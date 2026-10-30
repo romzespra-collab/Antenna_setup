@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.6.0
+antenna_setup.pyw  v0.6.1
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,9 @@ antenna_setup.pyw  v0.6.0
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.6.1: временный адрес кабеля больше не остаётся: при выходе — «вернуть сеть как было?» (по умолчанию
+          да; кабель — автоматический адрес, приоритет, маршруты, Wi-Fi); при запуске — то же, если осталось
+          с прошлого раза; плитка «IP ноутбука» подсвечивает временный адрес программы.
   v0.6.0: «📶 Wi-Fi антенны» — как с телефона: программа ищет Wi-Fi вокруг, отмечает сеть самой антенны
           (по её MAC из поиска по MAC, по марке BSSID и имени), подключает к ней Wi-Fi ноутбука (пароль —
           во временном профиле), берёт адрес антенны из шлюза (например 192.168.10.1), проверяет;
@@ -105,7 +108,7 @@ antenna_setup.pyw  v0.6.0
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -3825,7 +3828,12 @@ class MainWindow(QWidget):
                 in_net = bool(a.get("IP")) and ipaddress.IPv4Address(a["IP"]) in net
             except ValueError:
                 pass
-            self.t_myip.set(ip, "в подсети антенны" if in_net else "не в подсети антенны", "ok" if in_net else "warn")
+            temp = a["Name"] in (self.cfg.get("saved_net") or {}) and (a.get("Dhcp") or "").lower() != "enabled"
+            if temp:
+                self.t_myip.set(ip, "⚠ временный адрес программы — «↩ Вернуть как было»", "warn")
+            else:
+                self.t_myip.set(ip, "в подсети антенны" if in_net else "не в подсети антенны",
+                                "ok" if in_net else "warn")
         else:
             self.t_adapter.set("—", "нажми или F5 — прочитать адаптеры")
             self.t_myip.set("—", "")
@@ -4376,6 +4384,67 @@ class MainWindow(QWidget):
         QApplication.instance().quit()
 
     # ── закрытие ──
+    def restore_all_sync(self):
+        """Вернуть ВСЁ, что программа меняла в сети: адреса кабеля, приоритет, маршруты, Wi-Fi."""
+        self.set_chip("● возвращаю сеть…", "warn")
+        QApplication.processEvents()
+        for name, snap in list((self.cfg.get("saved_net") or {}).items()):
+            for c in restore_commands(name, snap or {"dhcp": True}):
+                ok, out = run_cmd(c)
+                if not ok:
+                    self.log(f"⚠ «{name}»: {out[:150]}")
+            orig = (self.cfg.get("metric_orig") or {}).get(name)
+            if orig:
+                set_metric(name, None if orig[0] else orig[1])
+            self.log(f"✓ «{name}» — как было")
+        self.cfg["saved_net"], self.cfg["metric_orig"] = {}, {}
+        if self.cfg.get("pinned_routes"):
+            self.unpin_all()
+        if self.cfg.get("wifi_off"):
+            self.enable_wifi_back()
+        if self.cfg.get("wifi_ant"):
+            self.wifi_home_back()
+        self.update_saved_label()
+        self.set_chip("● сеть возвращена", "ok")
+
+    def _exit_cleanup(self):
+        """При выходе: программа меняла сеть — спросить и вернуть как было (по умолчанию «да»)."""
+        if not IS_WIN:
+            return
+        changed = list((self.cfg.get("saved_net") or {}))
+        if changed:
+            mb = QMessageBox(QMessageBox.Question, "Выход",
+                             f"Программа меняла адрес «{', '.join(changed)}» (временный адрес на кабеле).\n\n"
+                             "Вернуть сеть как было перед выходом? Иначе ноутбук останется с временным "
+                             "адресом и никуда не зайдёт.", QMessageBox.Yes | QMessageBox.No, self)
+            mb.setDefaultButton(QMessageBox.Yes)
+            if mb.exec() == QMessageBox.Yes:
+                self.restore_all_sync()
+                return
+        if self.cfg.get("pinned_routes"):
+            self.unpin_all()
+        if self.cfg.get("wifi_off"):
+            self.enable_wifi_back()
+        if self.cfg.get("wifi_ant"):
+            self.wifi_home_back()
+
+    def offer_leftover(self):
+        """При запуске: остался временный адрес с прошлого раза — предложить убрать."""
+        if not IS_WIN or not (self.cfg.get("saved_net") or self.cfg.get("wifi_off") or self.cfg.get("wifi_ant")):
+            return
+        if self.worker.busy():
+            QTimer.singleShot(500, self.offer_leftover)
+            return
+        changed = ", ".join(self.cfg.get("saved_net") or {}) or "Wi-Fi"
+        mb = QMessageBox(QMessageBox.Question, "Сеть после прошлого раза",
+                         f"С прошлого запуска осталась временная настройка сети ({changed}).\n\n"
+                         "Вернуть как было (кабель — автоматический адрес, Wi-Fi — домашний)?",
+                         QMessageBox.Yes | QMessageBox.No, self)
+        mb.setDefaultButton(QMessageBox.Yes)
+        if mb.exec() == QMessageBox.Yes:
+            self.restore_all_sync()
+            self.refresh_quiet()
+
     def closeEvent(self, e):
         if getattr(self, "_force_close", False):
             e.accept()
@@ -4402,21 +4471,11 @@ class MainWindow(QWidget):
                 self.set_chip("● останавливаю…", "warn")
                 e.ignore()
                 return
-            if IS_WIN and self.cfg.get("pinned_routes"):
-                self.unpin_all()
-            if IS_WIN and self.cfg.get("wifi_off"):
-                self.enable_wifi_back()
-            if IS_WIN and self.cfg.get("wifi_ant"):
-                self.wifi_home_back()
+            self._exit_cleanup()
             self.save_now()
             e.accept()
             return
-        if IS_WIN and self.cfg.get("pinned_routes"):
-            self.unpin_all()
-        if IS_WIN and self.cfg.get("wifi_off"):
-            self.enable_wifi_back()
-        if IS_WIN and self.cfg.get("wifi_ant"):
-            self.wifi_home_back()
+        self._exit_cleanup()
         self.save_now()
         e.accept()
 
@@ -4617,6 +4676,7 @@ def main():
         win.log("⚠ нет прав администратора — смена IP недоступна (⋯ → Перезапуск или ответь «да» при запуске).")
     win.set_busy(False)
     QTimer.singleShot(200, win.refresh)
+    QTimer.singleShot(1500, win.offer_leftover)
     sys.exit(app.exec())
 
 
