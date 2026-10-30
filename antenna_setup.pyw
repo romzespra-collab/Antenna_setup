@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.2.2
+antenna_setup.pyw  v0.2.3
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,8 @@ antenna_setup.pyw  v0.2.2
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.2.3: установка через setup.ps1 (у .bat с русским текстом Windows 10 теряла метки и молча
+          закрывала окно); при падении программы — окно с ошибкой и antenna_setup.log.
   v0.2.2: setup.bat ставит Python с python.org сам (без winget, которого нет на части Windows 10).
   v0.2.1: в меню ⋯ пункт «Обновить программу с GitHub»; «Обновить» → «Обновить адаптеры»;
           пресеты убраны: вместо них «🔎 Найти антенну» (F7) — поиск на кабеле в своей
@@ -24,7 +26,7 @@ antenna_setup.pyw  v0.2.2
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -46,6 +48,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 import zipfile
@@ -103,6 +106,26 @@ def ensure_packages():
         sys.exit(1)
 
 
+
+def _crash_hook(exc_type, exc, tb):
+    """Падение не молча: текст в antenna_setup.log и окно с ошибкой."""
+    text = "".join(traceback.format_exception(exc_type, exc, tb))
+    try:
+        with open(APP_ROOT / "antenna_setup.log", "a", encoding="utf-8") as f:
+            f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] v{VERSION}\n{text}")
+    except Exception:
+        pass
+    if IS_WIN and "--selftest" not in sys.argv:
+        try:
+            ctypes.windll.user32.MessageBoxW(None, f"Ошибка программы (записано в antenna_setup.log):\n\n{text[-1500:]}",
+                                             APP_NAME, 0x10)
+        except Exception:
+            pass
+    else:
+        sys.__excepthook__(exc_type, exc, tb)
+
+
+sys.excepthook = _crash_hook
 ensure_packages()
 
 from PySide6.QtCore import (QEvent, QLibraryInfo, QObject, QTranslator, QPoint, QPointF, QProcess, QRectF,  # noqa: E402
@@ -2413,7 +2436,8 @@ def selftest():
     if not IS_WIN:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     app = QApplication.instance() or QApplication(sys.argv)
-    ok("русский перевод Qt", install_ru(app))
+    if not install_ru(app):
+        res.append("ℹ русского перевода Qt нет — кнопки диалогов будут по-английски")
     app.setStyle("Fusion")
     apply_theme(app, "dark")
     f = _IntField(1, 15, 3, "с")
