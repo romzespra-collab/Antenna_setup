@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.3.1
+antenna_setup.pyw  v0.3.2
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,10 @@ antenna_setup.pyw  v0.3.1
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.3.2: поиск антенны переделан: шлюз и DHCP-сервер адаптера — первыми; прослушка кабеля 12 с
+          (все пакеты на адаптере + запросы Ubiquiti/MikroTik) — подсети услышанных адресов
+          проверяются первыми; после смены IP ждём, пока Windows подготовит адрес (DAD), а не 3 с;
+          больше заводских подсетей; услышанные, но молчащие адреса тоже показываются.
   v0.3.1: поиск падал в Python 3.15 («'lazy_import' object is not callable») — свои потоки вместо
           concurrent.futures; при ошибке поиска сеть адаптера возвращается; антенна без открытого
           веба тоже находится (ARP); ⋯ → «Обновить программу с GitHub» всегда активна и работает
@@ -33,7 +37,7 @@ antenna_setup.pyw  v0.3.1
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -149,7 +153,9 @@ from PySide6.QtWidgets import (QAbstractButton, QApplication, QButtonGroup,  # n
 
 # ───────────────────────── поиск и тема ─────────────────────────
 # заводские подсети антенн и роутеров — по ним ищем, если в своей подсети пусто
-SEARCH_SUBNETS = "192.168.1, 192.168.0, 192.168.10, 192.168.88, 192.168.2, 192.168.100, 192.168.20, 192.168.8"
+SEARCH_SUBNETS = ("192.168.1, 192.168.0, 192.168.10, 192.168.88, 192.168.2, 192.168.100, 192.168.20, "
+                  "192.168.8, 192.168.11, 192.168.3, 192.168.5, 10.0.0, 10.10.10, 169.254.1")
+OLD_SUBNETS = ("192.168.1, 192.168.0, 192.168.10, 192.168.88, 192.168.2, 192.168.100, 192.168.20, 192.168.8",)  # прежние списки по умолчанию → заменяются новым
 SEARCH_HOST = 247  # временный адрес ноутбука при поиске
 SEARCH_PORTS = (80, 443)
 MY_HOST_OFFSET = 50  # адрес ноутбука = номер сети + 50
@@ -274,9 +280,12 @@ def list_adapters():
         "$ip=Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -EA SilentlyContinue|"
         "?{$_.PrefixOrigin -ne 'WellKnown'}|select -First 1;"
         "$if=Get-NetIPInterface -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -EA SilentlyContinue;"
+        "$c=Get-CimInstance Win32_NetworkAdapterConfiguration -Filter \"InterfaceIndex=$($a.ifIndex)\" -EA SilentlyContinue;"
         "[pscustomobject]@{Name=$a.Name;Desc=$a.InterfaceDescription;Status=[string]$a.Status;"
         "Media=[string]$a.PhysicalMediaType;IP=[string]$ip.IPAddress;Prefix=[int]$ip.PrefixLength;"
-        "Dhcp=[string]$if.Dhcp}};ConvertTo-Json -Compress -InputObject @($r)")
+        "Dhcp=[string]$if.Dhcp;DhcpSrv=[string]$c.DHCPServer;"
+        "Gw=[string]($c.DefaultIPGateway|?{$_ -notmatch ':'}|select -First 1)}};"
+        "ConvertTo-Json -Compress -InputObject @($r)")
     ok, out = run_ps(script)
     if not ok:
         raise RuntimeError(out or "PowerShell не ответил")
@@ -456,6 +465,134 @@ def scan_subnet(net, skip=(), src=None, ports=SEARCH_PORTS, timeout=0.5, stopped
     for t in threads:
         t.join()
     return dict(sorted(found.items(), key=lambda kv: ipaddress.IPv4Address(kv[0])))
+
+
+def wait_ip_ready(ip, timeout=15.0, stopped=lambda: False):
+    """После netsh Windows проверяет адрес (DAD) — до этого с него ничего не уходит.
+    -> "ok" | "dup" (адрес занят) | "timeout"."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end and not stopped():
+        ok, out = run_ps(f"(Get-NetIPAddress -IPAddress {ps_str(ip)} -EA SilentlyContinue).AddressState", 10)
+        if "Preferred" in out:
+            return "ok"
+        if "Duplicate" in out:
+            return "dup"
+        time.sleep(0.7)
+    return "timeout"
+
+
+def parse_ubnt(data):
+    """Ответ Ubiquiti Discovery (UDP 10001) -> (ip, описание) или None."""
+    if len(data) < 4 or data[0] != 1:
+        return None
+    ip, info, i = "", [], 4
+    while i + 3 <= len(data):
+        t, n = data[i], int.from_bytes(data[i + 1:i + 3], "big")
+        v = data[i + 3:i + 3 + n]
+        if t == 0x02 and n >= 10:
+            ip = ip or socket.inet_ntoa(v[6:10])
+        elif t in (0x0B, 0x0C, 0x14, 0x15):
+            info.append(v.decode("utf-8", "replace"))
+        i += 3 + n
+    return (ip, "Ubiquiti " + " ".join(dict.fromkeys(x for x in info if x))) if ip else None
+
+
+def parse_mndp(data):
+    """Ответ MikroTik MNDP (UDP 5678) -> (ip, описание) или None."""
+    ip, info, i = "", [], 4
+    while i + 4 <= len(data):
+        t, n = int.from_bytes(data[i:i + 2], "big"), int.from_bytes(data[i + 2:i + 4], "big")
+        v = data[i + 4:i + 4 + n]
+        if t == 0x11 and n == 4:
+            ip = socket.inet_ntoa(v)
+        elif t in (5, 0x0C):
+            info.append(v.decode("utf-8", "replace"))
+        i += 4 + n
+    return (ip, "MikroTik " + " ".join(x for x in info if x)) if ip else None
+
+
+def listen_wire(src_ip, seconds=12.0, stopped=lambda: False):
+    """Слушать кабель: все IP-пакеты на адаптере (нужны права администратора) + запросы
+    обнаружения Ubiquiti/MikroTik. Антенна в любой подсети что-то шлёт — её адрес виден.
+    -> {ip: описание}."""
+    heard, lock = {}, threading.Lock()
+    done = threading.Event()
+
+    def add(ip, what):
+        try:
+            a = ipaddress.IPv4Address(ip)
+        except ValueError:
+            return
+        if ip == src_ip or a.is_multicast or a.is_unspecified or ip == "255.255.255.255":
+            return
+        with lock:
+            if what or ip not in heard:
+                heard[ip] = what or heard.get(ip, "")
+
+    def sniff():
+        if not IS_WIN:
+            return
+        try:
+            r = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
+            r.bind((src_ip, 0))
+            r.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+            r.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
+            r.settimeout(0.5)
+        except OSError:
+            return
+        try:
+            while not done.is_set():
+                try:
+                    pkt = r.recv(65535)
+                except socket.timeout:
+                    continue
+                if len(pkt) >= 20 and pkt[0] >> 4 == 4:
+                    add(socket.inet_ntoa(pkt[12:16]), "")
+        finally:
+            try:
+                r.ioctl(socket.SIO_RCVALL, socket.RCVALL_OFF)
+            except OSError:
+                pass
+            r.close()
+
+    def discover():
+        try:
+            u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            u.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            u.bind((src_ip, 0))
+            u.settimeout(0.5)
+        except OSError:
+            return
+        last = 0.0
+        try:
+            while not done.is_set():
+                if time.monotonic() - last > 3:
+                    last = time.monotonic()
+                    for port, msg in ((10001, b"\x01\x00\x00\x00"), (5678, b"\x00\x00\x00\x00")):
+                        try:
+                            u.sendto(msg, ("255.255.255.255", port))
+                        except OSError:
+                            pass
+                try:
+                    data, (ip, _port) = u.recvfrom(4096)
+                except (socket.timeout, OSError):
+                    continue
+                res = parse_ubnt(data) or parse_mndp(data)
+                add(ip, res[1] if res else "")
+                if res:
+                    add(res[0], res[1])
+        finally:
+            u.close()
+    th = [threading.Thread(target=f, daemon=True) for f in (sniff, discover)]
+    for t in th:
+        t.start()
+    end = time.monotonic() + seconds
+    while time.monotonic() < end and not stopped():
+        time.sleep(0.2)
+    done.set()
+    for t in th:
+        t.join(2)
+    return dict(sorted(heard.items(), key=lambda kv: ipaddress.IPv4Address(kv[0])))
 
 
 def neighbors(name, net, skip=()):
@@ -1585,6 +1722,8 @@ class MainWindow(QWidget):
         self.tg_admin.setChecked(bool(c.get("ask_admin", True)))
         c.pop("preset", None)
         c.pop("custom_presets", None)
+        if c.get("search_subnets") in OLD_SUBNETS:
+            c["search_subnets"] = SEARCH_SUBNETS
         self.e_subnets.setText(c.get("search_subnets") or SEARCH_SUBNETS)
         self.e_subnets.setCursorPosition(0)
         self._found_from = ""
@@ -1807,12 +1946,28 @@ class MainWindow(QWidget):
         saved = dict(self.cfg.get("saved_net") or {})
         mask = "255.255.255.0"
 
+        hints = [x for x in (a.get("Gw"), a.get("DhcpSrv")) if x and x != cur and x != "255.255.255.255"]
+
+        def probe_net(w, net, me, extra=()):
+            """Порты 80/443 по всей /24, потом кто ответил на ARP, потом подсказки (пинг)."""
+            found = scan_subnet(net, {me}, me, stopped=w.stopped)
+            if not found and IS_WIN:
+                found = {ip: [] for ip in neighbors(name, net, {me})}
+            for ip in extra:
+                if ip not in found and ipaddress.IPv4Address(ip) in net and ping(ip, 1.0):
+                    found[ip] = []
+            return found
+
         def job(w):
-            if cur and not cur.startswith("169.254."):
+            dh = "DHCP" if (a.get("Dhcp") or "").lower() == "enabled" else "статический"
+            w.log(f"ℹ «{name}»: {cur or 'нет адреса'}{'/' + str(prefix) if cur else ''}, {dh}, "
+                  f"шлюз {a.get('Gw') or '—'}, DHCP-сервер {a.get('DhcpSrv') or '—'}")
+            heard = {}
+            usable = cur and not cur.startswith("169.254.")
+            if usable:
                 own = ipaddress.IPv4Network(f"{cur}/{max(prefix, 24)}", strict=False)
                 w.log(f"🔎 ищу в своей подсети {own}…")
-                found = scan_subnet(own, {cur}, cur, stopped=w.stopped) or \
-                    {ip: [] for ip in (neighbors(name, own, {cur}) if IS_WIN else [])}
+                found = probe_net(w, own, cur, hints)
                 if found:
                     m = str(own.netmask)
                     w.ui(lambda: self.show_found(found, m, cur, str(own)))
@@ -1820,41 +1975,75 @@ class MainWindow(QWidget):
             if w.stopped():
                 return
             if not admin:
-                w.log("⚠ в своей подсети пусто. Чтобы искать в заводских подсетях, нужны права администратора "
-                      "(⋯ → Перезапуск).")
+                w.log("⚠ в своей подсети пусто. Чтобы слушать кабель и искать в других подсетях, нужны "
+                      "права администратора (⋯ → Перезапуск).")
                 return
+            if cur:
+                w.log("👂 слушаю кабель 12 с — антенна в любой подсети что-то шлёт…")
+                heard = listen_wire(cur, 12, w.stopped)
+                self._log_heard(w, heard)
             if name not in saved:
                 snap = snapshot_adapter(name)
                 saved[name] = snap
                 w.ui(lambda: self._store_snapshot(name, snap))
                 w.log("✓ запомнил прежние настройки адаптера")
+            order = []
+            for ip in heard:           # подсети услышанных адресов — первыми
+                n = ipaddress.IPv4Network(f"{ip}/24", strict=False)
+                if n not in order:
+                    order.append(n)
+            order += [n for n in nets if n not in order]
+            if usable:
+                order = [n for n in order if ipaddress.IPv4Address(cur) not in n]
+            listened = bool(cur)
             try:
-                for net in nets:
+                for net in order:
                     if w.stopped():
                         break
-                    if cur and ipaddress.IPv4Address(cur) in net:
-                        continue
                     me = str(net.network_address + SEARCH_HOST)
+                    if me in heard:
+                        me = str(net.network_address + SEARCH_HOST - 1)
                     ok, out = run_cmd(["netsh", "interface", "ipv4", "set", "address", f"name={name}",
                                        "static", me, mask])
                     if not ok:
                         w.log(f"✗ netsh: {out or 'ошибка'}")
                         break
                     w.log(f"🔎 ищу в {net} (ноутбук временно {me})…")
-                    if w.sleep(3):
-                        break
-                    found = scan_subnet(net, {me}, me, stopped=w.stopped) or \
-                        {ip: [] for ip in neighbors(name, net, {me})}
+                    st = wait_ip_ready(me, 15, w.stopped)
+                    if st == "dup":
+                        w.log(f"⚠ адрес {me} кто-то уже занял — значит, в {net} есть устройство")
+                    elif st == "timeout":
+                        w.log("⚠ Windows долго не готовит адрес — ищу всё равно")
+                    if not listened:
+                        listened = True
+                        w.log("👂 слушаю кабель 12 с…")
+                        heard = listen_wire(me, 12, w.stopped)
+                        self._log_heard(w, heard)
+                        new = [ipaddress.IPv4Network(f"{ip}/24", strict=False) for ip in heard]
+                        if any(n != net for n in new):
+                            for n in reversed(new):
+                                if n in order and order.index(n) > order.index(net):
+                                    order.remove(n)
+                                    order.insert(order.index(net) + 1, n)
+                    found = probe_net(w, net, me, [ip for ip in list(heard) + hints
+                                                   if ipaddress.IPv4Address(ip) in net])
+                    for ip in heard:   # слышен в кабеле, но на порты не ответил — всё равно показать
+                        if ipaddress.IPv4Address(ip) in net and ip not in found:
+                            found[ip] = []
                     if found:
-                        w.ui(lambda f=found, m=me, n=str(net): self.show_found(f, mask, m, n))
+                        w.ui(lambda f=found, m=me, n=str(net), h=dict(heard): self.show_found(f, mask, m, n, h))
                         w.log(f"ℹ ноутбук оставлен на {me}. Вернуть сеть — «↩ Вернуть как было».")
                         w.ui(self.refresh_quiet)
                         return
             except Exception as e:  # сеть всё равно вернуть
                 w.log(f"✗ поиск: {e}")
+            if heard:
+                w.log("ℹ в кабеле слышны: " + ", ".join(heard) + " — впиши адрес вручную в «Антенна» "
+                      "и нажми «авто», затем «⚡ Поставить IP».")
+                w.ui(lambda h=dict(heard): self.show_found({ip: [] for ip in h}, mask, "", "кабеле (на порты не ответили)", h))
             w.log("⏹ поиск остановлен" if w.stopped() else
-                  "✗ антенна не найдена. Проверь кабель и PoE-блок (антенна грузится до минуты), "
-                  "добавь её подсеть в «Настройки → Подсети для поиска».")
+                  ("✗ антенна не ответила ни в одной подсети. Проверь кабель и PoE-блок (антенна грузится "
+                   "до минуты), подключение в порт LAN/PoE."))
             snap = saved.get(name) or {"dhcp": True}
             for c in restore_commands(name, snap):
                 ok, out = run_cmd(c)
@@ -1866,12 +2055,20 @@ class MainWindow(QWidget):
             w.ui(self.refresh_quiet)
         self.run_job("поиск антенны", job)
 
-    def show_found(self, found, mask, my_ip, where=""):
+    def _log_heard(self, w, heard):
+        if heard:
+            w.log("✓ в кабеле слышны: " + ", ".join(f"{ip}{' (' + d + ')' if d else ''}" for ip, d in heard.items()))
+        else:
+            w.log("ℹ в кабеле тихо (или Windows не дала слушать)")
+
+    def show_found(self, found, mask, my_ip, where="", heard=None):
         self.found.blockSignals(True)
         self.found.clear()
         names = {80: "http", 443: "https"}
         for ip, ports in found.items():
             what = ", ".join(names.get(p, str(p)) for p in ports) or "отвечает, веб закрыт"
+            if heard and heard.get(ip):
+                what += " · " + heard[ip]
             it = QListWidgetItem(f"{ip}\n{what}")
             it.setData(Qt.UserRole, ip)
             self.found.addItem(it)
@@ -1879,8 +2076,11 @@ class MainWindow(QWidget):
         self.l_found.setVisible(not found)
         self._found_from = where
         self.e_mask.setText(mask)
-        self.e_my.setText(my_ip)
+        if my_ip:
+            self.e_my.setText(my_ip)
         self.found.setCurrentRow(0)
+        if not my_ip:
+            self.auto_my_ip()
         self.log(f"✓ найдено в {where}: " + ", ".join(found) if found else "✗ ничего не найдено")
         self.set_chip(f"● найдено: {len(found)}", "ok")
 
@@ -1947,7 +2147,9 @@ class MainWindow(QWidget):
         if a:
             dh = "DHCP" if a.get("Dhcp", "").lower() == "enabled" else "статический"
             self.l_adapter.setText(f"{a.get('Desc', '')}\nСейчас: {a.get('IP') or 'нет адреса'}"
-                                   f"{'/' + str(a['Prefix']) if a.get('IP') else ''}, {dh}")
+                                   f"{'/' + str(a['Prefix']) if a.get('IP') else ''}, {dh}"
+                                   f"{', шлюз ' + a['Gw'] if a.get('Gw') else ''}"
+                                   f"{', DHCP-сервер ' + a['DhcpSrv'] if a.get('DhcpSrv') else ''}")
         else:
             self.l_adapter.setText("")
         self.update_tiles()
@@ -2312,6 +2514,11 @@ def selftest():
     srv.bind(("127.0.0.1", 0))
     srv.listen(8)
     port = srv.getsockname()[1]
+    ub = b"\x01\x00\x00\x20" + b"\x02\x00\x0a" + bytes(6) + socket.inet_aton("192.168.1.20") \
+        + b"\x0b\x00\x03" + b"NSM"
+    ok("ответ Ubiquiti", parse_ubnt(ub) == ("192.168.1.20", "Ubiquiti NSM"))
+    mk = bytes(4) + b"\x00\x11\x00\x04" + socket.inet_aton("192.168.88.1") + b"\x00\x05\x00\x02" + b"MT"
+    ok("ответ MikroTik", parse_mndp(mk) == ("192.168.88.1", "MikroTik MT"))
     ok("поиск находит узел", list(scan_subnet(ipaddress.IPv4Network("127.0.0.0/30"), ports=(port,))) == ["127.0.0.1"])
     srv.close()
     try:
