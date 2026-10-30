@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.4.3
+antenna_setup.pyw  v0.4.4
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,9 @@ antenna_setup.pyw  v0.4.3
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.4.4: «⏹ Стоп» останавливает сразу: проверка, чтение настроек, поиск в своей сети, отправка
+          журнала бросаются мгновенно (раньше ждали таймаутов до минуты); поиск со сменой адреса —
+          останавливается на ближайшем шаге и возвращает сеть.
   v0.4.3: понятные надписи: «антенна X (ноутбук: Y)» вместо «X с Y» (читалось как диапазон адресов).
   v0.4.2: чтение настроек: ждём ответа веба до 20 с (было 5 — медленная антенна «timed out» до логина),
           заголовки как у браузера, не вышло с адреса кабеля — пробуем как браузер; диагностика
@@ -66,7 +69,7 @@ antenna_setup.pyw  v0.4.3
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -1015,7 +1018,44 @@ def relaunch_as_admin():
 # ───────────────────────── фоновая работа ─────────────────────────
 
 
-_DONE = object()
+
+
+# работы, которые только читают (сеть не меняют): «Стоп» бросает их сразу, поток доживает сам и молча
+ABANDONABLE = {"адаптеры", "поиск антенны", "проверка", "чтение настроек", "отправка журнала",
+               "маршрут через кабель"}
+
+
+class _Job:
+    """То, что получает функция работы: журнал, вызов в UI, «остановлено?». Брошенная работа — немая."""
+
+    def __init__(self, worker, gen):
+        self._w, self._gen = worker, gen
+
+    def _alive(self):
+        return self._gen == self._w.gen
+
+    def log(self, text):
+        if self._alive():
+            self._w.q.put(("log", text))
+
+    def ui(self, fn):
+        if self._alive():
+            self._w.q.put(("ui", fn, self._gen))
+
+    def stopped(self):
+        return self._w.stop_flag.is_set() or not self._alive()
+
+    def sleep(self, sec):
+        return self._w.stop_flag.wait(sec) or not self._alive()
+
+    @property
+    def blocking_close(self):
+        return self._w.blocking_close
+
+    @blocking_close.setter
+    def blocking_close(self, v):
+        if self._alive():
+            self._w.blocking_close = v
 
 
 class Worker:
@@ -1027,39 +1067,41 @@ class Worker:
         self.stop_flag = threading.Event()
         self.name = ""
         self.blocking_close = False
+        self.gen = 0
 
     def busy(self):
         return self.thread is not None and self.thread.is_alive()
 
+    def abandonable(self):
+        return self.busy() and self.name in ABANDONABLE and not self.blocking_close
+
     def start(self, name, fn, blocking_close=False):
         if self.busy():
             return False
+        self.gen += 1
+        gen = self.gen
         self.name = name
         self.blocking_close = blocking_close
-        self.stop_flag.clear()
+        self.stop_flag = threading.Event()   # своё событие у каждой работы
+        job = _Job(self, gen)
 
         def run():
             try:
-                fn(self)
+                fn(job)
             except Exception as e:
-                self.log(f"✗ {name}: {e}")
+                job.log(f"✗ {name}: {e}")
             finally:
-                self.q.put(_DONE)
+                self.q.put(("done", gen))
         self.thread = threading.Thread(target=run, daemon=True)
         self.thread.start()
         return True
 
-    def log(self, text):
-        self.q.put(("log", text))
-
-    def ui(self, fn):
-        self.q.put(fn)
-
-    def stopped(self):
-        return self.stop_flag.is_set()
-
-    def sleep(self, sec):
-        return self.stop_flag.wait(sec)
+    def abandon(self):
+        """Бросить читающую работу сразу: её дальнейший вывод не показывается."""
+        self.stop_flag.set()
+        self.gen += 1
+        self.thread = None
+        self.q.put(("done", self.gen))
 
 # ───────────────────────── тема: QSS + палитра ─────────────────────────
 
@@ -2346,10 +2388,14 @@ class MainWindow(QWidget):
         try:
             while True:
                 item = self.q.get_nowait()
-                if item is _DONE:
-                    self.work_done()
+                if isinstance(item, tuple) and item[0] == "done":
+                    if item[1] == self.worker.gen:
+                        self.work_done()
                 elif isinstance(item, tuple) and item[0] == "log":
                     self.log(item[1])
+                elif isinstance(item, tuple) and item[0] == "ui":
+                    if item[2] == self.worker.gen:
+                        item[1]()
                 elif callable(item):
                     item()
         except queue.Empty:
@@ -2391,9 +2437,17 @@ class MainWindow(QWidget):
         if self.worker.blocking_close:
             self.log("⚠ установку обновления не останавливаю — дождись конца.")
             return
-        if QMessageBox.question(self, "Стоп", f"Остановить «{self.worker.name}»?") == QMessageBox.Yes:
+        if QMessageBox.question(self, "Стоп", f"Остановить «{self.worker.name}»?") != QMessageBox.Yes:
+            return
+        if not self.worker.busy():
+            return
+        if self.worker.abandonable():
+            name = self.worker.name
+            self.worker.abandon()
+            self.log(f"⏹ «{name}» остановлено")
+        else:
             self.worker.stop_flag.set()
-            self.log("⏹ останавливаю…")
+            self.log(f"⏹ останавливаю «{self.worker.name}» — сеть адаптера верну, несколько секунд…")
 
     # ── поиск ──
     def search(self):
@@ -3002,7 +3056,11 @@ class MainWindow(QWidget):
                                     "сеть адаптера как было?") != QMessageBox.Yes:
                 return
             name = (self.adapter() or {}).get("Name", "")
-            self.worker.stop_flag.set()
+            if self.worker.abandonable():
+                self.worker.abandon()
+                self._drain()
+            else:
+                self.worker.stop_flag.set()
             self.log("⏹ останавливаю, потом верну сеть…")
 
             def later():
@@ -3240,15 +3298,28 @@ class MainWindow(QWidget):
             QMessageBox.information(self, "Закрытие", "Идёт обновление программы — дождись конца.")
             e.ignore()
             return
+        if self.worker.busy() and self.worker.blocking_close:
+            QMessageBox.information(self, "Закрытие", "Идёт установка обновления — дождись конца.")
+            e.ignore()
+            return
         if self.worker.busy():
             if QMessageBox.question(self, "Закрытие", f"Идёт «{self.worker.name}». Остановить и закрыть?") \
                     != QMessageBox.Yes:
                 e.ignore()
                 return
-            self.worker.stop_flag.set()
-            self._closing = True
-            self.set_chip("● останавливаю…", "warn")
-            e.ignore()
+            if self.worker.abandonable():          # читающая работа — бросить и закрыть сразу
+                self.worker.abandon()
+                self._drain()
+            else:
+                self.worker.stop_flag.set()
+                self._closing = True
+                self.set_chip("● останавливаю…", "warn")
+                e.ignore()
+                return
+            if IS_WIN and self.cfg.get("pinned_routes"):
+                self.unpin_all()
+            self.save_now()
+            e.accept()
             return
         if IS_WIN and self.cfg.get("pinned_routes"):
             self.unpin_all()
