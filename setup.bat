@@ -3,7 +3,7 @@ chcp 65001 >nul
 setlocal EnableExtensions
 title Настройка антенны - установка
 rem ============================================================
-rem  setup.bat  v0.6.0 (antenna_setup)
+rem  setup.bat  v0.6.1 (antenna_setup)
 rem  По образцу START_ON_NEW_PC.bat из SmartMon (проверенный).
 rem  Python 3.15 - ОДИН на компьютер для всех наших программ: уже
 rem  стоит - берётся он; нет - ставится официальным установщиком
