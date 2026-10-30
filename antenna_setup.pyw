@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.5.0
+antenna_setup.pyw  v0.5.1
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,14 @@ antenna_setup.pyw  v0.5.0
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.5.1: антенна в той же подсети, что Wi-Fi (отчёт: Comfast 192.168.1.1 = адрес домашнего роутера) —
+          больше не прячется: показывается с пометкой и предложением на время выключить Wi-Fi, ноутбук на
+          кабеле — в подсеть антенны (адрес, который она сама спрашивает); «Вернуть как было» и выход
+          включают Wi-Fi обратно. Порты одной антенны (MAC …:61/…:62) считаются одним устройством.
+          Антенна просит адрес по DHCP (отчёт: Comfast 40:A5:EF:77:0F:61), а в кабеле раздать некому —
+          программа сама выдаёт ей адрес: ноутбук на кабеле 192.168.77.1, мини-DHCP отвечает только
+          этому MAC и только по кабелю, антенна — 192.168.77.2; затем проверка. Поиск по MAC, заметив
+          DHCP-просьбу, заканчивается через 10 с и предлагает это сам.
   v0.5.0: «👂 Найти по MAC» — как Winbox: программа слушает кабель через Npcap (ставится по кнопке,
           с npcap.com) и ловит ARP / ARP-пробы / LLDP / DHCP / MNDP / Ubiquiti / Pharos — антенна сама
           называет IP и MAC в любой подсети, к её веб — ни одного запроса; марка по MAC; найденное
@@ -85,7 +93,7 @@ antenna_setup.pyw  v0.5.0
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -235,7 +243,7 @@ DEFAULT_CONFIG = {
     "upd_token": "", "upd_auto": True, "upd_branch": GITHUB_BRANCH, "upd_every_h": 12,
     "saved_net": {}, "geometry": "", "page": 0,
     "wifi_internet": True, "metric_orig": {},
-    "report_repo": REPORT_REPO, "report_token": "", "ant_user": "admin", "ant_pass": "admin", "pinned_routes": [], "home_nets": [], "cert_pins": {},
+    "report_repo": REPORT_REPO, "report_token": "", "ant_user": "admin", "ant_pass": "admin", "pinned_routes": [], "home_nets": [], "cert_pins": {}, "wifi_off": [],
 }
 
 # ───────────────────────── конфиг (атомарно, с .bak) ─────────────────────────
@@ -1102,6 +1110,17 @@ OUI = {   # первые 3 байта MAC -> марка (самые частые
 }
 
 
+def same_device(m1, m2):
+    """У одной антенны порты обычно идут подряд: 40:A5:EF:77:0F:61 / …:62 — одно устройство."""
+    a, b = m1.replace("-", ":").upper(), m2.replace("-", ":").upper()
+    return a[:14] == b[:14]
+
+
+def set_iface_enabled(name, on):
+    return run_cmd(["netsh", "interface", "set", "interface", f"name={name}",
+                    "admin=enabled" if on else "admin=disabled"], timeout=30)
+
+
 def mac_vendor(mac):
     return OUI.get(mac.replace(":", "").replace("-", "").upper()[:6], "")
 
@@ -1213,6 +1232,74 @@ def sniff_l2(guid, seconds, on_frame, stopped=lambda: False):
                 break
     finally:
         pc.pcap_close(h)
+
+
+DHCP_NET = "192.168.77"   # подсеть, которую программа раздаёт антенне по кабелю (ноутбук .1, антенна .2)
+
+
+def _dhcp_opts(data):
+    out, i = {}, 0
+    while i < len(data):
+        t = data[i]
+        if t == 255:
+            break
+        if t == 0:
+            i += 1
+            continue
+        n = data[i + 1] if i + 1 < len(data) else 0
+        out[t] = data[i + 2:i + 2 + n]
+        i += 2 + n
+    return out
+
+
+def dhcp_reply(req, server_ip, offer_ip, mask="255.255.255.0", only_mac=""):
+    """Ответ DHCP-сервера на запрос антенны -> (байты ответа, тип) или (None, "")."""
+    if len(req) < 240 or req[0] != 1 or req[236:240] != b"\x63\x82\x53\x63":
+        return None, ""
+    mac = _mac(req[28:34])
+    if only_mac and mac != only_mac.upper():
+        return None, ""
+    kind = _dhcp_opts(req[240:]).get(53, b"\x00")[0]
+    if kind not in (1, 3):                      # 1 DISCOVER -> OFFER, 3 REQUEST -> ACK
+        return None, ""
+    rep = bytearray(240)
+    rep[0], rep[1], rep[2] = 2, 1, 6
+    rep[4:8] = req[4:8]                         # xid
+    rep[10:12] = req[10:12]                     # flags
+    rep[16:20] = socket.inet_aton(offer_ip)     # yiaddr
+    rep[20:24] = socket.inet_aton(server_ip)    # siaddr
+    rep[28:44] = req[28:44]                     # chaddr
+    rep[236:240] = b"\x63\x82\x53\x63"
+    t = 2 if kind == 1 else 5
+    opts = bytes([53, 1, t, 54, 4]) + socket.inet_aton(server_ip) + bytes([51, 4]) + (3600).to_bytes(4, "big") \
+        + bytes([1, 4]) + socket.inet_aton(mask) + bytes([255])
+    return bytes(rep) + opts, ("OFFER" if t == 2 else "ACK")
+
+
+def dhcp_serve(bind_ip, mac, offer_ip, seconds=120, stopped=lambda: False, log=print):
+    """Раздать адрес ОДНОЙ антенне (по её MAC) на кабеле. -> True, когда антенна взяла адрес (ACK)."""
+    sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sk.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sk.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sk.bind((bind_ip, 67))                      # адрес кабеля: Wi-Fi и домашняя сеть не слышат
+    sk.settimeout(0.5)
+    end = time.monotonic() + seconds
+    try:
+        while time.monotonic() < end and not stopped():
+            try:
+                req, _ = sk.recvfrom(2048)
+            except socket.timeout:
+                continue
+            rep, what = dhcp_reply(req, bind_ip, offer_ip, only_mac=mac)
+            if not rep:
+                continue
+            sk.sendto(rep, ("255.255.255.255", 68))
+            log(f"… DHCP: {what} → {offer_ip} для {mac}")
+            if what == "ACK":
+                return True
+    finally:
+        sk.close()
+    return False
 
 
 def install_npcap(log=print):
@@ -3060,6 +3147,7 @@ class MainWindow(QWidget):
                                 "ПЕРЕЗАГРУЗИТЕ АНТЕННУ: выдерните PoE на 10 секунд и вставьте обратно — "
                                 "при включении она сама назовёт свой адрес.\n\nКак появится — можно «⏹ Стоп».")
         seen = {}
+        asked = {}      # MAC -> когда впервые попросил DHCP
 
         def job(w):
             w.log("👂 слушаю кабель 120 с (Npcap) — перезагрузите антенну…")
@@ -3070,6 +3158,8 @@ class MainWindow(QWidget):
                 if not r:
                     return
                 mac, ip, how, what = r
+                if how == "DHCP":
+                    asked.setdefault(mac, time.monotonic())
                 key = (mac, ip)
                 if key in seen or (not ip and any(k[0] == mac for k in seen)):
                     return
@@ -3096,26 +3186,155 @@ class MainWindow(QWidget):
                 if time.monotonic() - last[0] > 5:
                     last[0] = time.monotonic()
                     discover()
+                # просит DHCP и за 10 с своего IP не назвал — дальше слушать незачем
+                if asked and all(time.monotonic() - t > 10 and not any(k[1] and same_device(k[0], m) for k in seen)
+                                 for m, t in asked.items()):
+                    return True
                 return w.stopped()
             sniff_l2(guid, 120, on_frame, tick)
             w.log(f"ℹ слушал кабель — найдено устройств: {len({k[0] for k in seen})}" if seen else
                   "✗ в кабеле никто не назвался. Антенну перезагружали? Кабель в порту LAN/PoE?")
+            need = [m for m in asked if not any(k[1] and same_device(k[0], m) for k in seen)]
+            if need and not w.stopped():
+                w.ui(lambda: self._offer_dhcp(need[0]))
         self.run_job("поиск по MAC", job)
 
+    def _offer_dhcp(self, mac):
+        """Антенна просит адрес по DHCP, а раздать некому — выдать ей адрес самим."""
+        def ask():
+            if self.worker.busy():
+                QTimer.singleShot(200, ask)
+                return
+            a = self.adapter()
+            if not a:
+                return
+            me, ant = f"{DHCP_NET}.1", f"{DHCP_NET}.2"
+            if self.in_home(me):
+                self.log(f"✗ подсеть {DHCP_NET}.x совпала с домашней сетью — выдать адрес нельзя")
+                return
+            vend = mac_vendor(mac)
+            if QMessageBox.question(
+                    self, "Антенна просит адрес",
+                    f"Антенна {mac}{' (' + vend + ')' if vend else ''} просит адрес по DHCP, а в кабеле его "
+                    f"никто не раздаёт.\n\nВыдать ей адрес? Ноутбук на кабеле станет {me}, антенна получит {ant}. "
+                    "Раздача — только по кабелю и только этому MAC; «↩ Вернуть как было» вернёт сеть.") \
+                    != QMessageBox.Yes:
+                return
+            self._serve_dhcp(a["Name"], mac, me, ant)
+        ask()
+
+    def _serve_dhcp(self, name, mac, me, ant):
+        saved = dict(self.cfg.get("saved_net") or {})
+
+        def job(w):
+            if name not in saved:
+                snap = snapshot_adapter(name)
+                w.ui(lambda: self._store_snapshot(name, snap))
+                w.log("✓ запомнил прежние настройки кабеля")
+            self._cable_low_priority(w, name)
+            ok, out = run_cmd(["netsh", "interface", "ipv4", "set", "address", f"name={name}",
+                               "static", me, "255.255.255.0"])
+            if not ok:
+                w.log(f"✗ netsh: {out or 'ошибка'}")
+                return
+            w.log(f"✓ ноутбук на кабеле — {me}; жду, пока Windows подготовит адрес…")
+            wait_ip_ready(me, 15, w.stopped)
+            w.log(f"📡 раздаю адрес {ant} антенне {mac} (до 2 минут; можно перезагрузить антенну — быстрее)…")
+            try:
+                got = dhcp_serve(me, mac, ant, 120, w.stopped, w.log)
+            except OSError as e:
+                w.log(f"✗ DHCP-сервер не запустился: {e}")
+                return
+            if not got:
+                w.log("⏹ остановлено" if w.stopped() else "✗ антенна адрес не взяла — перезагрузите её и повторите")
+                return
+            w.log(f"✓ антенна взяла адрес {ant}. Даю ей 5 с поднять сеть…")
+            w.sleep(5)
+            w.ui(lambda: self.show_found({ant: []}, "255.255.255.0", me, "кабеле (адрес выдан программой)",
+                                         {ant: f"MAC {mac} · адрес выдан по DHCP"}))
+            res = check_antenna(ant, 5, me)
+            w.ui(lambda: self.show_check(ant, res))
+        self.run_job("выдаю адрес антенне", job)
+
     def _show_mac_found(self, seen):
-        found, heard = {}, {}
+        found, heard, asks = {}, {}, {}
         for (mac, ip), (how, what) in seen.items():
-            if not ip or ip.startswith(("0.", "255.")) or self.in_home(ip):
+            if not ip or ip.startswith(("0.", "255.")):
                 continue
             vend = mac_vendor(mac)
             found[ip] = []
-            heard[ip] = f"MAC {mac}{' · ' + vend if vend else ''} · {how}{' · ' + what if what else ''}"
+            clash = " · ⚠ тот же адрес-диапазон, что у Wi-Fi" if self.in_home(ip) else ""
+            heard[ip] = f"MAC {mac}{' · ' + vend if vend else ''} · {how}{' · ' + what if what else ''}{clash}"
+            if what.startswith("спрашивает "):
+                asks[ip] = what.split()[-1]
         if found:
             first = next(iter(found))
-            mask = "255.255.255.0"
-            self.show_found(found, mask, "", "кабеле (по MAC)", heard)
+            self.show_found(found, "255.255.255.0", "", "кабеле (по MAC)", heard)
             self.e_ant.setText(first)
             self.auto_my_ip()
+            if self.in_home(first) and not getattr(self, "_wifi_offer_shown", False):
+                self._wifi_offer_shown = True
+                QTimer.singleShot(300, lambda: self._offer_wifi_off(first, asks.get(first, "")))
+
+    def _offer_wifi_off(self, ant, hint):
+        """Антенна в той же подсети, что Wi-Fi (у вас обе 192.168.1.1) — два одинаковых адреса не развести:
+        Wi-Fi на время выключаем, ноутбук на кабеле — в подсеть антенны."""
+        def ask():
+            if self.worker.busy():
+                QTimer.singleShot(300, ask)
+                return
+            a = self.adapter()
+            if not a:
+                return
+            net = ipaddress.IPv4Network(f"{ant}/24", strict=False)
+            me = hint if hint and hint != ant and ipaddress.IPv4Address(hint) in net else \
+                str(net.network_address + SEARCH_HOST)
+            wifi = [x["Name"] for x in self.adapters if x.get("Wifi") and x.get("Status") == "Up"]
+            if QMessageBox.question(
+                    self, "Антенна в сети Wi-Fi",
+                    f"Антенна {ant} — в той же подсети, что ваш Wi-Fi (там свой {ant} или соседи).\n\n"
+                    f"Выключить Wi-Fi на время работы с антенной? Ноутбук на кабеле станет {me}.\n"
+                    "«↩ Вернуть как было» включит Wi-Fi обратно (и при выходе из программы).\n\n"
+                    "Совет: первым делом смените антенне адрес на свободный — тогда Wi-Fi выключать не придётся.") \
+                    != QMessageBox.Yes:
+                return
+            if self._need_admin():
+                return
+            name = a["Name"]
+            saved = dict(self.cfg.get("saved_net") or {})
+
+            def job(w):
+                for n in wifi:
+                    ok, out = set_iface_enabled(n, False)
+                    w.log(f"✓ Wi-Fi «{n}» выключен на время" if ok else f"⚠ Wi-Fi «{n}» не выключился: {out[:150]}")
+                    if ok:
+                        w.ui(lambda n=n: self.cfg.setdefault("wifi_off", []).append(n))
+                if name not in saved:
+                    snap = snapshot_adapter(name)
+                    w.ui(lambda: self._store_snapshot(name, snap))
+                ok, out = run_cmd(["netsh", "interface", "ipv4", "set", "address", f"name={name}",
+                                   "static", me, "255.255.255.0"])
+                if not ok:
+                    w.log(f"✗ netsh: {out or 'ошибка'}")
+                    return
+                w.log(f"✓ ноутбук на кабеле — {me}; жду, пока Windows подготовит адрес…")
+                wait_ip_ready(me, 15, w.stopped)
+                w.ui(lambda: (self.e_my.setText(me), self.e_ant.setText(ant), self._params_edited()))
+                res = check_antenna(ant, 5, me)
+                w.ui(lambda: self.show_check(ant, res))
+                w.ui(self.refresh_quiet)
+            self.run_job("антенна в сети Wi-Fi", job)
+        ask()
+
+    def enable_wifi_back(self, w=None):
+        for n in list(self.cfg.get("wifi_off") or []):
+            ok, out = set_iface_enabled(n, True)
+            msg = f"✓ Wi-Fi «{n}» включён обратно" if ok else f"⚠ Wi-Fi «{n}» не включился: {out[:150]}"
+            (w.log if w else self.log)(msg)
+        if w:
+            w.ui(lambda: self.cfg.__setitem__("wifi_off", []))
+        else:
+            self.cfg["wifi_off"] = []
 
     def show_found(self, found, mask, my_ip, where="", heard=None):
         self.found.blockSignals(True)
@@ -3209,7 +3428,9 @@ class MainWindow(QWidget):
         self.cfg["home_nets"] = home[-5:]
 
     def in_home(self, ip):
-        """Адрес в домашней сети (Wi-Fi с интернетом)? -> подсеть или ""."""
+        """Адрес в домашней сети (Wi-Fi с интернетом)? -> подсеть или "". Wi-Fi выключен программой — "" ."""
+        if self.cfg.get("wifi_off"):
+            return ""
         try:
             a = ipaddress.IPv4Address(ip)
         except ValueError:
@@ -3629,6 +3850,7 @@ class MainWindow(QWidget):
             w.ui(lambda: self.cfg.__setitem__("pinned_routes", [k for k in (self.cfg.get("pinned_routes") or [])
                                                                  if k[0] != name]))
             self._restore_metric(w, name)
+            self.enable_wifi_back(w)
             w.log(f"✓ «{name}» возвращён: {what}")
             w.ui(lambda: self._forget(name))
             w.ui(lambda: self.set_chip("● сеть возвращена", "ok"))
@@ -3888,11 +4110,15 @@ class MainWindow(QWidget):
                 return
             if IS_WIN and self.cfg.get("pinned_routes"):
                 self.unpin_all()
+            if IS_WIN and self.cfg.get("wifi_off"):
+                self.enable_wifi_back()
             self.save_now()
             e.accept()
             return
         if IS_WIN and self.cfg.get("pinned_routes"):
             self.unpin_all()
+        if IS_WIN and self.cfg.get("wifi_off"):
+            self.enable_wifi_back()
         self.save_now()
         e.accept()
 
@@ -3955,6 +4181,17 @@ def selftest():
     probe = arp[:28] + socket.inet_aton("0.0.0.0") + bytes(6) + socket.inet_aton("10.0.0.5")
     ok("ARP-проба: свой адрес", parse_frame(probe)[1] == "10.0.0.5")
     ok("свой MAC пропускается", parse_frame(arp, {"50:C7:BF:11:22:33"}) is None)
+    disc = bytearray(240)
+    disc[0], disc[1], disc[2] = 1, 1, 6
+    disc[4:8] = b"\x12\x34\x56\x78"
+    disc[28:34] = bytes.fromhex("40a5ef770f61")
+    disc[236:240] = b"\x63\x82\x53\x63"
+    disc = bytes(disc) + bytes([53, 1, 1, 255])
+    rep, kind = dhcp_reply(disc, "192.168.77.1", "192.168.77.2", only_mac="40:A5:EF:77:0F:61")
+    ok("DHCP: OFFER антенне", kind == "OFFER" and rep[16:20] == socket.inet_aton("192.168.77.2")
+       and rep[4:8] == b"\x12\x34\x56\x78" and _dhcp_opts(rep[240:])[53] == b"\x02")
+    ok("DHCP: чужому MAC не отвечает", dhcp_reply(disc, "192.168.77.1", "192.168.77.2",
+                                                  only_mac="11:22:33:44:55:66")[0] is None)
     ok("поиск находит узел", list(scan_subnet(ipaddress.IPv4Network("127.0.0.0/30"), ports=(port,))) == ["127.0.0.1"])
     srv.close()
     try:
