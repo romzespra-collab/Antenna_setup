@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.4.4
+antenna_setup.pyw  v0.4.5
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,10 @@ antenna_setup.pyw  v0.4.4
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.4.5: «🛠 Настроить ПК» — изоляция: интернет только Wi-Fi (кабелю низкий приоритет и без шлюза),
+          кабель RJ45 только для антенн; домашняя сеть Wi-Fi запоминается и закрыта для поиска,
+          проверки, чтения и маршрутов через кабель. Чтение настроек по https: сертификат антенны
+          показывается (SHA-256) и после «доверять» запоминается — дальше сверяется каждый раз.
   v0.4.4: «⏹ Стоп» останавливает сразу: проверка, чтение настроек, поиск в своей сети, отправка
           журнала бросаются мгновенно (раньше ждали таймаутов до минуты); поиск со сменой адреса —
           останавливается на ближайшем шаге и возвращает сеть.
@@ -69,7 +73,7 @@ antenna_setup.pyw  v0.4.4
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -219,7 +223,7 @@ DEFAULT_CONFIG = {
     "upd_token": "", "upd_auto": True, "upd_branch": GITHUB_BRANCH, "upd_every_h": 12,
     "saved_net": {}, "geometry": "", "page": 0,
     "wifi_internet": True, "metric_orig": {},
-    "report_repo": REPORT_REPO, "report_token": "", "ant_user": "admin", "ant_pass": "admin", "pinned_routes": [],
+    "report_repo": REPORT_REPO, "report_token": "", "ant_user": "admin", "ant_pass": "admin", "pinned_routes": [], "home_nets": [], "cert_pins": {},
 }
 
 # ───────────────────────── конфиг (атомарно, с .bak) ─────────────────────────
@@ -477,11 +481,50 @@ BROWSER_HEADERS = {
 HTTP_TIMEOUT = 20.0   # старые антенны отвечают медленно (TP-Link — до 10+ с на первый запрос)
 
 
+_TLS = threading.local()   # .ctx — https к антенне с запомненным сертификатом (см. pinned_ctx)
+
+
+def fetch_cert(ip, src=None, timeout=8.0):
+    """Сертификат антенны (порт 443) -> (PEM, отпечаток SHA-256 «AB:CD:…»).
+    Только ПРОЧИТАТЬ, чтобы показать человеку и запомнить; соединяться дальше — через pinned_ctx."""
+    import hashlib
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE     # только чтобы СКАЧАТЬ сертификат; данных так не шлём
+    try:
+        ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
+        ctx.minimum_version = ssl.TLSVersion.TLSv1
+    except (ssl.SSLError, ValueError):
+        pass
+    with socket.create_connection((ip, 443), timeout=timeout, source_address=(src, 0) if src else None) as sk:
+        with ctx.wrap_socket(sk, server_hostname=None) as tls:
+            der = tls.getpeercert(binary_form=True)
+    fp = hashlib.sha256(der).hexdigest().upper()
+    return ssl.DER_cert_to_PEM_cert(der), ":".join(fp[i:i + 2] for i in range(0, len(fp), 2))
+
+
+def pinned_ctx(pem):
+    """TLS, который верит ТОЛЬКО этому сертификату антенны (проверка включена: другой сертификат —
+    ошибка). Имя в сертификате не сверяем — у антенн там не IP; личность подтверждает сам сертификат."""
+    ctx = ssl.create_default_context(cadata=pem)
+    ctx.check_hostname = False
+    ctx.verify_flags |= getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+    try:
+        ctx.set_ciphers("DEFAULT:@SECLEVEL=0")   # старые антенны: SHA1 / RSA-1024
+        ctx.minimum_version = ssl.TLSVersion.TLSv1
+    except (ssl.SSLError, ValueError):
+        pass
+    return ctx
+
+
 def http_get(ip, path, src=None, headers=None, method="GET", body=None, timeout=HTTP_TIMEOUT, limit=512 * 1024):
-    """HTTP к антенне С АДРЕСА КАБЕЛЯ (src): Wi-Fi в той же подсети не перехватит.
-    Заголовки — как у браузера. Без перехода по редиректам.
+    """HTTP(S) к антенне С АДРЕСА КАБЕЛЯ (src): Wi-Fi в той же подсети не перехватит.
+    Заголовки — как у браузера. Без перехода по редиректам. https — если задан _TLS.ctx.
     -> (код, {заголовок: значение}, тело); Set-Cookie — все, через «\n»."""
-    c = http.client.HTTPConnection(ip, 80, timeout=timeout, source_address=(src, 0) if src else None)
+    ctx = getattr(_TLS, "ctx", None)
+    sa = (src, 0) if src else None
+    c = (http.client.HTTPSConnection(ip, 443, timeout=timeout, source_address=sa, context=ctx) if ctx
+         else http.client.HTTPConnection(ip, 80, timeout=timeout, source_address=sa))
     try:
         h = dict(BROWSER_HEADERS)
         h.update(headers or {})
@@ -514,6 +557,12 @@ def set_metric(name, metric=None):
 
 
 CABLE_METRIC = 500   # у кабеля с антенной — низкий приоритет: интернет Windows ведёт через Wi-Fi
+
+
+def drop_default_route(name):
+    """Убрать у кабеля маршрут «в интернет» (0.0.0.0/0), если антенна раздала шлюз по DHCP."""
+    return run_ps(f"Get-NetRoute -InterfaceAlias {ps_str(name)} -DestinationPrefix '0.0.0.0/0' -EA SilentlyContinue|"
+                  "Remove-NetRoute -Confirm:$false -EA SilentlyContinue", 20)
 
 
 def pin_route(name, ip):
@@ -653,9 +702,18 @@ def raw_probe(ip, src=None, timeout=HTTP_TIMEOUT):
     return f"соединение {t_conn:.1f} с, первый ответ через {first:.1f} с, {len(data)} байт", data
 
 
-def read_antenna(ip, src=None, user="", pw="", log=print):
-    """Определить, что за антенна, и прочитать её настройки через её веб (порт 80).
+def read_antenna(ip, src=None, user="", pw="", log=print, tls=None):
+    """Определить, что за антенна, и прочитать её настройки через её веб (80, или 443 с tls).
     -> (строки для человека, сырые данные для отчёта). Пароль в отчёт не попадает."""
+    _TLS.ctx = tls
+    try:
+        lines, raw = _read_antenna(ip, src, user, pw, log, tls)
+    finally:
+        _TLS.ctx = None
+    return lines, raw
+
+
+def _read_antenna(ip, src, user, pw, log, tls):
     raw = {}
     st = hd = body = None
     for s_ in ([src, None] if src else [None]):     # с адреса кабеля; не вышло — как браузер (без привязки)
@@ -665,9 +723,18 @@ def read_antenna(ip, src=None, user="", pw="", log=print):
             break
         except (OSError, http.client.HTTPException) as e:
             log(f"… антенна {ip}{' (ноутбук: ' + s_ + ')' if s_ else ''}: {e}")
+            if tls:
+                raw[f"https{'@' + s_ if s_ else ''}"] = str(e)
+                continue
             note, data = raw_probe(ip, s_)
             log(f"… диагностика: {note}")
             raw[f"probe{'@' + s_ if s_ else ''}"] = note + "\n" + data[:3000].decode("latin-1")
+    if st is None and tls:
+        err = " ".join(str(v) for v in raw.values())
+        if "CERTIFICATE_VERIFY_FAILED" in err:
+            return [f"✗ {ip}: сертификат https не тот, что запомнен — антенну подменили или сбросили. "
+                    "Не доверяйте, пока не выясните."], raw
+        return [f"✗ {ip}: https не ответил ({err[:150]})"], raw
     if st is None:
         return [f"✗ {ip}: веб не ответил — до логина не дошло. Закрой вкладку антенны в браузере "
                 "(её веб держит одно соединение) и нажми ещё раз."], raw
@@ -675,13 +742,16 @@ def read_antenna(ip, src=None, user="", pw="", log=print):
     realm, loc = hd.get("www-authenticate", ""), hd.get("location", "")
     raw["/"] = f"код {st} · server {server} · realm {realm} · location {loc} · title {title}\n" + \
         body[:3000].decode("utf-8", "replace")
-    info = [f"веб: код {st}" + (f" · «{title}»" if title else "") + (f" · сервер {server}" if server else "")
+    info = [f"веб{' (https)' if tls else ''}: код {st}" + (f" · «{title}»" if title else "") + (f" · сервер {server}" if server else "")
             + (f" · {realm}" if realm else "") + (f" → {loc}" if loc else "")]
-    if loc.lower().startswith("https"):
-        info.append("⚠ антенна уводит на https с самодельным сертификатом — без проверки сертификата не читаю; "
-                    "открой веб в браузере")
+    if loc.lower().startswith("https") and not tls:
+        info.append("ℹ антенна уводит на https — нажми «📖 Прочитать настройки» ещё раз, программа "
+                    "спросит, доверять ли её сертификату")
     text = (title + server + realm + loc + body[:4000].decode("latin-1")).lower()
     tries = []
+    if "pharos" in text:
+        info.append("ℹ похоже на TP-Link Pharos (CPE) — вход в его веб ещё не умею; страница ушла в отчёт, "
+                    "доделаю по ней")
     if "tp-link" in text or "tplink" in text or "userrpm" in text or ("basic" in realm.lower() and st == 401):
         tries.append(("TP-Link", read_tplink_classic, [("admin", "admin")]))
     if "airos" in text or "ubnt" in text or "login.cgi" in text or "ubiquiti" in text:
@@ -1901,8 +1971,12 @@ class MainWindow(QWidget):
         self.btn_report = QPushButton("📤 Отправить журнал")
         self.btn_report.setToolTip("Журнал, адаптеры и прочитанное — в приватный antenna_reports, для Claude")
         self.btn_report.clicked.connect(self.send_report)
+        self.btn_pc = QPushButton("🛠 Настроить ПК")
+        self.btn_pc.setToolTip("Изолировать: интернет — только Wi-Fi, кабель (RJ45) — только антенны;\n"
+                               "домашняя сеть Wi-Fi закрыта для поиска и проверок")
+        self.btn_pc.clicked.connect(self.setup_pc)
         for i, b in enumerate((self.btn_find, self.btn_set, self.btn_check, self.btn_open, self.btn_read,
-                               self.btn_restore, self.btn_report, self.btn_stop)):
+                               self.btn_restore, self.btn_pc, self.btn_report, self.btn_stop)):
             bg.addWidget(b, i // 3, i % 3)
         cl.addLayout(bg)
         res = QGridLayout()
@@ -2428,7 +2502,7 @@ class MainWindow(QWidget):
         self.btn_set.setEnabled(not busy and admin)
         for b in (self.btn_set, self.btn_restore):
             b.setToolTip(b.toolTip() if admin else "Нужны права администратора (перезапусти программу)")
-        for b in (self.btn_find, self.btn_check, self.btn_refresh, self.btn_read, self.btn_report):
+        for b in (self.btn_find, self.btn_check, self.btn_refresh, self.btn_read, self.btn_report, self.btn_pc):
             b.setEnabled(not busy)
 
     def ask_stop(self):
@@ -2506,12 +2580,15 @@ class MainWindow(QWidget):
                   and not x["IP"].startswith("169.254.")]
         # свой временный адрес поиска (.247/.246, статический) — не «своя сеть»: антенна его не выдавала
         temp = bool(cur) and not dhcp and cur.rsplit(".", 1)[-1] in (str(SEARCH_HOST), str(SEARCH_HOST - 1))
-        usable = bool(cur and not cur.startswith("169.254.") and not temp)
+        home_cur = self.in_home(cur) if cur else ""
+        usable = bool(cur and not cur.startswith("169.254.") and not temp and not home_cur)
         heard = {}
 
         def job(w):
             """Этап 1 — только своя сеть, сеть адаптера НЕ меняется."""
             dh = "DHCP" if dhcp else "статический"
+            if home_cur:
+                w.log(f"ℹ у кабеля адрес {cur} из домашней сети {home_cur} — её не проверяю")
             if temp:
                 w.log(f"ℹ {cur} — временный адрес, который ставил сам поиск (не от антенны); свою сеть "
                       "не проверяю. «↩ Вернуть как было» вернёт прежние настройки.")
@@ -2574,7 +2651,8 @@ class MainWindow(QWidget):
                 if n not in order:
                     order.append(n)
             order += [n for n in nets if n not in order]
-            busy = [n for n in order if any(ipaddress.IPv4Address(x) in n for x in others)]
+            busy = [n for n in order if any(ipaddress.IPv4Address(x) in n for x in others)
+                    or self.in_home(str(n.network_address + 1))]
             if busy:
                 w.log("ℹ пропускаю подсети других адаптеров (Wi-Fi/интернет не трогаю): "
                       + ", ".join(str(n) for n in busy))
@@ -2747,7 +2825,77 @@ class MainWindow(QWidget):
         idx = self.cb_adapter.findData(want)
         self.cb_adapter.setCurrentIndex(idx if idx >= 0 else 0)
         self.on_adapter()
+        self._remember_home()
         self.log(f"✓ адаптеров: {len(data)}" if data else "⚠ физических адаптеров не найдено")
+
+    def _remember_home(self):
+        """Подсети адаптеров с интернетом (Wi-Fi со шлюзом) — «домашние»: туда программа не лезет никогда."""
+        sel = self.cb_adapter.currentData()
+        home = list(self.cfg.get("home_nets") or [])
+        for x in self.adapters:
+            if x.get("IP") and x.get("Gw") and (x.get("Wifi") or x["Name"] != sel) \
+                    and not x["IP"].startswith("169.254."):
+                n = str(ipaddress.IPv4Network(f"{x['IP']}/{x.get('Prefix') or 24}", strict=False))
+                if n not in home:
+                    home.append(n)
+        self.cfg["home_nets"] = home[-5:]
+
+    def in_home(self, ip):
+        """Адрес в домашней сети (Wi-Fi с интернетом)? -> подсеть или ""."""
+        try:
+            a = ipaddress.IPv4Address(ip)
+        except ValueError:
+            return ""
+        for n in self.cfg.get("home_nets") or []:
+            try:
+                if a in ipaddress.IPv4Network(n):
+                    return n
+            except ValueError:
+                continue
+        return ""
+
+    def _home_refuse(self, ip, what):
+        n = self.in_home(ip)
+        if n:
+            QMessageBox.warning(self, what, f"{ip} — это ваша домашняя сеть Wi-Fi ({n}), а не кабель с антенной.\n\n"
+                                            "Программа туда не лезет. Найдите антенну «🔎 Найти антенну» "
+                                            "или впишите её адрес.")
+        return bool(n)
+
+    def setup_pc(self):
+        """Изоляция: интернет — только Wi-Fi, кабель — только антенны."""
+        a = self.adapter()
+        if not a or a.get("Wifi"):
+            QMessageBox.warning(self, "Настроить ПК", "Сначала выбери на плитке «Адаптер ▾» кабель (RJ45), "
+                                                     "к которому подключены антенны.")
+            return
+        if self._need_admin():
+            return
+        self._remember_home()
+        name, cable_ip = a["Name"], a.get("IP") or ""
+        inet = next((x for x in self.adapters if x["Name"] != name and x.get("Gw") and x.get("Status") == "Up"), None)
+        home = list(self.cfg.get("home_nets") or [])
+        self.cfg["wifi_internet"] = True
+        self.tg_wifi.setChecked(True)
+        pinned_home = [k for k in (self.cfg.get("pinned_routes") or []) if self.in_home(k[1])]
+
+        def job(w):
+            w.log("🛠 настраиваю ПК: интернет — только Wi-Fi, кабель — только антенны…")
+            self._cable_low_priority(w, name)
+            ok, out = drop_default_route(name)
+            w.log("✓ у кабеля нет шлюза в интернет" if ok else f"⚠ шлюз кабеля: {out[:150]}")
+            for n, ip in pinned_home:
+                unpin_route(n, ip)
+                w.log(f"✓ убран маршрут к {ip} через кабель — это домашняя сеть")
+            w.ui(lambda: self.cfg.__setitem__("pinned_routes", [k for k in (self.cfg.get("pinned_routes") or [])
+                                                                 if k not in pinned_home]))
+            if cable_ip and any(ipaddress.IPv4Address(cable_ip) in ipaddress.IPv4Network(n) for n in home):
+                w.log(f"⚠ у кабеля адрес {cable_ip} из домашней сети — нажми «↩ Вернуть как было» "
+                      "или «🔎 Найти антенну» (поиск поставит адрес из подсети антенны)")
+            w.log(f"✓ ПК настроен: интернет — «{inet['Name']}» ({inet['IP']})" if inet else
+                  "⚠ адаптер с интернетом (Wi-Fi со шлюзом) не найден — включи Wi-Fi")
+            w.log(f"✓ антенны — только «{name}»; домашняя сеть {', '.join(home) or '—'} для поиска закрыта")
+        self.run_job("настройка ПК", job)
 
     def adapter_menu(self):
         m = QMenu(self)
@@ -2911,7 +3059,10 @@ class MainWindow(QWidget):
         return ""
 
     def _pin_if_needed(self, w, ip):
-        """Wi-Fi в той же подсети — маршрут к антенне через кабель (Wi-Fi и интернет не трогаем)."""
+        """Wi-Fi в той же подсети — маршрут к антенне через кабель (Wi-Fi и интернет не трогаем).
+        В домашнюю сеть маршрутов через кабель не ставим."""
+        if self.in_home(ip):
+            return
         a, other = self.adapter(), self._conflict_for(ip)
         if not (IS_WIN and a and other and is_admin()):
             return
@@ -2991,6 +3142,8 @@ class MainWindow(QWidget):
         except ValueError:
             QMessageBox.warning(self, "Проверка", "Неверный адрес антенны.")
             return
+        if self._home_refuse(ip, "Проверка"):
+            return
         timeout = self.f_timeout.value()
         src = self._src_for(ip)
 
@@ -3034,6 +3187,8 @@ class MainWindow(QWidget):
             ipaddress.IPv4Address(ip)
         except ValueError:
             QMessageBox.warning(self, "Браузер", "Неверный адрес антенны.")
+            return
+        if self._home_refuse(ip, "Браузер"):
             return
         r = self.last_check if self.last_check and self.last_check.get("ip") in (None, ip) else None
         url = web_url(ip, r)
@@ -3147,16 +3302,57 @@ class MainWindow(QWidget):
         except ValueError:
             QMessageBox.warning(self, "Настройки антенны", "Сначала найди антенну или впиши её адрес.")
             return
+        if self._home_refuse(ip, "Настройки антенны"):
+            return
         src, user, pw = self._src_for(ip), self.e_user.text().strip(), self.e_pw.text()
+        pins = dict(self.cfg.get("cert_pins") or {})
 
         def job(w):
             self._pin_if_needed(w, ip)
             w.log(f"📖 читаю настройки антенны {ip}" + (f" (ноутбук: {src})" if src else "") + "…")
-            lines, raw = read_antenna(ip, src, user, pw, w.log)
+            p80, p443 = tcp_open(ip, 80, 3, src), tcp_open(ip, 443, 3, src)
+            w.log(f"   порт 80 (http): {'открыт' if p80 else 'закрыт'} · 443 (https): {'открыт' if p443 else 'закрыт'}")
+            tls = None
+            if p443:
+                try:
+                    pem, fp = fetch_cert(ip, src)
+                except (OSError, ssl.SSLError) as e:
+                    pem, fp = None, ""
+                    w.log(f"⚠ сертификат https не прочитать: {e}")
+                if pem and pins.get(ip) == fp:
+                    tls = pinned_ctx(pem)
+                    w.log("✓ https: сертификат антенны тот же, что запомнен")
+                elif pem:
+                    w.ui(lambda: self._ask_trust(ip, fp, pins.get(ip)))
+                    return
+            if not tls and not p80:
+                w.log("✗ у антенны закрыты и http, и https — веб выключен или это не антенна")
+                return
+            lines, raw = read_antenna(ip, src, user, pw, w.log, tls)
             for ln in lines:
-                w.log(ln if ln.startswith(("✓", "✗", "⚠")) else "   " + ln)
+                w.log(ln if ln.startswith(("✓", "✗", "⚠", "ℹ")) else "   " + ln)
             w.ui(lambda: self._store_read(ip, lines, raw))
         self.run_job("чтение настроек", job)
+
+    def _ask_trust(self, ip, fp, old):
+        def ask():
+            if self.worker.busy():
+                QTimer.singleShot(200, ask)
+                return
+            changed = (f"\n\n⚠ РАНЬШЕ У НЕЁ БЫЛ ДРУГОЙ СЕРТИФИКАТ:\n{old}\n"
+                       "Так бывает после сброса антенны. Если не сбрасывали — не доверяйте.") if old else ""
+            if QMessageBox.question(self, "Сертификат антенны",
+                                    f"Антенна {ip} работает по https со своим сертификатом.\n\n"
+                                    f"Отпечаток SHA-256:\n{fp}{changed}\n\n"
+                                    "Доверять ей? Программа запомнит именно этот сертификат и будет "
+                                    "сверять его каждый раз.") == QMessageBox.Yes:
+                self.cfg.setdefault("cert_pins", {})[ip] = fp
+                self.save_if_changed()
+                self.log(f"✓ сертификат {ip} запомнен")
+                self.read_settings()
+            else:
+                self.log("ℹ сертификату не доверили — настройки по https не читаю")
+        ask()
 
     def _store_read(self, ip, lines, raw):
         self.last_read = {"ip": ip, "time": time.strftime("%H:%M:%S"), "lines": lines, "raw": raw}
