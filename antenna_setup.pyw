@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.4.6
+antenna_setup.pyw  v0.4.7
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,9 @@ antenna_setup.pyw  v0.4.6
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.4.7: программа больше не вешает веб антенны: порт 80 проверяется HEAD-запросом с дочитыванием
+          ответа (раньше — «соединился и молча закрыл», от чего старые TP-Link падали до перезагрузки),
+          порт 443 — TLS-рукопожатием; так и в поиске, и в проверке, и перед чтением настроек.
   v0.4.6: антенна молчит программе — диагностика другими средствами Windows (curl.exe, PowerShell),
           антивирус и прокси — в журнал и отчёт с выводом «режет антивирус» / «молчит всем».
   v0.4.5: «🛠 Настроить ПК» — изоляция: интернет только Wi-Fi (кабелю низкий приоритет и без шлюза),
@@ -75,7 +78,7 @@ antenna_setup.pyw  v0.4.6
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.4.6"
+VERSION = "0.4.7"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -449,28 +452,60 @@ def tcp_open(ip, port, timeout=2.0, src=None):
         return False
 
 
-def http_status(ip, timeout=3.0):
-    """(код, Location) с порта 80 без перехода по редиректам; None — нет ответа."""
-    c = http.client.HTTPConnection(ip, 80, timeout=timeout)
+def web_alive(ip, timeout=3.0, src=None):
+    """Порт 80 — БЕРЕЖНО: соединиться, спросить «HEAD /» и дочитать ответ, как браузер.
+    Старые встроенные веб-серверы антенн (TP-Link и др.) падают до перезагрузки, если соединение
+    открыли и закрыли молча — поэтому «просто постучать» в порт 80 нельзя.
+    -> None — порт закрыт; (0, "") — соединились, но ответа нет; (код, Location)."""
     try:
-        c.request("GET", "/", headers={"User-Agent": "antenna_setup"})
-        r = c.getresponse()
-        return r.status, r.getheader("Location") or ""
-    except (OSError, http.client.HTTPException):
+        sk = socket.create_connection((ip, 80), timeout=timeout, source_address=(src, 0) if src else None)
+    except OSError:
         return None
+    data = b""
+    try:
+        sk.sendall(f"HEAD / HTTP/1.0\r\nHost: {ip}\r\nUser-Agent: {BROWSER_HEADERS['User-Agent']}\r\n\r\n".encode())
+        sk.settimeout(timeout)
+        while len(data) < 16384:
+            chunk = sk.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        pass
     finally:
-        c.close()
+        sk.close()
+    head = data.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+    lines = head.split("\r\n")
+    try:
+        code = int(lines[0].split()[1]) if lines[0].startswith("HTTP/") else 0
+    except (IndexError, ValueError):
+        code = 0
+    loc = next((ln.split(":", 1)[1].strip() for ln in lines[1:] if ln.lower().startswith("location:")), "")
+    return code, loc
+
+
+def tls_alive(ip, timeout=3.0, src=None):
+    """Порт 443 — тоже бережно: полноценное TLS-рукопожатие и вежливое закрытие."""
+    try:
+        fetch_cert(ip, src, timeout)
+        return True
+    except (OSError, ssl.SSLError, ValueError):
+        return False
+
+
+def gentle_open(ip, port, timeout=2.0, src=None):
+    """Открыт ли порт — не роняя веб антенны (80 — HEAD-запросом, 443 — TLS)."""
+    if port == 80:
+        return web_alive(ip, timeout, src) is not None
+    if port == 443:
+        return tls_alive(ip, timeout, src)
+    return tcp_open(ip, port, timeout, src)
 
 
 def check_antenna(ip, timeout=3.0, src=None):
-    res = {"ping": ping(ip, min(timeout, 2.0), src), "p80": tcp_open(ip, 80, timeout, src),
-           "p443": tcp_open(ip, 443, timeout, src), "http": None}
-    if res["p80"]:
-        try:
-            st, hd, _b = http_get(ip, "/", src, timeout=timeout)
-            res["http"] = (st, hd.get("location", ""))
-        except (OSError, http.client.HTTPException):
-            res["http"] = None
+    w = web_alive(ip, timeout, src)
+    res = {"ping": ping(ip, min(timeout, 2.0), src), "p80": w is not None,
+           "p443": tls_alive(ip, timeout, src), "http": w if w and w[0] else None}
     res["alive"] = res["ping"] or res["p80"] or res["p443"]
     return res
 
@@ -603,7 +638,7 @@ def read_tplink_classic(ip, src, user, pw):
     lines, raw = [], {}
     for page in ("/userRpm/StatusRpm.htm", "/userRpm/WlanNetworkRpm.htm", "/userRpm/NetworkCfgRpm.htm"):
         st, _hd, body = http_get(ip, page, src, {"Authorization": auth, "Referer": f"http://{ip}/"})
-        if st == 401:
+        if st == 401 and not lines:      # главная страница не пустила — логин/пароль не те
             return None, {"tplink": "логин/пароль не подошли"}
         if st != 200:
             continue
@@ -833,7 +868,7 @@ def parse_subnets(text):
     return out
 
 
-def scan_subnet(net, skip=(), src=None, ports=SEARCH_PORTS, timeout=0.5, stopped=lambda: False):
+def scan_subnet(net, skip=(), src=None, ports=SEARCH_PORTS, timeout=1.0, stopped=lambda: False):
     """Ищет в подсети узлы с открытыми портами (веб антенны). {ip: [порты]} по возрастанию адреса."""
     # свои потоки, без concurrent.futures: в Python 3.15 он падал «'lazy_import' object is not callable»
     hosts = iter([str(h) for h in net.hosts() if str(h) not in skip])
@@ -845,7 +880,7 @@ def scan_subnet(net, skip=(), src=None, ports=SEARCH_PORTS, timeout=0.5, stopped
                 ip = next(hosts, None)
             if ip is None:
                 return
-            opened = [p for p in ports if tcp_open(ip, p, timeout, src)]
+            opened = [p for p in ports if gentle_open(ip, p, timeout, src)]
             if opened:
                 with lock:
                     found[ip] = opened
@@ -3348,8 +3383,14 @@ class MainWindow(QWidget):
         def job(w):
             self._pin_if_needed(w, ip)
             w.log(f"📖 читаю настройки антенны {ip}" + (f" (ноутбук: {src})" if src else "") + "…")
-            p80, p443 = tcp_open(ip, 80, 3, src), tcp_open(ip, 443, 3, src)
-            w.log(f"   порт 80 (http): {'открыт' if p80 else 'закрыт'} · 443 (https): {'открыт' if p443 else 'закрыт'}")
+            wa = web_alive(ip, 5, src)
+            p80, p443 = wa is not None, tls_alive(ip, 5, src)
+            w.log(f"   порт 80 (http): {'закрыт' if wa is None else ('ответ ' + str(wa[0]) if wa[0] else 'открыт, но молчит')}"
+                  f" · 443 (https): {'открыт' if p443 else 'закрыт'}")
+            if wa is not None and not wa[0] and not p443:
+                w.log("⚠ веб антенны завис (соединение есть, ответа нет) — так бывало от старых версий "
+                      "программы. Выдерни PoE на 10 с, подожди минуту и нажми ещё раз.")
+                return
             tls = None
             if p443:
                 try:
