@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.3.6
+antenna_setup.pyw  v0.3.7
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,8 @@ antenna_setup.pyw  v0.3.6
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.3.7: кнопка «⏹ Стоп» в «Действиях»; «↩ Вернуть как было» работает и во время поиска —
+          останавливает его и возвращает сеть адаптера.
   v0.3.6: свой временный адрес поиска (x.x.x.247, статический) больше не принимается за «свою сеть»
           антенны — сразу прослушка кабеля и перебор подсетей (с вопросом).
   v0.3.5: перед поиском адаптеры перечитываются (адрес мог прийти после запуска — раньше поиск
@@ -47,7 +49,7 @@ antenna_setup.pyw  v0.3.6
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.3.6"
+VERSION = "0.3.7"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -1478,10 +1480,15 @@ class MainWindow(QWidget):
         self.btn_restore.setObjectName("danger")
         self.btn_restore.setToolTip("Вернуть адаптеру прежние настройки (или DHCP, если снимка нет)")
         self.btn_restore.clicked.connect(self.restore)
+        self.btn_stop = QPushButton("⏹ Стоп")
+        self.btn_stop.setToolTip("Остановить поиск / проверку (Esc). Если поиск менял адрес — он вернёт сеть сам")
+        self.btn_stop.clicked.connect(self.ask_stop)
+        self.btn_stop.setEnabled(False)
         bg = QGridLayout()
         bg.setHorizontalSpacing(8)
         bg.setVerticalSpacing(8)
-        for i, b in enumerate((self.btn_find, self.btn_set, self.btn_check, self.btn_open, self.btn_restore)):
+        for i, b in enumerate((self.btn_find, self.btn_set, self.btn_check, self.btn_open, self.btn_restore,
+                               self.btn_stop)):
             bg.addWidget(b, i // 3, i % 3)
         cl.addLayout(bg)
         res = QGridLayout()
@@ -1942,8 +1949,10 @@ class MainWindow(QWidget):
 
     def set_busy(self, busy):
         admin = is_admin()
+        self.btn_stop.setEnabled(busy)
+        self.btn_restore.setEnabled(admin)      # и во время поиска: остановит и вернёт сеть
+        self.btn_set.setEnabled(not busy and admin)
         for b in (self.btn_set, self.btn_restore):
-            b.setEnabled(not busy and admin)
             b.setToolTip(b.toolTip() if admin else "Нужны права администратора (перезапусти программу)")
         for b in (self.btn_find, self.btn_check, self.btn_refresh):
             b.setEnabled(not busy)
@@ -2463,6 +2472,28 @@ class MainWindow(QWidget):
 
     def restore(self):
         if self.worker.busy():
+            if self.worker.blocking_close:
+                return
+            if QMessageBox.question(self, "Вернуть как было", f"Остановить «{self.worker.name}» и вернуть "
+                                    "сеть адаптера как было?") != QMessageBox.Yes:
+                return
+            name = (self.adapter() or {}).get("Name", "")
+            self.worker.stop_flag.set()
+            self.log("⏹ останавливаю, потом верну сеть…")
+
+            def later():
+                if self.worker.busy():
+                    QTimer.singleShot(300, later)
+                elif name and name in (self.cfg.get("saved_net") or {}):
+                    self._restore_now()
+                else:
+                    self.log("✓ сеть адаптера уже как была")
+            QTimer.singleShot(300, later)
+            return
+        self._restore_now(ask=True)
+
+    def _restore_now(self, ask=False):
+        if self.worker.busy():
             return
         a = self.adapter()
         if not a:
@@ -2473,8 +2504,8 @@ class MainWindow(QWidget):
         what = ("DHCP (автоматически)" if not snap or snap.get("dhcp") or not snap.get("ip")
                 else f"{snap['ip']} / {snap['mask']}, шлюз {snap.get('gw') or '—'}")
         extra = "" if snap else "\n\nПрежние настройки не запомнены — будет DHCP."
-        if QMessageBox.question(self, "Вернуть как было",
-                                f"Вернуть «{name}»: {what}?{extra}") != QMessageBox.Yes:
+        if ask and QMessageBox.question(self, "Вернуть как было",
+                                        f"Вернуть «{name}»: {what}?{extra}") != QMessageBox.Yes:
             return
         if self._need_admin():
             return
