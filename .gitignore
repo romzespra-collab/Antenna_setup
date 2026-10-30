@@ -10,4 +10,3 @@ dist/
 _backup/
 *.zip
 !release/*.zip
-setup.log

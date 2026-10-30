@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.2.3
+antenna_setup.pyw  v0.3.0
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,9 @@ antenna_setup.pyw  v0.2.3
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.3.0: обновление с GitHub — общий модуль gh_update 1.3.1 из SmartMon (app/gh_update*.py:
+          токен с инструкцией «?», автопроверка, «Что нового», докачка, сверка суммы, перезапуск);
+          setup.bat — по образцу START_ON_NEW_PC.bat из SmartMon (один Python 3.15 на компьютер).
   v0.2.3: установка через setup.ps1 (у .bat с русским текстом Windows 10 теряла метки и молча
           закрывала окно); при падении программы — окно с ошибкой и antenna_setup.log.
   v0.2.2: setup.bat ставит Python с python.org сам (без winget, которого нет на части Windows 10).
@@ -26,7 +29,7 @@ antenna_setup.pyw  v0.2.3
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.2.3"
+VERSION = "0.3.0"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -49,14 +52,13 @@ import tempfile
 import threading
 import time
 import traceback
-import urllib.error
-import urllib.request
-import zipfile
 from pathlib import Path
 
 FROZEN = bool(getattr(sys, "frozen", False))
 APP_ROOT = Path(sys.executable).parent if FROZEN else Path(os.path.abspath(__file__)).parent
 CONFIG_PATH = APP_ROOT / "config.json"
+if str(APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(APP_ROOT))   # app/ — общие модули (gh_update)
 NO_WINDOW = 0x08000000
 IS_WIN = sys.platform == "win32"
 
@@ -167,8 +169,8 @@ DEFAULT_CONFIG = {
     "theme": "dark", "search_subnets": SEARCH_SUBNETS,
     "antenna_ip": "", "mask": "", "my_ip": "", "adapter": "",
     "check_timeout": 3, "check_retries": 6, "auto_check": True, "ask_admin": True,
-    "check_updates": True, "github_repo": GITHUB_REPO, "github_branch": GITHUB_BRANCH,
-    "github_token": "", "saved_net": {}, "geometry": "", "page": 0,
+    "upd_token": "", "upd_auto": True, "upd_branch": GITHUB_BRANCH, "upd_every_h": 12,
+    "saved_net": {}, "geometry": "", "page": 0,
 }
 
 # ───────────────────────── конфиг (атомарно, с .bak) ─────────────────────────
@@ -452,117 +454,6 @@ def web_url(ip, res=None):
         return f"https://{ip}/"
     return f"http://{ip}/"
 
-# ───────────────────────── обновление с GitHub ─────────────────────────
-
-
-UPDATE_SKIP_DIRS = {"release", ".git", ".github", "modules", "tools", "_backup", "_other",
-                    "_update_tmp", "__pycache__", "build", "dist"}
-UPDATE_SKIP_FILES = {"config.json", "config.json.bak", "selftest.txt"}
-
-
-class UpdateError(Exception):
-    def __init__(self, text, permanent=False):
-        super().__init__(text)
-        self.permanent = permanent
-
-
-def ver_tuple(v):
-    out = []
-    for part in str(v).strip().lstrip("vV").split("."):
-        digits = "".join(ch for ch in part if ch.isdigit())
-        out.append(int(digits) if digits else 0)
-    return tuple(out + [0] * (3 - len(out)))
-
-
-def _gh_request(url, token, accept, timeout=30):
-    req = urllib.request.Request(url, headers={"Accept": accept, "User-Agent": "antenna_setup",
-                                               "X-GitHub-Api-Version": "2022-11-28"})
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    try:
-        return urllib.request.urlopen(req, timeout=timeout)
-    except urllib.error.HTTPError as e:
-        if e.code == 401:
-            raise UpdateError("GitHub отклонил токен (401) — проверь токен в настройках.", True)
-        if e.code == 404:
-            raise UpdateError("Не найдено (404): репозиторий приватный — нужен токен с доступом "
-                              "к нему, или неверное имя репозитория/ветки.", True)
-        if e.code in (403, 429):
-            raise UpdateError(f"GitHub ограничил доступ ({e.code}) — попробуй позже.")
-        raise UpdateError(f"GitHub ответил {e.code} — попробуй позже.")
-    except (urllib.error.URLError, OSError) as e:
-        raise UpdateError(f"Нет связи с GitHub: {getattr(e, 'reason', e)}")
-
-
-def remote_version(repo, branch, token):
-    url = f"https://api.github.com/repos/{repo}/contents/VERSION?ref={branch}"
-    with _gh_request(url, token, "application/vnd.github.raw") as r:
-        v = r.read(100).decode("utf-8", "replace").strip()
-    if not v or ver_tuple(v) == (0, 0, 0):
-        raise UpdateError(f"Непонятная версия на GitHub: {v!r}")
-    return v
-
-
-def update_plan(src_root):
-    """Относительные пути файлов из архива, которые ставим (свои файлы пользователя не трогаем)."""
-    plan = []
-    src_root = Path(src_root)
-    for p in sorted(src_root.rglob("*")):
-        if not p.is_file():
-            continue
-        rel = p.relative_to(src_root)
-        if rel.parts[0] in UPDATE_SKIP_DIRS or "__pycache__" in rel.parts:
-            continue
-        if rel.name in UPDATE_SKIP_FILES or rel.suffix.lower() in (".zip", ".log", ".tmp"):
-            continue
-        plan.append(rel)
-    return plan
-
-
-def install_update(repo, branch, token, dest_root, old_version, log=print, stopped=lambda: False):
-    """Качает архив ветки, кладёт новые файлы поверх. Заменяемые — в _backup/v<старая>/. Ничего не удаляет."""
-    dest_root = Path(dest_root)
-    url = f"https://api.github.com/repos/{repo}/zipball/{branch}"
-    tmp = Path(tempfile.mkdtemp(prefix="antenna_upd_"))
-    try:
-        zpath = tmp / "src.zip"
-        log("⏳ качаю архив ветки …")
-        with _gh_request(url, token, "application/vnd.github+json", timeout=60) as r, open(zpath, "wb") as f:
-            shutil.copyfileobj(r, f)
-        if stopped():
-            raise UpdateError("Остановлено.")
-        with zipfile.ZipFile(zpath) as z:
-            for n in z.namelist():
-                if n.startswith("/") or ".." in Path(n).parts:
-                    raise UpdateError("В архиве подозрительный путь — обновление отменено.", True)
-            z.extractall(tmp / "x")
-        tops = [p for p in (tmp / "x").iterdir() if p.is_dir()]
-        if len(tops) != 1:
-            raise UpdateError("Неожиданная структура архива.", True)
-        src = tops[0]
-        if not (src / "antenna_setup.pyw").exists():
-            raise UpdateError("В архиве нет antenna_setup.pyw — это не та программа.", True)
-        backup = dest_root / "_backup" / f"v{old_version}"
-        changed = 0
-        for rel in update_plan(src):
-            s, d = src / rel, dest_root / rel
-            data = s.read_bytes()
-            if d.exists() and d.read_bytes() == data:
-                continue
-            if d.exists():
-                b = backup / rel
-                b.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(d, b)
-            d.parent.mkdir(parents=True, exist_ok=True)
-            t = d.with_name(d.name + ".tmp")
-            t.write_bytes(data)
-            _replace_retry(t, d)
-            changed += 1
-            log(f"✓ {rel.as_posix()}")
-        return changed
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
 # ───────────────────────── права администратора ─────────────────────────
 
 
@@ -619,8 +510,6 @@ class Worker:
         def run():
             try:
                 fn(self)
-            except UpdateError as e:
-                self.log(f"✗ {e}")
             except Exception as e:
                 self.log(f"✗ {name}: {e}")
             finally:
@@ -688,6 +577,12 @@ def _qss(p):
     QListWidget::item:hover {{ background: {p['panel']}; }}
     QListWidget::item:selected {{ background: {_rgba(p['accent'], 40)}; color: {p['text']};
         border-left: 3px solid {p['accent']}; }}
+    QGroupBox {{ background: {p['panel']}; border: 1px solid {p['line']}; border-radius: 10px;
+        margin-top: 16px; padding: 10px 8px 8px 8px; font-weight: 600; }}
+    QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 4px; color: {p['muted']}; }}
+    QCheckBox, QRadioButton {{ color: {p['text']}; background: transparent; }}
+    QWidget#setinner {{ background: {p['bg']}; }}
+    QGroupBox QPushButton {{ padding: 5px 8px; min-width: 0; }}
     QPushButton {{ background: {p['panel2']}; color: {p['text']}; border: 1px solid {p['line']};
         border-radius: 7px; padding: 6px 12px; min-width: 80px; }}
     QPushButton:hover {{ border-color: {p['accent']}; }}
@@ -1438,15 +1333,13 @@ class MainWindow(QWidget):
         self.f_retries.setToolTip("После смены IP Windows нужно несколько секунд — столько раз повторить проверку")
         self.tg_auto = Toggle()
         self.tg_admin = Toggle()
-        self.tg_upd = Toggle()
         self.e_subnets = QLineEdit()
         self.e_subnets.setMinimumWidth(600)
         self.e_subnets.setToolTip("Где искать антенну, если в своей подсети пусто. Через запятую, по /24")
         self.e_subnets.textEdited.connect(self._sync_cfg)
         rows = (("Подсети для поиска", self.e_subnets), ("Таймаут проверки", self.f_timeout), ("Повторов после смены IP", self.f_retries),
                 ("Проверять антенну сразу после смены IP", self.tg_auto),
-                ("Просить права администратора при запуске", self.tg_admin),
-                ("Проверять обновления при запуске", self.tg_upd))
+                ("Просить права администратора при запуске", self.tg_admin))
         for i, (t, w) in enumerate(rows):
             g.addWidget(_lab(t), i, 0)
             g.addWidget(w, i, 1, Qt.AlignLeft)
@@ -1485,52 +1378,48 @@ class MainWindow(QWidget):
         lay.addStretch()
         for w in (self.f_timeout, self.f_retries):
             w.valueChanged.connect(self._sync_cfg)
-        for w in (self.tg_auto, self.tg_admin, self.tg_upd):
+        for w in (self.tg_auto, self.tg_admin):
             w.toggled.connect(self._sync_cfg)
         return page
 
     def _page_update(self):
-        page = QWidget()
-        page.setObjectName("page")
-        lay = QVBoxLayout(page)
-        lay.setContentsMargins(0, 0, 0, 8)
-        lay.setSpacing(10)
-        c, cl = _card("Обновление с GitHub")
-        g = QGridLayout()
-        g.setHorizontalSpacing(10)
-        self.e_repo = QLineEdit()
-        self.e_repo.setPlaceholderText("владелец/репозиторий")
-        self.e_branch = QLineEdit()
-        self.e_token = QLineEdit()
-        self.e_token.setEchoMode(QLineEdit.Password)
-        self.e_token.setPlaceholderText("нужен для приватного репозитория (права: Contents — read)")
-        self.e_token.setToolTip("Хранится только в config.json рядом с программой")
-        self.l_ver = _lab(f"Установлена: v{VERSION}   ·   на GitHub: —", "hint")
-        g.addWidget(_lab("Репозиторий"), 0, 0)
-        g.addWidget(self.e_repo, 0, 1)
-        g.addWidget(_lab("Ветка"), 1, 0)
-        g.addWidget(self.e_branch, 1, 1)
-        g.addWidget(_lab("Токен GitHub"), 2, 0)
-        g.addWidget(self.e_token, 2, 1)
-        cl.addLayout(g)
-        cl.addWidget(self.l_ver)
-        row = QHBoxLayout()
-        self.btn_ucheck = QPushButton("🔎 Проверить")
-        self.btn_ucheck.clicked.connect(lambda: self.check_update(install=False))
-        self.btn_uinst = QPushButton("⬇ Обновить")
-        self.btn_uinst.setObjectName("primary")
-        self.btn_uinst.clicked.connect(lambda: self.check_update(install=True))
-        row.addWidget(self.btn_ucheck)
-        row.addWidget(self.btn_uinst)
-        row.addStretch()
-        cl.addLayout(row)
-        cl.addWidget(_lab("Заменяемые файлы сохраняются в _backup/v<версия>/. config.json, modules/, "
-                          "tools/ и другие свои файлы не трогаются.", "hint"))
-        lay.addWidget(c)
-        lay.addStretch()
-        for e in (self.e_repo, self.e_branch, self.e_token):
-            e.textEdited.connect(self._sync_cfg)
-        return page
+        """Вкладка «Обновление» — общий модуль gh_update (как в SmartMon)."""
+        from app import gh_update, gh_update_qt
+        gh_update_qt.set_colors(lambda: {"accent": P["accent"], "text": P["text"], "dim": P["muted"],
+                                         "panel": P["panel"], "border": P["line"]})
+        target = gh_update.UpdateTarget(
+            owner=GITHUB_REPO.split("/")[0], repo=GITHUB_REPO.split("/")[1], name="antenna_setup",
+            current=VERSION, app_dir=str(APP_ROOT), main_file="antenna_setup.pyw",
+            changelog="README.md", version_files=("VERSION",), where="Обновление")
+
+        def cfg_get():
+            c = self.cfg
+            return {"token": c.get("upd_token") or "", "auto": bool(c.get("upd_auto", True)),
+                    "branch": c.get("upd_branch") or GITHUB_BRANCH, "every_h": int(c.get("upd_every_h") or 12)}
+
+        def cfg_set(d):
+            self.cfg["upd_token"] = d.get("token") or ""
+            self.cfg["upd_auto"] = bool(d.get("auto"))
+            self.cfg["upd_branch"] = d.get("branch") or GITHUB_BRANCH
+            self.cfg["upd_every_h"] = int(d.get("every_h") or 12)
+            self.save_if_changed()
+
+        self.update_page = gh_update_qt.UpdatePage(target, cfg_get, cfg_set, on_quit=self._quit_for_update,
+                                                   log=lambda *a: self.q.put(("log", " ".join(str(x) for x in a))))
+        self.update_page.box.setFixedWidth(450)   # под шрифт 10pt — кнопки не обрезаются
+        self.update_page.box.available.connect(
+            lambda v: self.set_status(f"⬆ есть новая версия {v} — вкладка «Обновление»"))
+        return self.update_page
+
+    def _quit_for_update(self):
+        """Обновлено, новая копия уже запущена — эта закрывается полностью."""
+        self.save_now()
+        self._force_close = True
+        self.close()
+        QApplication.instance().quit()
+
+    def update_busy(self):
+        return bool(getattr(getattr(self, "update_page", None), "box", None) and self.update_page.box._busy)
 
     def _shortcuts(self):
         for key, fn in (("F5", self.refresh), ("F6", self.check), ("F7", self.search), ("Ctrl+O", self.open_browser),
@@ -1595,7 +1484,7 @@ class MainWindow(QWidget):
         m.addAction("🔄 Обновить адаптеры\tF5", self.refresh)
         m.addAction("🔎 Найти антенну\tF7", self.search).setEnabled(not self.worker.busy())
         a = m.addAction("⬇ Обновить программу с GitHub…", self.update_from_menu)
-        a.setEnabled(not self.worker.busy())
+        a.setEnabled(not self.worker.busy() and not self.update_busy())
         m.addAction("💾 Сохранить\tCtrl+S", self.save_now)
         m.addAction("🎨 Тема\tCtrl+T", self.toggle_theme)
         m.addSeparator()
@@ -1638,9 +1527,6 @@ class MainWindow(QWidget):
             m.addAction("Удалить", w.del_).setEnabled(has and not ro)
             m.addSeparator()
             m.addAction("Выделить всё", w.selectAll)
-            if w is self.e_token:
-                m.addAction("Показать / скрыть токен", lambda: w.setEchoMode(
-                    QLineEdit.Normal if w.echoMode() == QLineEdit.Password else QLineEdit.Password))
         elif not own:
             return False
         elif w is self.found or w.parent() is self.found:
@@ -1670,10 +1556,6 @@ class MainWindow(QWidget):
         self.f_retries.setValue(c.get("check_retries", 6))
         self.tg_auto.setChecked(bool(c.get("auto_check", True)))
         self.tg_admin.setChecked(bool(c.get("ask_admin", True)))
-        self.tg_upd.setChecked(bool(c.get("check_updates", True)))
-        self.e_repo.setText(c.get("github_repo") or GITHUB_REPO)
-        self.e_branch.setText(c.get("github_branch") or GITHUB_BRANCH)
-        self.e_token.setText(c.get("github_token", ""))
         c.pop("preset", None)
         c.pop("custom_presets", None)
         self.e_subnets.setText(c.get("search_subnets") or SEARCH_SUBNETS)
@@ -1711,10 +1593,6 @@ class MainWindow(QWidget):
         c["check_retries"] = self.f_retries.value()
         c["auto_check"] = self.tg_auto.isChecked()
         c["ask_admin"] = self.tg_admin.isChecked()
-        c["check_updates"] = self.tg_upd.isChecked()
-        c["github_repo"] = self.e_repo.text().strip()
-        c["github_branch"] = self.e_branch.text().strip() or GITHUB_BRANCH
-        c["github_token"] = self.e_token.text().strip()
         c["search_subnets"] = self.e_subnets.text().strip() or SEARCH_SUBNETS
         c["antenna_ip"] = self.e_ant.text().strip()
         c["mask"] = self.e_mask.text().strip()
@@ -1871,7 +1749,7 @@ class MainWindow(QWidget):
         for b in (self.btn_set, self.btn_restore):
             b.setEnabled(not busy and admin)
             b.setToolTip(b.toolTip() if admin else "Нужны права администратора (перезапусти программу)")
-        for b in (self.btn_find, self.btn_check, self.btn_refresh, self.btn_ucheck, self.btn_uinst):
+        for b in (self.btn_find, self.btn_check, self.btn_refresh):
             b.setEnabled(not busy)
 
     def ask_stop(self):
@@ -2272,58 +2150,12 @@ class MainWindow(QWidget):
         self.l_saved.setText("\n".join(lines))
 
     # ── обновление ──
-    def check_update(self, install=False, quiet=False):
-        if FROZEN:
-            if not quiet:
-                QMessageBox.information(self, "Обновление", "Это EXE-сборка: скачай новую сборку из release/ на GitHub.")
-            return
-        self._sync_cfg()
-        repo, branch, token = self.cfg["github_repo"], self.cfg["github_branch"], self.cfg["github_token"]
-        if "/" not in repo:
-            QMessageBox.warning(self, "Обновление", "Впиши репозиторий как владелец/имя.")
-            return
-
-        if quiet and self.worker.busy():
-            QTimer.singleShot(2000, lambda: self.check_update(install, quiet))
-            return
-
-        def job(w):
-            if not quiet:
-                w.log(f"🔎 смотрю версию на GitHub ({repo}, {branch})…")
-            try:
-                rv = remote_version(repo, branch, token)
-            except UpdateError as e:
-                if not quiet or e.permanent:
-                    w.log(f"✗ {e}")
-                return
-            newer = ver_tuple(rv) > ver_tuple(VERSION)
-            w.ui(lambda: self.l_ver.setText(f"Установлена: v{VERSION}   ·   на GitHub: v{rv}"
-                                            + ("   ·   есть новая" if newer else "   ·   последняя")))
-            if not newer:
-                if not quiet:
-                    w.log(f"✓ у тебя последняя версия (v{VERSION})")
-                return
-            w.log(f"⬆ на GitHub есть v{rv}")
-            if not install:
-                w.ui(lambda: self.set_status(f"есть обновление v{rv} — вкладка «Обновление»"))
-                return
-            w.blocking_close = True
-            n = install_update(repo, branch, token, APP_ROOT, VERSION, w.log, w.stopped)
-            w.log(f"✓ обновлено файлов: {n}. Нужен перезапуск.")
-            w.ui(lambda: self.offer_restart(rv))
-        self.run_job("обновление", job)
-
     def update_from_menu(self):
         self.set_page(2)
-        self.check_update(install=True)
-
-    def offer_restart(self, rv):
-        if QMessageBox.question(self, "Обновление", f"Установлена v{rv}. Перезапустить программу?") \
-                == QMessageBox.Yes:
-            self.restart()
+        self.update_page.box.check(manual=True)
 
     def restart(self, admin=False):
-        if self.worker.busy():
+        if self.worker.busy() or self.update_busy():
             QMessageBox.information(self, "Перезапуск", "Дождись конца работы.")
             return
         self.save_now()
@@ -2344,11 +2176,11 @@ class MainWindow(QWidget):
         if getattr(self, "_force_close", False):
             e.accept()
             return
+        if self.update_busy():
+            QMessageBox.information(self, "Закрытие", "Идёт обновление программы — дождись конца.")
+            e.ignore()
+            return
         if self.worker.busy():
-            if self.worker.blocking_close:
-                QMessageBox.information(self, "Закрытие", "Идёт установка обновления — дождись конца.")
-                e.ignore()
-                return
             if QMessageBox.question(self, "Закрытие", f"Идёт «{self.worker.name}». Остановить и закрыть?") \
                     != QMessageBox.Yes:
                 e.ignore()
@@ -2410,7 +2242,15 @@ def selftest():
     port = srv.getsockname()[1]
     ok("поиск находит узел", list(scan_subnet(ipaddress.IPv4Network("127.0.0.0/30"), ports=(port,))) == ["127.0.0.1"])
     srv.close()
-    ok("ver_tuple", ver_tuple("v0.10.1") > ver_tuple("0.9.9") and ver_tuple("1.0") == (1, 0, 0))
+    try:
+        import importlib as _il
+        gh_update = _il.import_module("app.gh_update")
+        for m in ("app.gh_update_qt", "app.gh_update_help"):
+            _il.import_module(m)
+        ok(f"модуль обновления gh_update {gh_update.VERSION}",
+           gh_update.newer("0.3.1", "0.3.0") and not gh_update.newer("0.2.9", "0.3.0"))
+    except Exception as e:
+        ok(f"модуль обновления: {e}", False)
     ok("decode cp866", decode_out("Ошибка".encode("cp866")) == "Ошибка")
     ok("restore dhcp", restore_commands("Ethernet 2", {"dhcp": True})[0][-1] == "source=dhcp")
     rc = restore_commands("E", {"dhcp": False, "ip": "10.0.0.5", "mask": "255.255.255.0",
@@ -2426,12 +2266,6 @@ def selftest():
         (Path(d) / "config.json.bak").write_text("{", encoding="utf-8")
         c, w = load_config(cp)
         ok("config: оба битые → не писать", not w)
-        src = Path(d) / "src"
-        for rel in ("antenna_setup.pyw", "VERSION", "release/x.zip", "modules/m.pyw", "config.json", "tools/t"):
-            (src / rel).parent.mkdir(parents=True, exist_ok=True)
-            (src / rel).write_text("x")
-        plan = {r.as_posix() for r in update_plan(src)}
-        ok("план обновления не трогает свои файлы", plan == {"antenna_setup.pyw", "VERSION"})
     ok("утечек токенов нет", not leak_scan(APP_ROOT))
     if not IS_WIN:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -2483,13 +2317,20 @@ def install_ru(app):
 def main():
     if "--selftest" in sys.argv:
         sys.exit(selftest())
+    from app import gh_update
+    gh_update.wait_previous(sys.argv)   # после обновления — дождаться закрытия старой копии
     if IS_WIN:
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
         except Exception:
             pass
     cfg, writable = load_config()
-    if IS_WIN and cfg.get("ask_admin", True) and "--no-admin" not in sys.argv and not is_admin():
+    if cfg.get("github_token") and not cfg.get("upd_token"):   # токен из v0.2.x
+        cfg["upd_token"] = cfg["github_token"]
+    for k in ("github_token", "github_repo", "github_branch", "check_updates"):
+        cfg.pop(k, None)
+    if IS_WIN and cfg.get("ask_admin", True) and "--no-admin" not in sys.argv \
+            and "--after-update" not in sys.argv and not is_admin():
         if relaunch_as_admin():
             sys.exit(0)
     QApplication.setAttribute(Qt.AA_DontUseNativeDialogs, True)
@@ -2507,8 +2348,6 @@ def main():
         win.log("⚠ нет прав администратора — смена IP недоступна (⋯ → Перезапуск или ответь «да» при запуске).")
     win.set_busy(False)
     QTimer.singleShot(200, win.refresh)
-    if cfg.get("check_updates", True):
-        QTimer.singleShot(3000, lambda: win.check_update(install=False, quiet=True))
     sys.exit(app.exec())
 
 
