@@ -1,2 +1,10 @@
-# Antenna_setup
-Antenna_setup
+# Antenna_setup — v0.1.0
+
+Настройка ноутбука (Windows) под антенну, подключённую кабелем / PoE:
+статический IP на адаптер, проверка ответа антенны, открытие веб-интерфейса, возврат на DHCP.
+
+## Запуск
+1. `setup.bat` — ставит Python (winget) и PySide6, запускает программу.
+2. Программу запускать от имени администратора (нужно для netsh).
+
+Пресеты: Comfast CF-E314N, TP-Link TL-WA5210G, Ubiquiti NanoStation M5.
