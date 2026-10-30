@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.4.2
+antenna_setup.pyw  v0.4.3
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,7 @@ antenna_setup.pyw  v0.4.2
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.4.3: понятные надписи: «антенна X (ноутбук: Y)» вместо «X с Y» (читалось как диапазон адресов).
   v0.4.2: чтение настроек: ждём ответа веба до 20 с (было 5 — медленная антенна «timed out» до логина),
           заголовки как у браузера, не вышло с адреса кабеля — пробуем как браузер; диагностика
           (соединение / первый байт / что прислала) — в журнал и в отчёт; логин / пароль по умолчанию
@@ -65,7 +66,7 @@ antenna_setup.pyw  v0.4.2
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -660,7 +661,7 @@ def read_antenna(ip, src=None, user="", pw="", log=print):
             src = s_
             break
         except (OSError, http.client.HTTPException) as e:
-            log(f"… {ip}{' с ' + s_ if s_ else ''}: {e}")
+            log(f"… антенна {ip}{' (ноутбук: ' + s_ + ')' if s_ else ''}: {e}")
             note, data = raw_probe(ip, s_)
             log(f"… диагностика: {note}")
             raw[f"probe{'@' + s_ if s_ else ''}"] = note + "\n" + data[:3000].decode("latin-1")
@@ -2940,7 +2941,7 @@ class MainWindow(QWidget):
         src = self._src_for(ip)
 
         def job(w):
-            w.log(f"🔎 проверяю {ip}" + (f" с {src}" if src else "") + "…")
+            w.log(f"🔎 проверяю антенну {ip}" + (f" (ноутбук: {src})" if src else "") + "…")
             self._check_loop(w, ip, timeout, 0, src)
         self.run_job("проверка", job)
 
@@ -3092,7 +3093,7 @@ class MainWindow(QWidget):
 
         def job(w):
             self._pin_if_needed(w, ip)
-            w.log(f"📖 читаю настройки {ip}" + (f" с {src}" if src else "") + "…")
+            w.log(f"📖 читаю настройки антенны {ip}" + (f" (ноутбук: {src})" if src else "") + "…")
             lines, raw = read_antenna(ip, src, user, pw, w.log)
             for ln in lines:
                 w.log(ln if ln.startswith(("✓", "✗", "⚠")) else "   " + ln)
