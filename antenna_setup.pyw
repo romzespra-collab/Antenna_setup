@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.4.8
+antenna_setup.pyw  v0.5.0
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,10 @@ antenna_setup.pyw  v0.4.8
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.5.0: «👂 Найти по MAC» — как Winbox: программа слушает кабель через Npcap (ставится по кнопке,
+          с npcap.com) и ловит ARP / ARP-пробы / LLDP / DHCP / MNDP / Ubiquiti / Pharos — антенна сама
+          называет IP и MAC в любой подсети, к её веб — ни одного запроса; марка по MAC; найденное
+          сразу в «Антенна». Старый поиск — «🔎 Поиск перебором» (в конце).
   v0.4.8: поиск больше не стучится в веб антенн: устройства находятся по ARP (без соединений),
           найденное проверяется одним GET как у браузера с ожиданием ответа до 20 с без обрыва
           (v0.4.7 ждал 1 с и закрывал — медленный TP-Link всё равно падал).
@@ -81,7 +85,7 @@ antenna_setup.pyw  v0.4.8
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.4.8"
+VERSION = "0.5.0"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -335,7 +339,7 @@ def list_adapters():
         "$c=Get-CimInstance Win32_NetworkAdapterConfiguration -Filter \"InterfaceIndex=$($a.ifIndex)\" -EA SilentlyContinue;"
         "[pscustomobject]@{Name=$a.Name;Desc=$a.InterfaceDescription;Status=[string]$a.Status;"
         "Media=[string]$a.PhysicalMediaType;IP=[string]$ip.IPAddress;Prefix=[int]$ip.PrefixLength;"
-        "Dhcp=[string]$if.Dhcp;DhcpSrv=[string]$c.DHCPServer;"
+        "Dhcp=[string]$if.Dhcp;DhcpSrv=[string]$c.DHCPServer;Mac=[string]$a.MacAddress;Guid=[string]$a.InterfaceGuid;"
         "Gw=[string]($c.DefaultIPGateway|?{$_ -notmatch ':'}|select -First 1)}};"
         "ConvertTo-Json -Compress -InputObject @($r)")
     ok, out = run_ps(script)
@@ -1075,6 +1079,157 @@ def web_url(ip, res=None):
         return f"https://{ip}/"
     return f"http://{ip}/"
 
+# ───────────────────────── поиск по MAC (как Winbox): слушать кабель через Npcap ─────────────────────────
+# Устройство со статическим адресом при включении объявляет в кабель свой IP (ARP), периодически
+# спрашивает шлюз (ARP), MikroTik/Ubiquiti/TP-Link Pharos шлют свои пакеты обнаружения, LLDP —
+# адрес управления. Всё это видно на уровне кабеля, в ЛЮБОЙ подсети, без единого запроса к веб антенны.
+NPCAP_URL = "https://npcap.com/dist/npcap-1.90.exe"
+NPCAP_DIR = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "Npcap"
+OUI = {   # первые 3 байта MAC -> марка (самые частые)
+    **{p: "TP-Link" for p in ("002719", "14CC20", "50C7BF", "60E327", "647002", "90F652", "A0F3C1", "C04A00",
+                              "C46E1F", "E8DE27", "F4F26D", "98DED0", "AC84C6", "18A6F7", "30B5C2", "54C80F",
+                              "704F57", "8416F9", "B04E26", "D807B6", "10FEED", "1C3BF3", "3C846A", "403F8C",
+                              "5CE931", "68FF7B", "98254A", "A42BB0", "B0A7B9", "C006C3", "CC32E5", "E4C32A",
+                              "EC086B", "F81A67", "001D0F", "0023CD", "002586", "081F71", "0C8268", "1C61B4",
+                              "282CB2", "3460F9", "50D4F7", "5C899A", "6466B3", "74DA88", "7844FD", "88D7F6",
+                              "9C216A", "A8574E", "B0487A", "C025E9", "D46E0E", "E894F6", "F8D111")},
+    **{p: "Ubiquiti" for p in ("00156D", "002722", "0418D6", "18E829", "24A43C", "44D9E7", "687251", "7483C2",
+                               "788A20", "802AA8", "B4FBE4", "DC9FDB", "E063DA", "F09FC2", "FCECDA", "245A4C",
+                               "68D79A", "70A741", "74ACB9", "784558", "D021F9", "E43883", "0418D6", "F492BF")},
+    **{p: "MikroTik" for p in ("000C42", "18FD74", "2CC81B", "488F5A", "4C5E0C", "64D154", "6C3B6B", "744D28",
+                               "B869F4", "C4AD34", "CC2DE0", "D4CA6D", "DC2C6E", "E48D8C", "48A98A")},
+    **{p: "Comfast" for p in ("40A5EF", "C8EEA6", "18D0C5")},
+}
+
+
+def mac_vendor(mac):
+    return OUI.get(mac.replace(":", "").replace("-", "").upper()[:6], "")
+
+
+def _mac(b):
+    return ":".join(f"{x:02X}" for x in b)
+
+
+def parse_frame(fr, own_macs=()):
+    """Кадр Ethernet -> (mac, ip, чем найдено, описание) или None. own_macs — свои MAC (пропускаем)."""
+    if len(fr) < 14:
+        return None
+    src = _mac(fr[6:12])
+    if src in own_macs:
+        return None
+    et, off = int.from_bytes(fr[12:14], "big"), 14
+    if et == 0x8100 and len(fr) >= 18:
+        et, off = int.from_bytes(fr[16:18], "big"), 18
+    p = fr[off:]
+    if et == 0x0806 and len(p) >= 28:                       # ARP
+        smac, sip, tip = _mac(p[8:14]), socket.inet_ntoa(p[14:18]), socket.inet_ntoa(p[24:28])
+        if smac in own_macs:
+            return None
+        if sip == "0.0.0.0":                                 # ARP-проба: устройство проверяет СВОЙ адрес
+            return smac, tip, "ARP-проба", "проверяет свой адрес"
+        return smac, sip, "ARP", (f"спрашивает {tip}" if int.from_bytes(p[6:8], "big") == 1 else "отвечает")
+    if et == 0x88CC:                                         # LLDP
+        ip, name, i = "", "", 0
+        while i + 2 <= len(p):
+            h = int.from_bytes(p[i:i + 2], "big")
+            t, n = h >> 9, h & 0x1FF
+            v = p[i + 2:i + 2 + n]
+            if t == 0:
+                break
+            if t == 5:
+                name = v.decode("utf-8", "replace")
+            if t == 8 and n >= 6 and v[1] == 1:              # адрес управления IPv4
+                ip = socket.inet_ntoa(v[2:6])
+            i += 2 + n
+        return (src, ip, "LLDP", name) if ip or name else None
+    if et == 0x0800 and len(p) >= 28 and p[9] == 17:         # IPv4 / UDP
+        ihl = (p[0] & 0x0F) * 4
+        sip = socket.inet_ntoa(p[12:16])
+        sport, dport = int.from_bytes(p[ihl:ihl + 2], "big"), int.from_bytes(p[ihl + 2:ihl + 4], "big")
+        data = p[ihl + 8:]
+        if 68 in (sport,) and dport == 67:
+            return src, "", "DHCP", "просит адрес по DHCP (антенна — DHCP-клиент)"
+        if sport == 10001:
+            r = parse_ubnt(data)
+            return (src, r[0] if r else sip, "Ubiquiti", r[1] if r else "")
+        if sport == 5678:
+            r = parse_mndp(data)
+            return (src, r[0] if r else sip, "MNDP", r[1] if r else "MikroTik")
+        if 20002 in (sport, dport):
+            return src, sip, "Pharos", "TP-Link Pharos"
+        if sip != "0.0.0.0":
+            return src, sip, "IP", f"UDP {sport}→{dport}"
+    elif et == 0x0800 and len(p) >= 20:
+        sip = socket.inet_ntoa(p[12:16])
+        if sip != "0.0.0.0":
+            return src, sip, "IP", ""
+    return None
+
+
+def npcap_ok():
+    return IS_WIN and (NPCAP_DIR / "wpcap.dll").exists()
+
+
+class _PcapHdr(ctypes.Structure):
+    _fields_ = [("sec", ctypes.c_long), ("usec", ctypes.c_long), ("caplen", ctypes.c_uint32),
+                ("len", ctypes.c_uint32)]
+
+
+class _BpfProg(ctypes.Structure):
+    _fields_ = [("bf_len", ctypes.c_uint), ("bf_insns", ctypes.c_void_p)]
+
+
+def sniff_l2(guid, seconds, on_frame, stopped=lambda: False):
+    """Слушать кабель через Npcap (wpcap.dll), только чтение. on_frame(bytes) на каждый кадр."""
+    os.add_dll_directory(str(NPCAP_DIR))
+    pc = ctypes.CDLL(str(NPCAP_DIR / "wpcap.dll"))
+    pc.pcap_open_live.restype = ctypes.c_void_p
+    pc.pcap_open_live.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
+    pc.pcap_compile.argtypes = [ctypes.c_void_p, ctypes.POINTER(_BpfProg), ctypes.c_char_p, ctypes.c_int,
+                                ctypes.c_uint32]
+    pc.pcap_setfilter.argtypes = [ctypes.c_void_p, ctypes.POINTER(_BpfProg)]
+    pc.pcap_next_ex.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.POINTER(_PcapHdr)),
+                                ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte))]
+    pc.pcap_close.argtypes = [ctypes.c_void_p]
+    pc.pcap_freecode.argtypes = [ctypes.POINTER(_BpfProg)]
+    err = ctypes.create_string_buffer(512)
+    dev = f"\\Device\\NPF_{guid}".encode()
+    h = pc.pcap_open_live(dev, 2048, 1, 500, err)
+    if not h:
+        raise RuntimeError("Npcap не открыл адаптер: " + err.value.decode("utf-8", "replace"))
+    try:
+        prog = _BpfProg()
+        flt = b"arp or ether proto 0x88cc or udp or icmp"
+        if pc.pcap_compile(h, ctypes.byref(prog), flt, 1, 0) == 0:
+            pc.pcap_setfilter(h, ctypes.byref(prog))
+            pc.pcap_freecode(ctypes.byref(prog))
+        hdr, data = ctypes.POINTER(_PcapHdr)(), ctypes.POINTER(ctypes.c_ubyte)()
+        end = time.monotonic() + seconds
+        while time.monotonic() < end and not stopped():
+            r = pc.pcap_next_ex(h, ctypes.byref(hdr), ctypes.byref(data))
+            if r == 1:
+                on_frame(ctypes.string_at(data, hdr.contents.caplen))
+            elif r < 0:
+                break
+    finally:
+        pc.pcap_close(h)
+
+
+def install_npcap(log=print):
+    """Скачать установщик Npcap (TLS с проверкой) и запустить: окно установщика — для человека."""
+    exe = Path(tempfile.gettempdir()) / "npcap-setup.exe"
+    log("⏳ качаю Npcap с npcap.com …")
+    with urllib.request.urlopen(NPCAP_URL, timeout=60) as r, open(exe, "wb") as f:
+        shutil.copyfileobj(r, f)
+    log("ℹ открываю установщик Npcap — нажмите «I Agree» и «Install» (галочки оставьте как есть)")
+    subprocess.run([str(exe)], timeout=900)
+    try:
+        exe.unlink()
+    except OSError:
+        pass
+    return npcap_ok()
+
+
 # ───────────────────────── отчёт на GitHub ─────────────────────────
 
 
@@ -1196,7 +1351,7 @@ def relaunch_as_admin():
 
 # работы, которые только читают (сеть не меняют): «Стоп» бросает их сразу, поток доживает сам и молча
 ABANDONABLE = {"адаптеры", "поиск антенны", "проверка", "чтение настроек", "отправка журнала",
-               "маршрут через кабель"}
+               "маршрут через кабель", "поиск по MAC"}
 
 
 class _Job:
@@ -1979,7 +2134,7 @@ class MainWindow(QWidget):
         self.found.setToolTip("Что нашёл поиск на кабеле. Клик — выбрать. Правый клик — меню")
         self.found.currentRowChanged.connect(self.on_found)
         cl.addWidget(self.found, 1)
-        self.l_found = _lab("Пока пусто — нажми «🔎 Найти антенну».\nИли впиши адрес антенны ниже.", "hint")
+        self.l_found = _lab("Пока пусто — нажми «👂 Найти по MAC»\nИли впиши адрес антенны ниже.", "hint")
         self.l_found.setWordWrap(True)
         cl.addWidget(self.l_found)
         c.setFixedWidth(300)
@@ -2075,12 +2230,20 @@ class MainWindow(QWidget):
         self.btn_report = QPushButton("📤 Отправить журнал")
         self.btn_report.setToolTip("Журнал, адаптеры и прочитанное — в приватный antenna_reports, для Claude")
         self.btn_report.clicked.connect(self.send_report)
+        self.btn_mac = QPushButton("👂 Найти по MAC")
+        self.btn_mac.setObjectName("primary")
+        self.btn_mac.setToolTip("Как Winbox: слушать кабель (Npcap) — антенна сама скажет свой IP и MAC в любой\n"
+                                "подсети. Ни одного запроса к её веб. Перезагрузите антенну, пока слушаем")
+        self.btn_mac.clicked.connect(self.find_by_mac)
         self.btn_pc = QPushButton("🛠 Настроить ПК")
         self.btn_pc.setToolTip("Изолировать: интернет — только Wi-Fi, кабель (RJ45) — только антенны;\n"
                                "домашняя сеть Wi-Fi закрыта для поиска и проверок")
         self.btn_pc.clicked.connect(self.setup_pc)
-        for i, b in enumerate((self.btn_find, self.btn_set, self.btn_check, self.btn_open, self.btn_read,
-                               self.btn_restore, self.btn_pc, self.btn_report, self.btn_stop)):
+        self.btn_find.setObjectName("")
+        self.btn_find.setText("🔎 Поиск перебором")
+        self.btn_find.setToolTip("Старый способ: перебор подсетей (меняет адрес кабеля). Лучше — «👂 Найти по MAC»")
+        for i, b in enumerate((self.btn_mac, self.btn_read, self.btn_set, self.btn_check, self.btn_open,
+                               self.btn_restore, self.btn_pc, self.btn_report, self.btn_stop, self.btn_find)):
             bg.addWidget(b, i // 3, i % 3)
         cl.addLayout(bg)
         res = QGridLayout()
@@ -2255,7 +2418,7 @@ class MainWindow(QWidget):
         return bool(getattr(getattr(self, "update_page", None), "box", None) and self.update_page.box._busy)
 
     def _shortcuts(self):
-        for key, fn in (("F5", self.refresh), ("F6", self.check), ("F7", self.search), ("Ctrl+O", self.open_browser),
+        for key, fn in (("F5", self.refresh), ("F6", self.check), ("F7", self.find_by_mac), ("Ctrl+O", self.open_browser),
                         ("Ctrl+Return", self.set_static), ("Ctrl+S", self.save_now),
                         ("Ctrl+T", self.toggle_theme), ("Esc", self.ask_stop)):
             QShortcut(QKeySequence(key), self, fn)
@@ -2606,7 +2769,8 @@ class MainWindow(QWidget):
         self.btn_set.setEnabled(not busy and admin)
         for b in (self.btn_set, self.btn_restore):
             b.setToolTip(b.toolTip() if admin else "Нужны права администратора (перезапусти программу)")
-        for b in (self.btn_find, self.btn_check, self.btn_refresh, self.btn_read, self.btn_report, self.btn_pc):
+        for b in (self.btn_find, self.btn_check, self.btn_refresh, self.btn_read, self.btn_report, self.btn_pc,
+                  self.btn_mac):
             b.setEnabled(not busy)
 
     def ask_stop(self):
@@ -2864,14 +3028,104 @@ class MainWindow(QWidget):
         else:
             w.log("ℹ в кабеле тихо (или Windows не дала слушать)")
 
+    def find_by_mac(self):
+        """Как Winbox: слушать кабель, антенна сама называет IP и MAC (любая подсеть)."""
+        if not IS_WIN:
+            QMessageBox.information(self, "Поиск по MAC", "Работает только в Windows.")
+            return
+        a = self.adapter()
+        if not a or a.get("Wifi"):
+            QMessageBox.warning(self, "Поиск по MAC", "Выбери на плитке «Адаптер ▾» кабель (RJ45) с антеннами.")
+            return
+        if not a.get("Guid"):
+            QMessageBox.information(self, "Поиск по MAC", "Обнови список адаптеров (F5) и нажми ещё раз.")
+            return
+        if self._need_admin():
+            return
+        if not npcap_ok():
+            if QMessageBox.question(self, "Поиск по MAC",
+                                    "Чтобы слушать кабель как Winbox / Wireshark, нужен бесплатный драйвер Npcap "
+                                    "(npcap.com, 1,3 МБ).\n\nСкачать и открыть установщик?") != QMessageBox.Yes:
+                return
+
+            def inst(w):
+                ok = install_npcap(w.log)
+                w.log("✓ Npcap установлен — нажми «👂 Найти по MAC» ещё раз" if ok else
+                      "✗ Npcap не установился — без него поиск по MAC не работает")
+            self.run_job("установка Npcap", inst)
+            return
+        own = {(x.get("Mac") or "").replace("-", ":").upper() for x in self.adapters if x.get("Mac")}
+        guid, src = a["Guid"], a.get("IP") or ""
+        QMessageBox.information(self, "Поиск по MAC", "Сейчас программа 2 минуты слушает кабель.\n\n"
+                                "ПЕРЕЗАГРУЗИТЕ АНТЕННУ: выдерните PoE на 10 секунд и вставьте обратно — "
+                                "при включении она сама назовёт свой адрес.\n\nКак появится — можно «⏹ Стоп».")
+        seen = {}
+
+        def job(w):
+            w.log("👂 слушаю кабель 120 с (Npcap) — перезагрузите антенну…")
+            last = [0.0]
+
+            def on_frame(fr):
+                r = parse_frame(fr, own)
+                if not r:
+                    return
+                mac, ip, how, what = r
+                key = (mac, ip)
+                if key in seen or (not ip and any(k[0] == mac for k in seen)):
+                    return
+                seen[key] = (how, what)
+                vend = mac_vendor(mac)
+                w.log(f"✓ {ip or '—'} · MAC {mac}{' · ' + vend if vend else ''} · {how}{' · ' + what if what else ''}")
+                snap = dict(seen)
+                w.ui(lambda: self._show_mac_found(snap))
+
+            def discover():               # запросы обнаружения MikroTik / Ubiquiti — ответы ловит сниффер
+                if not src:
+                    return
+                try:
+                    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    u.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                    u.bind((src, 0))
+                    for port, msg in ((10001, b"\x01\x00\x00\x00"), (5678, b"\x00\x00\x00\x00")):
+                        u.sendto(msg, ("255.255.255.255", port))
+                    u.close()
+                except OSError:
+                    pass
+
+            def tick():
+                if time.monotonic() - last[0] > 5:
+                    last[0] = time.monotonic()
+                    discover()
+                return w.stopped()
+            sniff_l2(guid, 120, on_frame, tick)
+            w.log(f"ℹ слушал кабель — найдено устройств: {len({k[0] for k in seen})}" if seen else
+                  "✗ в кабеле никто не назвался. Антенну перезагружали? Кабель в порту LAN/PoE?")
+        self.run_job("поиск по MAC", job)
+
+    def _show_mac_found(self, seen):
+        found, heard = {}, {}
+        for (mac, ip), (how, what) in seen.items():
+            if not ip or ip.startswith(("0.", "255.")) or self.in_home(ip):
+                continue
+            vend = mac_vendor(mac)
+            found[ip] = []
+            heard[ip] = f"MAC {mac}{' · ' + vend if vend else ''} · {how}{' · ' + what if what else ''}"
+        if found:
+            first = next(iter(found))
+            mask = "255.255.255.0"
+            self.show_found(found, mask, "", "кабеле (по MAC)", heard)
+            self.e_ant.setText(first)
+            self.auto_my_ip()
+
     def show_found(self, found, mask, my_ip, where="", heard=None):
         self.found.blockSignals(True)
         self.found.clear()
         names = {80: "http", 443: "https"}
         for ip, ports in found.items():
-            what = ", ".join(names.get(p, str(p)) for p in ports) or "отвечает, веб закрыт"
+            what = ", ".join(names.get(p, str(p)) for p in ports) or ("" if heard and heard.get(ip) else
+                                                                      "отвечает, веб закрыт")
             if heard and heard.get(ip):
-                what += " · " + heard[ip]
+                what = (what + " · " if what else "") + heard[ip]
             it = QListWidgetItem(f"{ip}\n{what}")
             it.setData(Qt.UserRole, ip)
             self.found.addItem(it)
@@ -3694,6 +3948,13 @@ def selftest():
     ok("ответ Ubiquiti", parse_ubnt(ub) == ("192.168.1.20", "Ubiquiti NSM"))
     mk = bytes(4) + b"\x00\x11\x00\x04" + socket.inet_aton("192.168.88.1") + b"\x00\x05\x00\x02" + b"MT"
     ok("ответ MikroTik", parse_mndp(mk) == ("192.168.88.1", "MikroTik MT"))
+    arp = bytes.fromhex("ffffffffffff" "50c7bf112233" "0806") + bytes.fromhex("0001080006040001") \
+        + bytes.fromhex("50c7bf112233") + socket.inet_aton("192.168.0.254") + bytes(6) + socket.inet_aton("192.168.0.1")
+    ok("ARP: адрес антенны по MAC", parse_frame(arp)[:3] == ("50:C7:BF:11:22:33", "192.168.0.254", "ARP")
+       and mac_vendor("50:C7:BF:11:22:33") == "TP-Link")
+    probe = arp[:28] + socket.inet_aton("0.0.0.0") + bytes(6) + socket.inet_aton("10.0.0.5")
+    ok("ARP-проба: свой адрес", parse_frame(probe)[1] == "10.0.0.5")
+    ok("свой MAC пропускается", parse_frame(arp, {"50:C7:BF:11:22:33"}) is None)
     ok("поиск находит узел", list(scan_subnet(ipaddress.IPv4Network("127.0.0.0/30"), ports=(port,))) == ["127.0.0.1"])
     srv.close()
     try:
