@@ -1,5 +1,6 @@
 @echo off
 chcp 65001 >nul
+rem setup.bat  v0.2.0 — Python + PySide6 и запуск
 cd /d "%~dp0"
 title Настройка антенны - установка
 
@@ -22,7 +23,7 @@ if errorlevel 1 (
 )
 
 echo Устанавливаю PySide6 (один раз, может занять минуту)...
-python -m pip install --upgrade PySide6
+python -m pip install --disable-pip-version-check --upgrade -r requirements.txt
 if errorlevel 1 (
   echo Ошибка установки PySide6. Проверь интернет и запусти ещё раз.
   pause

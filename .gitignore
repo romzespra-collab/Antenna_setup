@@ -1,6 +1,12 @@
 __pycache__/
 *.pyc
 config.json
+config.json.bak
+*.tmp
 *.log
+selftest.txt
+build/
+dist/
+_backup/
 *.zip
 !release/*.zip
