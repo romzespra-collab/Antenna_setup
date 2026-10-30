@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.5.1
+antenna_setup.pyw  v0.5.2
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,9 @@ antenna_setup.pyw  v0.5.1
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.5.2: под экран ноутбука: плитки вверху и шапка компактнее, главная страница прокручивается,
+          окно при запуске не больше экрана и целиком на нём; кнопки в 4 ряда, логин и пароль в одну строку;
+          всё помещается в 1366×768.
   v0.5.1: антенна в той же подсети, что Wi-Fi (отчёт: Comfast 192.168.1.1 = адрес домашнего роутера) —
           больше не прячется: показывается с пометкой и предложением на время выключить Wi-Fi, ноутбук на
           кабеле — в подсеть антенны (адрес, который она сама спрашивает); «Вернуть как было» и выход
@@ -93,7 +96,7 @@ antenna_setup.pyw  v0.5.1
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -1541,15 +1544,16 @@ def _qss(p):
     QPushButton#winBtn:hover {{ background: rgba(255,255,255,0.12); }}
     QPushButton#winClose:hover {{ background: #e81123; }}
     QWidget#side {{ background: {p['side']}; }}
-    QLabel#h1 {{ font-size: 15pt; font-weight: 700; }}
+    QLabel#h1 {{ font-size: 13pt; font-weight: 700; }}
     QLabel#chip {{ border-radius: 11px; padding: 3px 12px; background: {p['panel2']};
         border: 1px solid {p['line']}; font-weight: 600; }}
     QFrame#card, QFrame#tile {{ background: {p['panel']}; border: 1px solid {p['line']}; border-radius: 10px; }}
     QFrame#tile[clickable="true"]:hover {{ border-color: {p['accent']}; }}
     QLabel#cardTitle {{ color: {p['muted']}; font-size: 8pt; font-weight: 700; letter-spacing: 1px; background: transparent; }}
-    QLabel#tileCap {{ color: {p['muted']}; font-size: 8pt; background: transparent; }}
-    QLabel#tileVal {{ font-size: 13pt; font-weight: 700; background: transparent; }}
-    QLabel#tileSub, QLabel#hint {{ color: {p['muted']}; font-size: 9pt; background: transparent; }}
+    QLabel#tileCap {{ color: {p['muted']}; font-size: 7.5pt; background: transparent; }}
+    QLabel#tileVal {{ font-size: 10.5pt; font-weight: 700; background: transparent; }}
+    QLabel#tileSub {{ color: {p['muted']}; font-size: 8pt; background: transparent; }}
+    QLabel#hint {{ color: {p['muted']}; font-size: 9pt; background: transparent; }}
     QLineEdit, QComboBox, QPlainTextEdit, QTextEdit {{ background: {p['panel2']}; color: {p['text']};
         border: 1px solid {p['line']}; border-radius: 7px; padding: 4px 6px;
         selection-background-color: {p['accent']}; selection-color: #ffffff; }}
@@ -1575,7 +1579,7 @@ def _qss(p):
     QScrollArea#pageScroll {{ background: {p['bg']}; border: none; }}
     QGroupBox QPushButton {{ padding: 5px 8px; min-width: 0; }}
     QPushButton {{ background: {p['panel2']}; color: {p['text']}; border: 1px solid {p['line']};
-        border-radius: 7px; padding: 6px 12px; min-width: 80px; }}
+        border-radius: 7px; padding: 6px 12px; min-width: 80px; min-height: 18px; }}
     QPushButton:hover {{ border-color: {p['accent']}; }}
     QPushButton:pressed {{ background: {p['line']}; }}
     QPushButton:disabled {{ color: {p['muted']}; background: {p['panel']}; }}
@@ -2018,13 +2022,20 @@ class Tile(QFrame):
         super().__init__()
         self.setObjectName("tile")
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(14, 8, 14, 10)
-        lay.setSpacing(2)
+        lay.setContentsMargins(10, 4, 10, 5)     # компактно — под экран ноутбука
+        lay.setSpacing(0)
+        top = QHBoxLayout()
+        top.setSpacing(6)
         self.cap = _lab(caption.upper(), "tileCap")
         self.val = _lab("—", "tileVal")
         self.sub = _lab("", "tileSub")
-        for w in (self.cap, self.val, self.sub):
-            lay.addWidget(w)
+        top.addWidget(self.cap)
+        top.addStretch()
+        lay.addLayout(top)
+        lay.addWidget(self.val)
+        lay.addWidget(self.sub)
+        for w in (self.val, self.sub):
+            w.setMinimumWidth(0)
         self._color = None
 
     def set(self, value, sub="", color=None):
@@ -2087,7 +2098,7 @@ class MainWindow(QWidget):
         self._closing = False
         self.setWindowTitle(f"{APP_NAME} — v{VERSION}")
         self.setWindowIcon(app_icon())
-        self.setMinimumSize(900, 600)
+        self.setMinimumSize(760, 600)
         self._loading = True
         self._build()
         self._load_ui_from_cfg()
@@ -2139,13 +2150,13 @@ class MainWindow(QWidget):
         right = QWidget()
         right.setObjectName("page")
         rl = QVBoxLayout(right)
-        rl.setContentsMargins(16, 12, 16, 0)
-        rl.setSpacing(10)
+        rl.setContentsMargins(12, 6, 12, 0)
+        rl.setSpacing(6)
         bl.addWidget(right, 1)
 
         head = QHBoxLayout()
         ico = QLabel()
-        ico.setPixmap(app_icon().pixmap(30, 30))
+        ico.setPixmap(app_icon().pixmap(22, 22))
         head.addWidget(ico)
         head.addWidget(_lab(APP_NAME, "h1"))
         head.addStretch()
@@ -2220,8 +2231,9 @@ class MainWindow(QWidget):
         self.found = QListWidget()
         self.found.setToolTip("Что нашёл поиск на кабеле. Клик — выбрать. Правый клик — меню")
         self.found.currentRowChanged.connect(self.on_found)
+        self.found.setMinimumHeight(50)
         cl.addWidget(self.found, 1)
-        self.l_found = _lab("Пока пусто — нажми «👂 Найти по MAC»\nИли впиши адрес антенны ниже.", "hint")
+        self.l_found = _lab("Пусто — нажми «👂 Найти по MAC» или впиши адрес ниже.", "hint")
         self.l_found.setWordWrap(True)
         cl.addWidget(self.l_found)
         c.setFixedWidth(300)
@@ -2249,15 +2261,17 @@ class MainWindow(QWidget):
         g.addWidget(self.e_my, 2, 1)
         g.addWidget(self.btn_auto, 2, 2)
         self.e_user = QLineEdit()
-        self.e_user.setPlaceholderText("логин (по умолчанию admin)")
+        self.e_user.setPlaceholderText("логин")
         self.e_pw = QLineEdit()
         self.e_pw.setEchoMode(QLineEdit.Password)
-        self.e_pw.setPlaceholderText("пароль (по умолчанию admin)")
+        self.e_pw.setPlaceholderText("пароль")
         self.e_pw.setToolTip("Для «📖 Прочитать настройки». Хранится только в config.json; в отчёт не попадает")
-        g.addWidget(_lab("Логин"), 3, 0)
-        g.addWidget(self.e_user, 3, 1, 1, 2)
-        g.addWidget(_lab("Пароль"), 4, 0)
-        g.addWidget(self.e_pw, 4, 1, 1, 2)
+        g.addWidget(_lab("Вход"), 3, 0)          # логин и пароль — в одну строку (экран ноутбука)
+        lp = QHBoxLayout()
+        lp.setSpacing(6)
+        lp.addWidget(self.e_user, 1)
+        lp.addWidget(self.e_pw, 1)
+        g.addLayout(lp, 3, 1, 1, 2)
         cl.addLayout(g)
         c.setFixedWidth(300)
         left.addWidget(c)
@@ -2331,7 +2345,7 @@ class MainWindow(QWidget):
         self.btn_find.setToolTip("Старый способ: перебор подсетей (меняет адрес кабеля). Лучше — «👂 Найти по MAC»")
         for i, b in enumerate((self.btn_mac, self.btn_read, self.btn_set, self.btn_check, self.btn_open,
                                self.btn_restore, self.btn_pc, self.btn_report, self.btn_stop, self.btn_find)):
-            bg.addWidget(b, i // 3, i % 3)
+            bg.addWidget(b, i // 4, i % 4)       # 4 в ряд — ниже на экране ноутбука
         cl.addLayout(bg)
         res = QGridLayout()
         res.setHorizontalSpacing(8)
@@ -2354,6 +2368,7 @@ class MainWindow(QWidget):
         self.logv.setReadOnly(True)
         self.logv.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.logv.setMaximumBlockCount(3000)
+        self.logv.setMinimumHeight(70)
         cl.addWidget(self.logv)
         right.addWidget(c, 1)
         lay.addLayout(right, 1)
@@ -2666,20 +2681,25 @@ class MainWindow(QWidget):
         self.update_saved_label()
         self.update_tiles()
         g = c.get("geometry")
-        if g:
-            try:
-                x, y, w, h, mx = g
-                scr = QApplication.screenAt(QPoint(x + 40, y + 10))
-                if scr is not None:
-                    self.setGeometry(x, y, max(w, 900), max(h, 600))
-                else:
-                    self.resize(max(w, 900), max(h, 600))
-                if mx:
-                    QTimer.singleShot(0, self.toggle_max)
-            except Exception:
-                self.resize(1080, 720)
-        else:
-            self.resize(1080, 720)
+        scr = QApplication.primaryScreen()
+        av = scr.availableGeometry() if scr else None
+        try:
+            x, y, w, h, mx = g if g else (None, None, 1080, 720, False)
+            if g:
+                s_ = QApplication.screenAt(QPoint(x + 40, y + 10))
+                if s_ is not None:
+                    av = s_.availableGeometry()
+            if av is not None:                     # не больше экрана (ноутбук 1366×768 и меньше)
+                w, h = min(w, av.width()), min(h, av.height())
+                if x is None or not av.contains(QPoint(x + 40, y + 10)):
+                    x, y = av.x() + (av.width() - w) // 2, av.y() + (av.height() - h) // 2
+                x = max(av.x(), min(x, av.right() - w + 1))
+                y = max(av.y(), min(y, av.bottom() - h + 1))
+            self.setGeometry(x or 0, y or 0, max(w, 760), max(h, 600))
+            if mx:
+                QTimer.singleShot(0, self.toggle_max)
+        except Exception:
+            self.resize(1000, 640)
 
     def _sync_cfg(self, *_):
         if getattr(self, "_loading", False):
