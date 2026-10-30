@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.5.2
+antenna_setup.pyw  v0.5.3
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,10 @@ antenna_setup.pyw  v0.5.2
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.5.3: раздача адреса антенне — через Npcap (запросы ловим и ответы шлём прямо в кабель; раньше
+          брандмауэр Windows не пропускал запросы к программе); поиск по MAC больше не останавливается
+          через 10 с (главный порт антенны объявляется позже); адрес антенны в подсети Wi-Fi
+          (192.168.1.1) при «Проверить» / «Открыть веб» / «Прочитать» — предложение выключить Wi-Fi.
   v0.5.2: под экран ноутбука: плитки вверху и шапка компактнее, главная страница прокручивается,
           окно при запуске не больше экрана и целиком на нём; кнопки в 4 ряда, логин и пароль в одну строку;
           всё помещается в 1366×768.
@@ -96,7 +100,7 @@ antenna_setup.pyw  v0.5.2
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -1214,6 +1218,7 @@ def sniff_l2(guid, seconds, on_frame, stopped=lambda: False):
                                 ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte))]
     pc.pcap_close.argtypes = [ctypes.c_void_p]
     pc.pcap_freecode.argtypes = [ctypes.POINTER(_BpfProg)]
+    pc.pcap_sendpacket.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
     err = ctypes.create_string_buffer(512)
     dev = f"\\Device\\NPF_{guid}".encode()
     h = pc.pcap_open_live(dev, 2048, 1, 500, err)
@@ -1230,7 +1235,9 @@ def sniff_l2(guid, seconds, on_frame, stopped=lambda: False):
         while time.monotonic() < end and not stopped():
             r = pc.pcap_next_ex(h, ctypes.byref(hdr), ctypes.byref(data))
             if r == 1:
-                on_frame(ctypes.string_at(data, hdr.contents.caplen))
+                out = on_frame(ctypes.string_at(data, hdr.contents.caplen))
+                if out:                              # ответ — прямо в кабель (мимо брандмауэра)
+                    pc.pcap_sendpacket(h, out, len(out))
             elif r < 0:
                 break
     finally:
@@ -1277,6 +1284,56 @@ def dhcp_reply(req, server_ip, offer_ip, mask="255.255.255.0", only_mac=""):
     opts = bytes([53, 1, t, 54, 4]) + socket.inet_aton(server_ip) + bytes([51, 4]) + (3600).to_bytes(4, "big") \
         + bytes([1, 4]) + socket.inet_aton(mask) + bytes([255])
     return bytes(rep) + opts, ("OFFER" if t == 2 else "ACK")
+
+
+def _csum(b):
+    if len(b) % 2:
+        b += b"\x00"
+    s_ = sum(int.from_bytes(b[i:i + 2], "big") for i in range(0, len(b), 2))
+    while s_ >> 16:
+        s_ = (s_ & 0xFFFF) + (s_ >> 16)
+    return (~s_) & 0xFFFF
+
+
+def udp_frame(src_mac, src_ip, dst_mac, dst_ip, sport, dport, payload):
+    """Кадр Ethernet + IPv4 + UDP целиком (для отправки через Npcap)."""
+    udp = sport.to_bytes(2, "big") + dport.to_bytes(2, "big") + (8 + len(payload)).to_bytes(2, "big") \
+        + b"\x00\x00" + payload                  # контрольная сумма UDP 0 — допустимо для IPv4
+    iph = bytearray(b"\x45\x00" + (20 + len(udp)).to_bytes(2, "big") + b"\x00\x00\x00\x00\x40\x11\x00\x00"
+                    + socket.inet_aton(src_ip) + socket.inet_aton(dst_ip))
+    iph[10:12] = _csum(bytes(iph)).to_bytes(2, "big")
+    mac = lambda m: bytes.fromhex(m.replace(":", "").replace("-", ""))  # noqa: E731
+    return mac(dst_mac) + mac(src_mac) + b"\x08\x00" + bytes(iph) + udp
+
+
+def dhcp_frame_reply(fr, my_mac, server_ip, ant_mac, offer_ip):
+    """Кадр с DHCP-запросом антенны -> (кадр-ответ, тип) или (None, "")."""
+    if len(fr) < 42 or fr[12:14] != b"\x08\x00" or _mac(fr[6:12]) != ant_mac.upper():
+        return None, ""
+    p = fr[14:]
+    ihl = (p[0] & 0x0F) * 4
+    if p[9] != 17 or p[ihl:ihl + 4] != b"\x00\x44\x00\x43":      # UDP 68 -> 67
+        return None, ""
+    rep, kind = dhcp_reply(p[ihl + 8:], server_ip, offer_ip, only_mac=ant_mac)
+    if not rep:
+        return None, ""
+    return udp_frame(my_mac, server_ip, "ff:ff:ff:ff:ff:ff", "255.255.255.255", 67, 68, rep), kind
+
+
+def dhcp_serve_pcap(guid, my_mac, server_ip, ant_mac, offer_ip, seconds=120, stopped=lambda: False, log=print):
+    """Раздать адрес антенне через Npcap: запросы ловим и ответы шлём прямо в кабель —
+    брандмауэр Windows и привязка сокетов не мешают. -> True, когда антенна взяла адрес."""
+    state = {"ack": False}
+
+    def on_frame(fr):
+        out, kind = dhcp_frame_reply(fr, my_mac, server_ip, ant_mac, offer_ip)
+        if out:
+            log(f"… DHCP: {kind} → {offer_ip} для {ant_mac}")
+            if kind == "ACK":
+                state["ack"] = True
+        return out
+    sniff_l2(guid, seconds, on_frame, lambda: stopped() or state["ack"])
+    return state["ack"]
 
 
 def dhcp_serve(bind_ip, mac, offer_ip, seconds=120, stopped=lambda: False, log=print):
@@ -3206,10 +3263,6 @@ class MainWindow(QWidget):
                 if time.monotonic() - last[0] > 5:
                     last[0] = time.monotonic()
                     discover()
-                # просит DHCP и за 10 с своего IP не назвал — дальше слушать незачем
-                if asked and all(time.monotonic() - t > 10 and not any(k[1] and same_device(k[0], m) for k in seen)
-                                 for m, t in asked.items()):
-                    return True
                 return w.stopped()
             sniff_l2(guid, 120, on_frame, tick)
             w.log(f"ℹ слушал кабель — найдено устройств: {len({k[0] for k in seen})}" if seen else
@@ -3245,6 +3298,8 @@ class MainWindow(QWidget):
 
     def _serve_dhcp(self, name, mac, me, ant):
         saved = dict(self.cfg.get("saved_net") or {})
+        a = next((x for x in self.adapters if x["Name"] == name), {})
+        guid, my_mac = a.get("Guid", ""), (a.get("Mac") or "").replace("-", ":")
 
         def job(w):
             if name not in saved:
@@ -3261,8 +3316,11 @@ class MainWindow(QWidget):
             wait_ip_ready(me, 15, w.stopped)
             w.log(f"📡 раздаю адрес {ant} антенне {mac} (до 2 минут; можно перезагрузить антенну — быстрее)…")
             try:
-                got = dhcp_serve(me, mac, ant, 120, w.stopped, w.log)
-            except OSError as e:
+                if npcap_ok() and guid and my_mac:
+                    got = dhcp_serve_pcap(guid, my_mac, me, mac, ant, 120, w.stopped, w.log)
+                else:
+                    got = dhcp_serve(me, mac, ant, 120, w.stopped, w.log)
+            except (OSError, RuntimeError) as e:
                 w.log(f"✗ DHCP-сервер не запустился: {e}")
                 return
             if not got:
@@ -3304,7 +3362,9 @@ class MainWindow(QWidget):
                 QTimer.singleShot(300, ask)
                 return
             a = self.adapter()
-            if not a:
+            if not a or a.get("Wifi"):
+                QMessageBox.warning(self, "Антенна в сети Wi-Fi", "Сначала выбери на плитке «Адаптер ▾» кабель "
+                                                                   "(RJ45), к которому подключена антенна.")
                 return
             net = ipaddress.IPv4Network(f"{ant}/24", strict=False)
             me = hint if hint and hint != ant and ipaddress.IPv4Address(hint) in net else \
@@ -3464,11 +3524,11 @@ class MainWindow(QWidget):
         return ""
 
     def _home_refuse(self, ip, what):
+        """Адрес антенны в подсети Wi-Fi (у вас антенна 192.168.1.1, как домашний роутер) — сначала
+        Wi-Fi на время выключить и ноутбук на кабеле — в подсеть антенны; потом нажать ещё раз."""
         n = self.in_home(ip)
         if n:
-            QMessageBox.warning(self, what, f"{ip} — это ваша домашняя сеть Wi-Fi ({n}), а не кабель с антенной.\n\n"
-                                            "Программа туда не лезет. Найдите антенну «🔎 Найти антенну» "
-                                            "или впишите её адрес.")
+            self._offer_wifi_off(ip, "")
         return bool(n)
 
     def setup_pc(self):
@@ -4212,6 +4272,10 @@ def selftest():
        and rep[4:8] == b"\x12\x34\x56\x78" and _dhcp_opts(rep[240:])[53] == b"\x02")
     ok("DHCP: чужому MAC не отвечает", dhcp_reply(disc, "192.168.77.1", "192.168.77.2",
                                                   only_mac="11:22:33:44:55:66")[0] is None)
+    fr = udp_frame("40:a5:ef:77:0f:61", "0.0.0.0", "ff:ff:ff:ff:ff:ff", "255.255.255.255", 68, 67, disc)
+    out, kind = dhcp_frame_reply(fr, "20:89:84:9d:c8:06", "192.168.77.1", "40:A5:EF:77:0F:61", "192.168.77.2")
+    ok("DHCP через кабель: кадр-ответ", kind == "OFFER" and out[:6] == b"\xff" * 6 and out[12:14] == b"\x08\x00"
+       and _csum(out[14:34]) == 0 and out[36:38] == b"\x00\x44")
     ok("поиск находит узел", list(scan_subnet(ipaddress.IPv4Network("127.0.0.0/30"), ports=(port,))) == ["127.0.0.1"])
     srv.close()
     try:
