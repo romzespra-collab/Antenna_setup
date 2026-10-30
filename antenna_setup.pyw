@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.3.2
+antenna_setup.pyw  v0.3.3
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,9 @@ antenna_setup.pyw  v0.3.2
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.3.3: поиск сначала только в своей сети, сеть не меняется: шлюз и DHCP-сервер (раздал IP)
+          проверяются и показываются всегда; адрес получен по DHCP — другие подсети не трогаются вовсе;
+          перебор других подсетей — только после вопроса.
   v0.3.2: поиск антенны переделан: шлюз и DHCP-сервер адаптера — первыми; прослушка кабеля 12 с
           (все пакеты на адаптере + запросы Ubiquiti/MikroTik) — подсети услышанных адресов
           проверяются первыми; после смены IP ждём, пока Windows подготовит адрес (DAD), а не 3 с;
@@ -37,7 +40,7 @@ antenna_setup.pyw  v0.3.2
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -1958,30 +1961,57 @@ class MainWindow(QWidget):
                     found[ip] = []
             return found
 
+        dhcp = (a.get("Dhcp") or "").lower() == "enabled"
+        usable = bool(cur and not cur.startswith("169.254."))
+        heard = {}
+
         def job(w):
-            dh = "DHCP" if (a.get("Dhcp") or "").lower() == "enabled" else "статический"
+            """Этап 1 — только своя сеть, сеть адаптера НЕ меняется."""
+            dh = "DHCP" if dhcp else "статический"
             w.log(f"ℹ «{name}»: {cur or 'нет адреса'}{'/' + str(prefix) if cur else ''}, {dh}, "
                   f"шлюз {a.get('Gw') or '—'}, DHCP-сервер {a.get('DhcpSrv') or '—'}")
-            heard = {}
-            usable = cur and not cur.startswith("169.254.")
             if usable:
                 own = ipaddress.IPv4Network(f"{cur}/{max(prefix, 24)}", strict=False)
-                w.log(f"🔎 ищу в своей подсети {own}…")
-                found = probe_net(w, own, cur, hints)
+                labels = {}
+                for ip, what in ((a.get("Gw"), "шлюз"), (a.get("DhcpSrv"), "DHCP-сервер — раздал ноутбуку IP")):
+                    if not ip or ip == cur or ip == "255.255.255.255":
+                        continue
+                    r = check_antenna(ip, 2.0)
+                    labels[ip] = (labels.get(ip, "") + ", " if ip in labels else "") + what
+                    w.log(f"{'✓' if r['alive'] else '⚠'} {what} {ip}: пинг {'да' if r['ping'] else 'нет'}, "
+                          f"80 {'да' if r['p80'] else 'нет'}, 443 {'да' if r['p443'] else 'нет'}")
+                w.log(f"🔎 ищу во всей своей сети {own} (сеть не меняю)…")
+                found = scan_subnet(own, {cur}, cur, stopped=w.stopped)
+                if IS_WIN:
+                    for ip in neighbors(name, own, {cur}):
+                        found.setdefault(ip, [])
+                for ip in labels:                 # шлюз и DHCP-сервер показываем всегда
+                    if ipaddress.IPv4Address(ip) in own:
+                        found.setdefault(ip, [])
+                found = dict(sorted(found.items(), key=lambda kv: (kv[0] not in labels, ipaddress.IPv4Address(kv[0]))))
                 if found:
                     m = str(own.netmask)
-                    w.ui(lambda: self.show_found(found, m, cur, str(own)))
+                    w.ui(lambda: self.show_found(found, m, cur, str(own), labels))
+                    return
+                if dhcp:
+                    w.log("⚠ адрес получен по DHCP, но в сети никто не отвечает — проверь подключение антенны.")
                     return
             if w.stopped():
                 return
             if not admin:
-                w.log("⚠ в своей подсети пусто. Чтобы слушать кабель и искать в других подсетях, нужны "
-                      "права администратора (⋯ → Перезапуск).")
+                w.log("⚠ в своей сети пусто. Чтобы слушать кабель и искать в других подсетях, нужны права "
+                      "администратора (⋯ → Перезапуск).")
                 return
             if cur:
                 w.log("👂 слушаю кабель 12 с — антенна в любой подсети что-то шлёт…")
-                heard = listen_wire(cur, 12, w.stopped)
+                heard.update(listen_wire(cur, 12, w.stopped))
                 self._log_heard(w, heard)
+            if w.stopped():
+                return
+            w.ui(lambda: self._offer_other_subnets(name, bool(usable), dict(heard), job2))
+
+        def job2(w):
+            """Этап 2 — только с согласия: временно ставить адреса в других подсетях."""
             if name not in saved:
                 snap = snapshot_adapter(name)
                 saved[name] = snap
@@ -2017,7 +2047,7 @@ class MainWindow(QWidget):
                     if not listened:
                         listened = True
                         w.log("👂 слушаю кабель 12 с…")
-                        heard = listen_wire(me, 12, w.stopped)
+                        heard.update(listen_wire(me, 12, w.stopped))
                         self._log_heard(w, heard)
                         new = [ipaddress.IPv4Network(f"{ip}/24", strict=False) for ip in heard]
                         if any(n != net for n in new):
@@ -2054,6 +2084,22 @@ class MainWindow(QWidget):
             w.ui(lambda: self._forget(name))
             w.ui(self.refresh_quiet)
         self.run_job("поиск антенны", job)
+
+    def _offer_other_subnets(self, name, had_ip, heard, job2):
+        """После этапа 1: спросить, можно ли временно менять сеть адаптера."""
+        def ask():
+            if self.worker.busy():
+                QTimer.singleShot(300, ask)
+                return
+            hint = ("\n\nВ кабеле слышны: " + ", ".join(heard) + " — начну с их подсетей.") if heard else ""
+            why = "В своей сети антенну не нашёл." if had_ip else "У адаптера нет своего адреса."
+            if QMessageBox.question(self, "Поиск", f"{why}\n\nПеребрать другие подсети? Адрес «{name}» "
+                                    f"будет временно меняться; не найду — верну как было.{hint}") \
+                    == QMessageBox.Yes:
+                self.run_job("поиск в других подсетях", job2)
+            else:
+                self.log("ℹ другие подсети не перебираю. Адрес антенны можно вписать вручную.")
+        ask()
 
     def _log_heard(self, w, heard):
         if heard:
