@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.3.0
+antenna_setup.pyw  v0.3.1
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,10 @@ antenna_setup.pyw  v0.3.0
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.3.1: поиск падал в Python 3.15 («'lazy_import' object is not callable») — свои потоки вместо
+          concurrent.futures; при ошибке поиска сеть адаптера возвращается; антенна без открытого
+          веба тоже находится (ARP); ⋯ → «Обновить программу с GitHub» всегда активна и работает
+          без токена (репозиторий публичный): проверка, скачивание, установка, перезапуск.
   v0.3.0: обновление с GitHub — общий модуль gh_update 1.3.1 из SmartMon (app/gh_update*.py:
           токен с инструкцией «?», автопроверка, «Что нового», докачка, сверка суммы, перезапуск);
           setup.bat — по образцу START_ON_NEW_PC.bat из SmartMon (один Python 3.15 на компьютер).
@@ -29,7 +33,7 @@ antenna_setup.pyw  v0.3.0
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -432,19 +436,43 @@ def parse_subnets(text):
 
 def scan_subnet(net, skip=(), src=None, ports=SEARCH_PORTS, timeout=0.5, stopped=lambda: False):
     """Ищет в подсети узлы с открытыми портами (веб антенны). {ip: [порты]} по возрастанию адреса."""
-    from concurrent.futures import ThreadPoolExecutor
-    hosts = [str(h) for h in net.hosts() if str(h) not in skip]
+    # свои потоки, без concurrent.futures: в Python 3.15 он падал «'lazy_import' object is not callable»
+    hosts = iter([str(h) for h in net.hosts() if str(h) not in skip])
+    found, lock = {}, threading.Lock()
 
-    def probe(ip):
-        if stopped():
-            return ip, []
-        return ip, [p for p in ports if tcp_open(ip, p, timeout, src)]
-    found = {}
-    with ThreadPoolExecutor(64) as ex:
-        for ip, opened in ex.map(probe, hosts):
+    def worker():
+        while not stopped():
+            with lock:
+                ip = next(hosts, None)
+            if ip is None:
+                return
+            opened = [p for p in ports if tcp_open(ip, p, timeout, src)]
             if opened:
-                found[ip] = opened
+                with lock:
+                    found[ip] = opened
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(min(64, net.num_addresses))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
     return dict(sorted(found.items(), key=lambda kv: ipaddress.IPv4Address(kv[0])))
+
+
+def neighbors(name, net, skip=()):
+    """Кто ответил на ARP на этом адаптере (антенна без открытого веба тоже видна)."""
+    script = (f"Get-NetNeighbor -InterfaceAlias {ps_str(name)} -AddressFamily IPv4 -EA SilentlyContinue|"
+              "?{$_.State -in 'Reachable','Stale','Delay','Probe'}|"
+              "%{$_.IPAddress}")
+    ok, out = run_ps(script, timeout=20)
+    res = []
+    for line in out.splitlines() if ok else []:
+        try:
+            ip = ipaddress.IPv4Address(line.strip())
+        except ValueError:
+            continue
+        if ip in net and ip not in (net.network_address, net.broadcast_address) and str(ip) not in skip:
+            res.append(str(ip))
+    return sorted(set(res), key=ipaddress.IPv4Address)
 
 
 def web_url(ip, res=None):
@@ -1483,8 +1511,7 @@ class MainWindow(QWidget):
         m = QMenu(self)
         m.addAction("🔄 Обновить адаптеры\tF5", self.refresh)
         m.addAction("🔎 Найти антенну\tF7", self.search).setEnabled(not self.worker.busy())
-        a = m.addAction("⬇ Обновить программу с GitHub…", self.update_from_menu)
-        a.setEnabled(not self.worker.busy() and not self.update_busy())
+        m.addAction("⬇ Обновить программу с GitHub…", self.update_from_menu)
         m.addAction("💾 Сохранить\tCtrl+S", self.save_now)
         m.addAction("🎨 Тема\tCtrl+T", self.toggle_theme)
         m.addSeparator()
@@ -1784,7 +1811,8 @@ class MainWindow(QWidget):
             if cur and not cur.startswith("169.254."):
                 own = ipaddress.IPv4Network(f"{cur}/{max(prefix, 24)}", strict=False)
                 w.log(f"🔎 ищу в своей подсети {own}…")
-                found = scan_subnet(own, {cur}, cur, stopped=w.stopped)
+                found = scan_subnet(own, {cur}, cur, stopped=w.stopped) or \
+                    {ip: [] for ip in (neighbors(name, own, {cur}) if IS_WIN else [])}
                 if found:
                     m = str(own.netmask)
                     w.ui(lambda: self.show_found(found, m, cur, str(own)))
@@ -1800,26 +1828,30 @@ class MainWindow(QWidget):
                 saved[name] = snap
                 w.ui(lambda: self._store_snapshot(name, snap))
                 w.log("✓ запомнил прежние настройки адаптера")
-            for net in nets:
-                if w.stopped():
-                    break
-                if cur and ipaddress.IPv4Address(cur) in net:
-                    continue
-                me = str(net.network_address + SEARCH_HOST)
-                ok, out = run_cmd(["netsh", "interface", "ipv4", "set", "address", f"name={name}",
-                                   "static", me, mask])
-                if not ok:
-                    w.log(f"✗ netsh: {out or 'ошибка'}")
-                    break
-                w.log(f"🔎 ищу в {net} (ноутбук временно {me})…")
-                if w.sleep(3):
-                    break
-                found = scan_subnet(net, {me}, me, stopped=w.stopped)
-                if found:
-                    w.ui(lambda f=found, m=me, n=str(net): self.show_found(f, mask, m, n))
-                    w.log(f"ℹ ноутбук оставлен на {me}. Вернуть сеть — «↩ Вернуть как было».")
-                    w.ui(self.refresh_quiet)
-                    return
+            try:
+                for net in nets:
+                    if w.stopped():
+                        break
+                    if cur and ipaddress.IPv4Address(cur) in net:
+                        continue
+                    me = str(net.network_address + SEARCH_HOST)
+                    ok, out = run_cmd(["netsh", "interface", "ipv4", "set", "address", f"name={name}",
+                                       "static", me, mask])
+                    if not ok:
+                        w.log(f"✗ netsh: {out or 'ошибка'}")
+                        break
+                    w.log(f"🔎 ищу в {net} (ноутбук временно {me})…")
+                    if w.sleep(3):
+                        break
+                    found = scan_subnet(net, {me}, me, stopped=w.stopped) or \
+                        {ip: [] for ip in neighbors(name, net, {me})}
+                    if found:
+                        w.ui(lambda f=found, m=me, n=str(net): self.show_found(f, mask, m, n))
+                        w.log(f"ℹ ноутбук оставлен на {me}. Вернуть сеть — «↩ Вернуть как было».")
+                        w.ui(self.refresh_quiet)
+                        return
+            except Exception as e:  # сеть всё равно вернуть
+                w.log(f"✗ поиск: {e}")
             w.log("⏹ поиск остановлен" if w.stopped() else
                   "✗ антенна не найдена. Проверь кабель и PoE-блок (антенна грузится до минуты), "
                   "добавь её подсеть в «Настройки → Подсети для поиска».")
@@ -1839,7 +1871,8 @@ class MainWindow(QWidget):
         self.found.clear()
         names = {80: "http", 443: "https"}
         for ip, ports in found.items():
-            it = QListWidgetItem(f"{ip}\n{', '.join(names.get(p, str(p)) for p in ports)}")
+            what = ", ".join(names.get(p, str(p)) for p in ports) or "отвечает, веб закрыт"
+            it = QListWidgetItem(f"{ip}\n{what}")
             it.setData(Qt.UserRole, ip)
             self.found.addItem(it)
         self.found.blockSignals(False)
@@ -2151,8 +2184,47 @@ class MainWindow(QWidget):
 
     # ── обновление ──
     def update_from_menu(self):
+        """⋯ → «Обновить программу с GitHub»: проверить, скачать, поставить, перезапустить.
+        Репозиторий публичный — токен не обязателен (вписан — используется)."""
+        if FROZEN:
+            QMessageBox.information(self, "Обновление", "Это EXE — обнови на вкладке «Обновление».")
+            return
+        if self.worker.busy() or self.update_busy():
+            QMessageBox.information(self, "Обновление", f"Сейчас идёт «{self.worker.name or 'обновление'}» — "
+                                                       "дождись конца (или Esc — стоп) и нажми ещё раз.")
+            return
+        import dataclasses
+        from app import gh_update
+        t = dataclasses.replace(self.update_page.box.t, branch=self.cfg.get("upd_branch") or GITHUB_BRANCH)
+        token = self.cfg.get("upd_token") or ""
         self.set_page(2)
-        self.update_page.box.check(manual=True)
+
+        def job(w):
+            w.log(f"🔎 смотрю версию на GitHub ({t.owner}/{t.repo}, {t.branch})…")
+            rel, new = gh_update.check(t, token)
+            if rel is None:
+                w.log("✗ на GitHub нет архива программы в release/")
+                return
+            if not new:
+                w.log(f"✓ у тебя последняя версия v{VERSION} (на GitHub v{rel.version})")
+                return
+            w.blocking_close = True
+            w.log(f"⬇ качаю v{rel.version}…")
+            z = gh_update.download(t, token, rel)
+            gh_update.install(t, z, rel.version, lambda *a: w.log(" ".join(str(x) for x in a)))
+            w.log(f"✓ установлена v{rel.version} — перезапускаю")
+            w.ui(self._restart_after_update)
+        self.run_job("обновление", job)
+
+    def _restart_after_update(self):
+        from app import gh_update
+        try:
+            gh_update.restart([str(APP_ROOT / "antenna_setup.pyw")])
+        except Exception as e:
+            QMessageBox.information(self, "Обновление", f"Обновлено, но перезапустить не вышло ({e}). "
+                                                       "Закрой и открой программу.")
+            return
+        QTimer.singleShot(0, self._quit_for_update)
 
     def restart(self, admin=False):
         if self.worker.busy() or self.update_busy():
