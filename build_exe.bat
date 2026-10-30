@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-rem build_exe.bat  v0.4.7 — сборка antenna_setup.exe
+rem build_exe.bat  v0.4.8 — сборка antenna_setup.exe
 cd /d "%~dp0"
 echo === [1/4] Проверка Python ===
 where python >nul 2>nul || (echo Python не найден. Запусти setup.bat & pause & exit /b 1)

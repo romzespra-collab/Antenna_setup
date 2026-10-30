@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.4.7
+antenna_setup.pyw  v0.4.8
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,9 @@ antenna_setup.pyw  v0.4.7
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.4.8: поиск больше не стучится в веб антенн: устройства находятся по ARP (без соединений),
+          найденное проверяется одним GET как у браузера с ожиданием ответа до 20 с без обрыва
+          (v0.4.7 ждал 1 с и закрывал — медленный TP-Link всё равно падал).
   v0.4.7: программа больше не вешает веб антенны: порт 80 проверяется HEAD-запросом с дочитыванием
           ответа (раньше — «соединился и молча закрыл», от чего старые TP-Link падали до перезагрузки),
           порт 443 — TLS-рукопожатием; так и в поиске, и в проверке, и перед чтением настроек.
@@ -78,7 +81,7 @@ antenna_setup.pyw  v0.4.7
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.4.7"
+VERSION = "0.4.8"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -452,10 +455,10 @@ def tcp_open(ip, port, timeout=2.0, src=None):
         return False
 
 
-def web_alive(ip, timeout=3.0, src=None):
-    """Порт 80 — БЕРЕЖНО: соединиться, спросить «HEAD /» и дочитать ответ, как браузер.
+def web_alive(ip, timeout=3.0, src=None, read_timeout=20.0):
+    """Порт 80 — БЕРЕЖНО, как браузер: GET / и ответ дочитывается до конца (до 20 с, без обрыва).
     Старые встроенные веб-серверы антенн (TP-Link и др.) падают до перезагрузки, если соединение
-    открыли и закрыли молча — поэтому «просто постучать» в порт 80 нельзя.
+    закрыть раньше, чем они ответили, или открыть и закрыть молча.
     -> None — порт закрыт; (0, "") — соединились, но ответа нет; (код, Location)."""
     try:
         sk = socket.create_connection((ip, 80), timeout=timeout, source_address=(src, 0) if src else None)
@@ -463,10 +466,11 @@ def web_alive(ip, timeout=3.0, src=None):
         return None
     data = b""
     try:
-        sk.sendall(f"HEAD / HTTP/1.0\r\nHost: {ip}\r\nUser-Agent: {BROWSER_HEADERS['User-Agent']}\r\n\r\n".encode())
-        sk.settimeout(timeout)
-        while len(data) < 16384:
-            chunk = sk.recv(4096)
+        req = f"GET / HTTP/1.1\r\nHost: {ip}\r\n" + "".join(f"{k}: {v}\r\n" for k, v in BROWSER_HEADERS.items())
+        sk.sendall((req + "\r\n").encode())
+        sk.settimeout(read_timeout)
+        while len(data) < 256 * 1024:
+            chunk = sk.recv(8192)
             if not chunk:
                 break
             data += chunk
@@ -482,6 +486,33 @@ def web_alive(ip, timeout=3.0, src=None):
         code = 0
     loc = next((ln.split(":", 1)[1].strip() for ln in lines[1:] if ln.lower().startswith("location:")), "")
     return code, loc
+
+
+def arp_sweep(name, net, src, skip=(), stopped=lambda: False):
+    """Найти устройства на кабеле БЕЗ соединений с ними: пустой UDP-пакет на каждый адрес заставляет
+    Windows спросить по ARP «кто здесь?», ответившие попадают в таблицу соседей. Веб антенн не трогается."""
+    try:
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u.bind((src, 0))
+    except OSError:
+        return []
+    try:
+        for h in net.hosts():
+            if stopped():
+                return []
+            if str(h) in skip:
+                continue
+            try:
+                u.sendto(b"", (str(h), 9))      # порт 9 — «discard»; важен сам ARP-запрос
+            except OSError:
+                pass
+            time.sleep(0.002)
+    finally:
+        u.close()
+    end = time.monotonic() + 3
+    while time.monotonic() < end and not stopped():
+        time.sleep(0.2)
+    return neighbors(name, net, skip)
 
 
 def tls_alive(ip, timeout=3.0, src=None):
@@ -2638,11 +2669,24 @@ class MainWindow(QWidget):
 
         hints = [x for x in (a.get("Gw"), a.get("DhcpSrv")) if x and x != cur and x != "255.255.255.255"]
 
+        def discover(w, net, me):
+            """Кто есть в подсети. Windows — по ARP, без соединений (веб антенн не трогаем);
+            найденное — одна бережная проверка веба (GET как браузер, ответ дочитывается)."""
+            if IS_WIN:
+                ips = arp_sweep(name, net, me, {me}, w.stopped)
+            else:
+                ips = list(scan_subnet(net, {me}, me, ports=(80,), stopped=w.stopped))
+            found = {}
+            for ip in ips[:12]:
+                if w.stopped():
+                    break
+                wa = web_alive(ip, 3, me)
+                found[ip] = [80] if wa is not None and wa[0] else []
+            return found
+
         def probe_net(w, net, me, extra=()):
-            """Порты 80/443 по всей /24, потом кто ответил на ARP, потом подсказки (пинг)."""
-            found = scan_subnet(net, {me}, me, stopped=w.stopped)
-            if not found and IS_WIN:
-                found = {ip: [] for ip in neighbors(name, net, {me})}
+            """Кто есть в подсети (ARP), потом подсказки (пинг)."""
+            found = discover(w, net, me)
             for ip in extra:
                 if ip not in found and ipaddress.IPv4Address(ip) in net and ping(ip, 1.0, me):
                     found[ip] = []
@@ -2676,15 +2720,12 @@ class MainWindow(QWidget):
                 for ip, what in ((a.get("Gw"), "шлюз"), (a.get("DhcpSrv"), "DHCP-сервер — раздал ноутбуку IP")):
                     if not ip or ip == cur or ip == "255.255.255.255":
                         continue
-                    r = check_antenna(ip, 2.0, cur)
+                    r = check_antenna(ip, 3.0, cur)
                     labels[ip] = (labels.get(ip, "") + ", " if ip in labels else "") + what
                     w.log(f"{'✓' if r['alive'] else '⚠'} {what} {ip}: пинг {'да' if r['ping'] else 'нет'}, "
                           f"80 {'да' if r['p80'] else 'нет'}, 443 {'да' if r['p443'] else 'нет'}")
                 w.log(f"🔎 ищу во всей своей сети {own} (сеть не меняю)…")
-                found = scan_subnet(own, {cur}, cur, stopped=w.stopped)
-                if IS_WIN:
-                    for ip in neighbors(name, own, {cur}):
-                        found.setdefault(ip, [])
+                found = discover(w, own, cur)
                 for ip in labels:                 # шлюз и DHCP-сервер показываем всегда
                     if ipaddress.IPv4Address(ip) in own:
                         found.setdefault(ip, [])
