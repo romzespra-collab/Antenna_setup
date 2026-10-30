@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.3.3
+antenna_setup.pyw  v0.3.4
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,9 @@ antenna_setup.pyw  v0.3.3
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.3.4: плитка «Адаптер ▾» вверху — клик / правый клик: выбрать адаптер (поиск и смена IP —
+          только на нём); перебор подсетей пропускает подсети других адаптеров — Wi-Fi с интернетом
+          не ломается.
   v0.3.3: поиск сначала только в своей сети, сеть не меняется: шлюз и DHCP-сервер (раздал IP)
           проверяются и показываются всегда; адрес получен по DHCP — другие подсети не трогаются вовсе;
           перебор других подсетей — только после вопроса.
@@ -40,7 +43,7 @@ antenna_setup.pyw  v0.3.3
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -724,6 +727,7 @@ def _qss(p):
     QLabel#chip {{ border-radius: 11px; padding: 3px 12px; background: {p['panel2']};
         border: 1px solid {p['line']}; font-weight: 600; }}
     QFrame#card, QFrame#tile {{ background: {p['panel']}; border: 1px solid {p['line']}; border-radius: 10px; }}
+    QFrame#tile[clickable="true"]:hover {{ border-color: {p['accent']}; }}
     QLabel#cardTitle {{ color: {p['muted']}; font-size: 8pt; font-weight: 700; letter-spacing: 1px; background: transparent; }}
     QLabel#tileCap {{ color: {p['muted']}; font-size: 8pt; background: transparent; }}
     QLabel#tileVal {{ font-size: 13pt; font-weight: 700; background: transparent; }}
@@ -1189,6 +1193,8 @@ def _lab(text, name=None):
 
 
 class Tile(QFrame):
+    clicked = Signal(QPoint)   # глобальная точка клика (для меню под плиткой)
+
     def __init__(self, caption):
         super().__init__()
         self.setObjectName("tile")
@@ -1210,6 +1216,17 @@ class Tile(QFrame):
 
     def restyle(self):
         self.val.setStyleSheet(f"color: {P[self._color]};" if self._color else "")
+
+    def make_clickable(self, tip):
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(tip)
+        self.setProperty("clickable", True)
+
+    def mousePressEvent(self, e):
+        if self.property("clickable") and e.button() == Qt.LeftButton:
+            self.clicked.emit(self.mapToGlobal(QPoint(0, self.height())))
+            return
+        super().mousePressEvent(e)
 
 # ───────────────────────── фильтр событий приложения ─────────────────────────
 
@@ -1329,7 +1346,10 @@ class MainWindow(QWidget):
 
         tiles = QHBoxLayout()
         tiles.setSpacing(10)
-        self.t_adapter, self.t_myip = Tile("Адаптер"), Tile("IP ноутбука сейчас")
+        self.t_adapter, self.t_myip = Tile("Адаптер ▾"), Tile("IP ноутбука сейчас")
+        self.t_adapter.make_clickable("Нажми — выбрать адаптер, к которому подключена антенна.\n"
+                                      "Поиск и смена IP — только на нём; Wi-Fi с интернетом не трогается")
+        self.t_adapter.clicked.connect(lambda pos: self.adapter_menu().exec(pos))
         self.t_ant, self.t_resp = Tile("Антенна"), Tile("Ответ")
         self.tiles = (self.t_adapter, self.t_myip, self.t_ant, self.t_resp)
         for t in self.tiles:
@@ -1706,6 +1726,8 @@ class MainWindow(QWidget):
             m.addAction("Копировать адрес", lambda: QApplication.clipboard().setText(self.e_ant.text())) \
                 .setEnabled(it is not None)
             m.addAction("Очистить список", self.clear_found).setEnabled(self.found.count() > 0)
+        elif w is self.t_adapter or w.parent() is self.t_adapter:
+            m = self.adapter_menu()
         elif w is self.cb_adapter:
             m.addAction("🔄 Обновить список\tF5", self.refresh)
             m.addAction("Копировать имя", lambda: QApplication.clipboard().setText(self.cb_adapter.currentText()))
@@ -1962,6 +1984,8 @@ class MainWindow(QWidget):
             return found
 
         dhcp = (a.get("Dhcp") or "").lower() == "enabled"
+        others = [x.get("IP") for x in self.adapters if x["Name"] != name and x.get("IP")
+                  and not x["IP"].startswith("169.254.")]
         usable = bool(cur and not cur.startswith("169.254."))
         heard = {}
 
@@ -2023,6 +2047,11 @@ class MainWindow(QWidget):
                 if n not in order:
                     order.append(n)
             order += [n for n in nets if n not in order]
+            busy = [n for n in order if any(ipaddress.IPv4Address(x) in n for x in others)]
+            if busy:
+                w.log("ℹ пропускаю подсети других адаптеров (Wi-Fi/интернет не трогаю): "
+                      + ", ".join(str(n) for n in busy))
+                order = [n for n in order if n not in busy]
             if usable:
                 order = [n for n in order if ipaddress.IPv4Address(cur) not in n]
             listened = bool(cur)
@@ -2184,6 +2213,20 @@ class MainWindow(QWidget):
         self.on_adapter()
         self.log(f"✓ адаптеров: {len(data)}" if data else "⚠ физических адаптеров не найдено")
 
+    def adapter_menu(self):
+        m = QMenu(self)
+        cur = self.cb_adapter.currentData()
+        for i in range(self.cb_adapter.count()):
+            a = m.addAction(self.cb_adapter.itemText(i))
+            a.setCheckable(True)
+            a.setChecked(self.cb_adapter.itemData(i) == cur)
+            a.triggered.connect(lambda _=False, i=i: self.cb_adapter.setCurrentIndex(i))
+        if not self.cb_adapter.count():
+            m.addAction("адаптеры ещё не прочитаны").setEnabled(False)
+        m.addSeparator()
+        m.addAction("🔄 Обновить список\tF5", self.refresh)
+        return m
+
     def adapter(self):
         name = self.cb_adapter.currentData()
         return next((a for a in self.adapters if a["Name"] == name), None)
@@ -2204,8 +2247,8 @@ class MainWindow(QWidget):
         a = self.adapter()
         if a:
             up = a.get("Status") == "Up"
-            self.t_adapter.set(a["Name"], ("Wi-Fi" if a["Wifi"] else "кабель") + (", подключён" if up else ", нет связи"),
-                               "ok" if up else "warn")
+            self.t_adapter.set(a["Name"], ("Wi-Fi" if a["Wifi"] else "кабель") + (", подключён" if up else ", нет связи")
+                               + " · нажми — сменить", "ok" if up else "warn")
             ip = a.get("IP") or "нет"
             in_net = False
             try:
@@ -2215,7 +2258,7 @@ class MainWindow(QWidget):
                 pass
             self.t_myip.set(ip, "в подсети антенны" if in_net else "не в подсети антенны", "ok" if in_net else "warn")
         else:
-            self.t_adapter.set("—", "F5 — прочитать адаптеры")
+            self.t_adapter.set("—", "нажми или F5 — прочитать адаптеры")
             self.t_myip.set("—", "")
         ant = self.e_ant.text().strip()
         self.t_ant.set(ant or "—", "найдена поиском" if ant and self.found.count() and
