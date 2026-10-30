@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.3.8
+antenna_setup.pyw  v0.4.0
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,12 @@ antenna_setup.pyw  v0.3.8
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.4.0: «📖 Прочитать настройки» — программа сама входит в веб антенны (TP-Link старый веб,
+          Ubiquiti airOS, MikroTik REST; логин/пароль в «Параметрах», пусто — заводские) и
+          показывает модель, прошивку, режим, адреса, SSID, сигнал; прочитанное — и в отчёт.
+          Wi-Fi в той же подсети, что кабель, больше не перехватывает запросы к антенне: пинг,
+          порты и веб — с адреса кабеля, браузеру — маршрут через кабель (до перезагрузки /
+          «Вернуть как было» / выхода). «📤 Отправить журнал» — на главной, в «Действиях».
   v0.3.8: «📤 Отправить журнал» (Настройки, ⋯, правый клик по журналу): журнал, адаптеры, найденное —
           файлом в приватный репозиторий antenna_reports (токен только на запись туда); после 5xx /
           обрыва повторно не шлёт, сначала проверяет, дошёл ли.
@@ -52,7 +58,7 @@ antenna_setup.pyw  v0.3.8
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.3.8"
+VERSION = "0.4.0"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -200,7 +206,7 @@ DEFAULT_CONFIG = {
     "check_timeout": 3, "check_retries": 6, "auto_check": True, "ask_admin": True,
     "upd_token": "", "upd_auto": True, "upd_branch": GITHUB_BRANCH, "upd_every_h": 12,
     "saved_net": {}, "geometry": "", "page": 0,
-    "report_repo": REPORT_REPO, "report_token": "",
+    "report_repo": REPORT_REPO, "report_token": "", "ant_user": "", "ant_pass": "", "pinned_routes": [],
 }
 
 # ───────────────────────── конфиг (атомарно, с .bak) ─────────────────────────
@@ -405,10 +411,10 @@ def validate(antenna_ip, mask, my_ip):
     return None
 
 
-def ping(ip, timeout_s=1.0):
-    """True — только если пришёл ответ с TTL (а не «узел недоступен»)."""
+def ping(ip, timeout_s=1.0, src=None):
+    """True — только если пришёл ответ с TTL (а не «узел недоступен»). src — с какого адреса (кабеля)."""
     if IS_WIN:
-        args = ["ping", "-n", "1", "-w", str(int(timeout_s * 1000)), ip]
+        args = ["ping", "-n", "1", "-w", str(int(timeout_s * 1000))] + (["-S", src] if src else []) + [ip]
     else:
         args = ["ping", "-c", "1", "-W", str(max(1, int(timeout_s))), ip]
     ok, out = run_cmd(args, timeout=timeout_s + 5)
@@ -437,13 +443,181 @@ def http_status(ip, timeout=3.0):
         c.close()
 
 
-def check_antenna(ip, timeout=3.0):
-    res = {"ping": ping(ip, min(timeout, 2.0)), "p80": tcp_open(ip, 80, timeout),
-           "p443": tcp_open(ip, 443, timeout), "http": None}
+def check_antenna(ip, timeout=3.0, src=None):
+    res = {"ping": ping(ip, min(timeout, 2.0), src), "p80": tcp_open(ip, 80, timeout, src),
+           "p443": tcp_open(ip, 443, timeout, src), "http": None}
     if res["p80"]:
-        res["http"] = http_status(ip, timeout)
+        try:
+            st, hd, _b = http_get(ip, "/", src, timeout=timeout)
+            res["http"] = (st, hd.get("location", ""))
+        except (OSError, http.client.HTTPException):
+            res["http"] = None
     res["alive"] = res["ping"] or res["p80"] or res["p443"]
     return res
+
+
+def http_get(ip, path, src=None, headers=None, method="GET", body=None, timeout=5.0, limit=512 * 1024):
+    """HTTP к антенне С АДРЕСА КАБЕЛЯ (src): Wi-Fi в той же подсети не перехватит.
+    Без перехода по редиректам. -> (код, {заголовок: значение}, тело); Set-Cookie — все, через «\n»."""
+    c = http.client.HTTPConnection(ip, 80, timeout=timeout, source_address=(src, 0) if src else None)
+    try:
+        h = {"User-Agent": "Mozilla/5.0 antenna_setup", "Connection": "close"}
+        h.update(headers or {})
+        c.request(method, path, body=body, headers=h)
+        r = c.getresponse()
+        hd = {}
+        for k, v in r.getheaders():
+            k = k.lower()
+            hd[k] = (hd[k] + "\n" + v) if k in hd and k == "set-cookie" else v
+        return r.status, hd, r.read(limit)
+    finally:
+        c.close()
+
+
+def pin_route(name, ip):
+    """Маршрут к адресу антенны — через кабель (только до перезагрузки, ActiveStore).
+    Нужен, когда Wi-Fi в той же подсети: иначе Windows шлёт запросы к антенне через Wi-Fi."""
+    ok, out = run_ps(f"New-NetRoute -DestinationPrefix '{ip}/32' -InterfaceAlias {ps_str(name)} -NextHop 0.0.0.0 "
+                     "-RouteMetric 1 -PolicyStore ActiveStore -EA Stop | Out-Null", 20)
+    return ok or "exist" in out.lower() or "существ" in out.lower(), out
+
+
+def unpin_route(name, ip):
+    run_ps(f"Remove-NetRoute -DestinationPrefix '{ip}/32' -InterfaceAlias {ps_str(name)} -Confirm:$false "
+           "-EA SilentlyContinue", 20)
+
+# ───────────────────────── чтение настроек антенны ─────────────────────────
+
+
+def _html_title(body):
+    import re
+    m = re.search(rb"<title[^>]*>(.*?)</title>", body or b"", re.I | re.S)
+    return m.group(1).decode("utf-8", "replace").strip()[:120] if m else ""
+
+
+def _js_arrays(text):
+    """TP-Link (старый веб): var statusPara = new Array(…); -> {имя: [значения]}."""
+    import re
+    out = {}
+    for m in re.finditer(r"var\s+(\w+)\s*=\s*new\s+Array\s*\((.*?)\);", text, re.S):
+        items = re.findall(r'"((?:[^"\\]|\\.)*)"|([-\w.]+)', m.group(2))
+        out[m.group(1)] = [a if a else b for a, b in items]
+    return out
+
+
+def read_tplink_classic(ip, src, user, pw):
+    auth = "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()
+    lines, raw = [], {}
+    for page in ("/userRpm/StatusRpm.htm", "/userRpm/WlanNetworkRpm.htm", "/userRpm/NetworkCfgRpm.htm"):
+        st, _hd, body = http_get(ip, page, src, {"Authorization": auth, "Referer": f"http://{ip}/"})
+        if st == 401:
+            return None, {"tplink": "логин/пароль не подошли"}
+        if st != 200:
+            continue
+        text = body.decode("utf-8", "replace")
+        raw[page] = text[:4000]
+        for name, vals in _js_arrays(text).items():
+            if vals:
+                lines.append(f"{name}: " + " | ".join(v for v in vals if v not in ("", "0"))[:400])
+    return (["TP-Link (старый веб-интерфейс)"] + lines) if lines else None, raw
+
+
+def read_airos(ip, src, user, pw):
+    import random
+    sid = "%032x" % random.getrandbits(128)
+    ck = {"Cookie": f"AIROS_SESSIONID={sid}"}
+    http_get(ip, "/login.cgi", src, ck)
+    bnd = "----antenna%08x" % random.getrandbits(32)
+    parts = []
+    for k, v in (("uri", "/status.cgi"), ("username", user), ("password", pw)):
+        parts.append(f'--{bnd}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n')
+    body = ("".join(parts) + f"--{bnd}--\r\n").encode()
+    http_get(ip, "/login.cgi", src, dict(ck, **{"Content-Type": f"multipart/form-data; boundary={bnd}"}),
+             "POST", body)
+    st, _hd, data = http_get(ip, "/status.cgi", src, ck)
+    try:
+        j = json.loads(data.decode("utf-8", "replace"))
+    except ValueError:
+        return None, {"airos": f"status.cgi: код {st}, не JSON — логин/пароль не подошли или другая прошивка"}
+    h, wl = j.get("host", {}), j.get("wireless", {})
+    lines = ["Ubiquiti airOS",
+             f"имя {h.get('hostname')} · модель {h.get('devmodel')} · прошивка {h.get('fwversion')} · "
+             f"работает {int(h.get('uptime') or 0) // 3600} ч",
+             f"режим {wl.get('mode')} · SSID {wl.get('essid')} · частота {wl.get('frequency')} · "
+             f"канал {wl.get('channel')} · сигнал {wl.get('signal')} дБм · шум {wl.get('noisef')} · "
+             f"CCQ {wl.get('ccq')} · TX/RX {wl.get('txrate')}/{wl.get('rxrate')}",
+             f"точка {wl.get('apmac')} · клиентов {wl.get('count')}"]
+    for itf in j.get("interfaces", []) or []:
+        st_ = itf.get("status", {}) or {}
+        lines.append(f"порт {itf.get('ifname')}: {st_.get('ipaddr') or '—'} {'вкл' if st_.get('plugged') else ''}")
+    return lines, {"status.cgi": json.dumps(j, ensure_ascii=False)[:4000]}
+
+
+def read_mikrotik(ip, src, user, pw):
+    auth = {"Authorization": "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()}
+    out, raw = ["MikroTik RouterOS"], {}
+    for path in ("/rest/system/identity", "/rest/system/resource", "/rest/ip/address",
+                 "/rest/interface/wireless"):
+        st, _hd, data = http_get(ip, path, src, auth)
+        if st == 401:
+            return None, {"mikrotik": "логин/пароль не подошли"}
+        if st != 200:
+            continue
+        try:
+            j = json.loads(data.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        raw[path] = json.dumps(j, ensure_ascii=False)[:3000]
+        items = j if isinstance(j, list) else [j]
+        for it in items[:6]:
+            keys = ("name", "board-name", "version", "uptime", "address", "interface", "mode", "ssid",
+                    "frequency", "band")
+            out.append(path.split("/")[-1] + ": " + " · ".join(f"{k} {it[k]}" for k in keys if k in it))
+    return (out if len(out) > 1 else None), raw
+
+
+def read_antenna(ip, src=None, user="", pw="", log=print):
+    """Определить, что за антенна, и прочитать её настройки через её веб (порт 80).
+    -> (строки для человека, сырые данные для отчёта). Пароль в отчёт не попадает."""
+    raw = {}
+    try:
+        st, hd, body = http_get(ip, "/", src)
+    except OSError as e:
+        return [f"✗ {ip}: веб (порт 80) не отвечает — {e}"], raw
+    title, server = _html_title(body), hd.get("server", "")
+    realm, loc = hd.get("www-authenticate", ""), hd.get("location", "")
+    raw["/"] = f"код {st} · server {server} · realm {realm} · location {loc} · title {title}\n" + \
+        body[:3000].decode("utf-8", "replace")
+    info = [f"веб: код {st}" + (f" · «{title}»" if title else "") + (f" · сервер {server}" if server else "")
+            + (f" · {realm}" if realm else "") + (f" → {loc}" if loc else "")]
+    if loc.lower().startswith("https"):
+        info.append("⚠ антенна уводит на https с самодельным сертификатом — без проверки сертификата не читаю; "
+                    "открой веб в браузере")
+    text = (title + server + realm + loc + body[:4000].decode("latin-1")).lower()
+    tries = []
+    if "tp-link" in text or "tplink" in text or "userrpm" in text or ("basic" in realm.lower() and st == 401):
+        tries.append(("TP-Link", read_tplink_classic, [("admin", "admin")]))
+    if "airos" in text or "ubnt" in text or "login.cgi" in text or "ubiquiti" in text:
+        tries.append(("Ubiquiti", read_airos, [("ubnt", "ubnt")]))
+    if "routeros" in text or "mikrotik" in text or "webfig" in text:
+        tries.append(("MikroTik", read_mikrotik, [("admin", "")]))
+    if not tries:
+        tries = [("TP-Link", read_tplink_classic, [("admin", "admin")]),
+                 ("Ubiquiti", read_airos, [("ubnt", "ubnt")]),
+                 ("MikroTik", read_mikrotik, [("admin", "")])]
+    for vendor, fn, defaults in tries:
+        creds = ([(user, pw)] if user else []) + [c for c in defaults if c != (user, pw)]
+        for u, p in creds:
+            log(f"… пробую {vendor}, логин «{u}»")
+            try:
+                lines, r = fn(ip, src, u, p)
+            except (OSError, http.client.HTTPException) as e:
+                lines, r = None, {vendor: f"ошибка: {e}"}
+            raw.update({f"{vendor}:{k}": v for k, v in (r or {}).items()})
+            if lines:
+                return info + [f"✓ вход: {u} / {'*' * len(p) if p else '(пусто)'}"] + lines, raw
+    return info + ["✗ настройки прочитать не вышло: модель не распознана или логин/пароль не подошли "
+                   "(впиши их в «Параметры»)."], raw
 
 
 def parse_subnets(text):
@@ -1492,9 +1666,21 @@ class MainWindow(QWidget):
         g.addWidget(_lab("Ноутбук"), 2, 0)
         g.addWidget(self.e_my, 2, 1)
         g.addWidget(self.btn_auto, 2, 2)
+        self.e_user = QLineEdit()
+        self.e_user.setPlaceholderText("логин (пусто — заводской)")
+        self.e_pw = QLineEdit()
+        self.e_pw.setEchoMode(QLineEdit.Password)
+        self.e_pw.setPlaceholderText("пароль (пусто — заводской)")
+        self.e_pw.setToolTip("Для «📖 Прочитать настройки». Хранится только в config.json; в отчёт не попадает")
+        g.addWidget(_lab("Логин"), 3, 0)
+        g.addWidget(self.e_user, 3, 1, 1, 2)
+        g.addWidget(_lab("Пароль"), 4, 0)
+        g.addWidget(self.e_pw, 4, 1, 1, 2)
         cl.addLayout(g)
         c.setFixedWidth(300)
         left.addWidget(c)
+        for e in (self.e_user, self.e_pw):
+            e.textEdited.connect(self._sync_cfg)
         for e in (self.e_ant, self.e_mask, self.e_my):
             e.textEdited.connect(self._params_edited)
         lay.addLayout(left)
@@ -1543,8 +1729,14 @@ class MainWindow(QWidget):
         bg = QGridLayout()
         bg.setHorizontalSpacing(8)
         bg.setVerticalSpacing(8)
-        for i, b in enumerate((self.btn_find, self.btn_set, self.btn_check, self.btn_open, self.btn_restore,
-                               self.btn_stop)):
+        self.btn_read = QPushButton("📖 Прочитать настройки")
+        self.btn_read.setToolTip("Войти в веб антенны и прочитать модель, прошивку, режим, адреса, SSID, сигнал")
+        self.btn_read.clicked.connect(self.read_settings)
+        self.btn_report = QPushButton("📤 Отправить журнал")
+        self.btn_report.setToolTip("Журнал, адаптеры и прочитанное — в приватный antenna_reports, для Claude")
+        self.btn_report.clicked.connect(self.send_report)
+        for i, b in enumerate((self.btn_find, self.btn_set, self.btn_check, self.btn_open, self.btn_read,
+                               self.btn_restore, self.btn_report, self.btn_stop)):
             bg.addWidget(b, i // 3, i % 3)
         cl.addLayout(bg)
         res = QGridLayout()
@@ -1865,6 +2057,8 @@ class MainWindow(QWidget):
             self.e_ant.setText(c["antenna_ip"])
             self.e_mask.setText(c.get("mask") or "255.255.255.0")
             self.e_my.setText(c.get("my_ip", ""))
+        self.e_user.setText(c.get("ant_user", ""))
+        self.e_pw.setText(c.get("ant_pass", ""))
         page = int(c.get("page", 0) or 0)
         self.set_page(page if 0 <= page < self.stack.count() else 0)
         self.update_saved_label()
@@ -1899,6 +2093,8 @@ class MainWindow(QWidget):
         c["antenna_ip"] = self.e_ant.text().strip()
         c["mask"] = self.e_mask.text().strip()
         c["my_ip"] = self.e_my.text().strip()
+        c["ant_user"] = self.e_user.text().strip()
+        c["ant_pass"] = self.e_pw.text()
         c["adapter"] = self.cb_adapter.currentData() or c.get("adapter", "")
         c["page"] = self.stack.currentIndex()
         geo = self._normal_geo if (self.maxed and self._normal_geo) else self.geometry()
@@ -2053,7 +2249,7 @@ class MainWindow(QWidget):
         self.btn_set.setEnabled(not busy and admin)
         for b in (self.btn_set, self.btn_restore):
             b.setToolTip(b.toolTip() if admin else "Нужны права администратора (перезапусти программу)")
-        for b in (self.btn_find, self.btn_check, self.btn_refresh):
+        for b in (self.btn_find, self.btn_check, self.btn_refresh, self.btn_read, self.btn_report):
             b.setEnabled(not busy)
 
     def ask_stop(self):
@@ -2114,7 +2310,7 @@ class MainWindow(QWidget):
             if not found and IS_WIN:
                 found = {ip: [] for ip in neighbors(name, net, {me})}
             for ip in extra:
-                if ip not in found and ipaddress.IPv4Address(ip) in net and ping(ip, 1.0):
+                if ip not in found and ipaddress.IPv4Address(ip) in net and ping(ip, 1.0, me):
                     found[ip] = []
             return found
 
@@ -2143,7 +2339,7 @@ class MainWindow(QWidget):
                 for ip, what in ((a.get("Gw"), "шлюз"), (a.get("DhcpSrv"), "DHCP-сервер — раздал ноутбуку IP")):
                     if not ip or ip == cur or ip == "255.255.255.255":
                         continue
-                    r = check_antenna(ip, 2.0)
+                    r = check_antenna(ip, 2.0, cur)
                     labels[ip] = (labels.get(ip, "") + ", " if ip in labels else "") + what
                     w.log(f"{'✓' if r['alive'] else '⚠'} {what} {ip}: пинг {'да' if r['ping'] else 'нет'}, "
                           f"80 {'да' if r['p80'] else 'нет'}, 443 {'да' if r['p443'] else 'нет'}")
@@ -2390,6 +2586,9 @@ class MainWindow(QWidget):
             apipa = (a.get("IP") or "").startswith("169.254.")
             if apipa:
                 dh += " — автоадрес Windows, DHCP не ответил"
+            other = self._conflict_for(a["IP"]) if a.get("IP") else ""
+            if other:
+                dh += f"\n⚠ «{other}» в той же подсети — запросы к антенне программа пустит через этот адаптер"
             self.l_adapter.setText(f"{a.get('Desc', '')}\nСейчас: {a.get('IP') or 'нет адреса'}"
                                    f"{'/' + str(a['Prefix']) if a.get('IP') else ''}, {dh}"
                                    f"{', шлюз ' + a['Gw'] if a.get('Gw') else ''}"
@@ -2481,7 +2680,7 @@ class MainWindow(QWidget):
             w.ui(lambda: self.set_chip("● IP задан", "ok"))
             w.ui(self.refresh_quiet)
             if auto:
-                self._check_loop(w, ant, timeout, retries)
+                self._check_loop(w, ant, timeout, retries, me)
         self.run_job("ставлю IP", job)
 
     def _store_snapshot(self, name, snap):
@@ -2498,12 +2697,62 @@ class MainWindow(QWidget):
                 self.refresh()
         QTimer.singleShot(500, later)
 
-    def _check_loop(self, w, ip, timeout, retries):
+    def _src_for(self, ip):
+        """Адрес выбранного адаптера, если антенна в его подсети (пинг/порты/веб — с него)."""
+        a = self.adapter()
+        try:
+            if a and a.get("IP") and ipaddress.IPv4Address(ip) in ipaddress.IPv4Network(
+                    f"{a['IP']}/{a.get('Prefix') or 24}", strict=False):
+                return a["IP"]
+        except ValueError:
+            pass
+        return None
+
+    def _conflict_for(self, ip):
+        """Другой адаптер (обычно Wi-Fi) в той же подсети, что адрес антенны -> его имя, иначе ""."""
+        a = self.adapter()
+        for x in self.adapters:
+            if a and x["Name"] != a["Name"] and x.get("IP") and not x["IP"].startswith("169.254."):
+                try:
+                    if ipaddress.IPv4Address(ip) in ipaddress.IPv4Network(f"{x['IP']}/{x.get('Prefix') or 24}",
+                                                                          strict=False):
+                        return x["Name"]
+                except ValueError:
+                    continue
+        return ""
+
+    def _pin_if_needed(self, w, ip):
+        """Wi-Fi в той же подсети — маршрут к антенне через кабель (Wi-Fi и интернет не трогаем)."""
+        a, other = self.adapter(), self._conflict_for(ip)
+        if not (IS_WIN and a and other and is_admin()):
+            return
+        key = [a["Name"], ip]
+        if key in (self.cfg.get("pinned_routes") or []):
+            return
+        ok, out = pin_route(a["Name"], ip)
+        if ok:
+            w.log(f"✓ «{other}» в той же подсети — запросы к {ip} пущены через «{a['Name']}» "
+                  "(маршрут до перезагрузки, интернет по Wi-Fi остаётся)")
+            w.ui(lambda: self.cfg.setdefault("pinned_routes", []).append(key))
+        else:
+            w.log(f"⚠ маршрут через кабель не поставился: {out[:200]}")
+
+    def unpin_all(self, name=None):
+        left = []
+        for n, ip in self.cfg.get("pinned_routes") or []:
+            if name is None or n == name:
+                unpin_route(n, ip)
+            else:
+                left.append([n, ip])
+        self.cfg["pinned_routes"] = left
+
+    def _check_loop(self, w, ip, timeout, retries, src=None):
+        self._pin_if_needed(w, ip)
         for i in range(retries + 1):
             if w.stopped():
                 w.log("⏹ проверка остановлена")
                 return
-            res = check_antenna(ip, timeout)
+            res = check_antenna(ip, timeout, src)
             if res["alive"] or i == retries:
                 w.ui(lambda r=res: self.show_check(ip, r))
                 return
@@ -2520,10 +2769,11 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "Проверка", "Неверный адрес антенны.")
             return
         timeout = self.f_timeout.value()
+        src = self._src_for(ip)
 
         def job(w):
-            w.log(f"🔎 проверяю {ip}…")
-            self._check_loop(w, ip, timeout, 0)
+            w.log(f"🔎 проверяю {ip}" + (f" с {src}" if src else "") + "…")
+            self._check_loop(w, ip, timeout, 0, src)
         self.run_job("проверка", job)
 
     def show_check(self, ip, r):
@@ -2564,7 +2814,13 @@ class MainWindow(QWidget):
             return
         r = self.last_check if self.last_check and self.last_check.get("ip") in (None, ip) else None
         url = web_url(ip, r)
-        QDesktopServices.openUrl(QUrl(url))
+        if self._conflict_for(ip) and IS_WIN and not self.worker.busy():
+            def job(w):
+                self._pin_if_needed(w, ip)
+                w.ui(lambda: QDesktopServices.openUrl(QUrl(url)))
+            self.run_job("маршрут через кабель", job)
+        else:
+            QDesktopServices.openUrl(QUrl(url))
         self.log(f"🌐 открываю {url}")
         if url.startswith("https"):
             self.log("ℹ у антенны свой сертификат — браузер может предупредить, это ожидаемо.")
@@ -2617,6 +2873,11 @@ class MainWindow(QWidget):
                     w.log(f"✗ netsh: {out or 'ошибка'}")
                     w.ui(lambda: self.set_chip("● ошибка", "err"))
                     return
+            for n, rip in list(self.cfg.get("pinned_routes") or []):
+                if n == name:
+                    unpin_route(n, rip)
+            w.ui(lambda: self.cfg.__setitem__("pinned_routes", [k for k in (self.cfg.get("pinned_routes") or [])
+                                                                 if k[0] != name]))
             w.log(f"✓ «{name}» возвращён: {what}")
             w.ui(lambda: self._forget(name))
             w.ui(lambda: self.set_chip("● сеть возвращена", "ok"))
@@ -2650,6 +2911,30 @@ class MainWindow(QWidget):
                                      f"DNS {', '.join(v.get('dns') or []) or '—'}"))
         self.l_saved.setText("\n".join(lines))
 
+    # ── чтение настроек антенны ──
+    def read_settings(self):
+        ip = self.e_ant.text().strip()
+        try:
+            ipaddress.IPv4Address(ip)
+        except ValueError:
+            QMessageBox.warning(self, "Настройки антенны", "Сначала найди антенну или впиши её адрес.")
+            return
+        src, user, pw = self._src_for(ip), self.e_user.text().strip(), self.e_pw.text()
+
+        def job(w):
+            self._pin_if_needed(w, ip)
+            w.log(f"📖 читаю настройки {ip}" + (f" с {src}" if src else "") + "…")
+            lines, raw = read_antenna(ip, src, user, pw, w.log)
+            for ln in lines:
+                w.log(ln if ln.startswith(("✓", "✗", "⚠")) else "   " + ln)
+            w.ui(lambda: self._store_read(ip, lines, raw))
+        self.run_job("чтение настроек", job)
+
+    def _store_read(self, ip, lines, raw):
+        self.last_read = {"ip": ip, "time": time.strftime("%H:%M:%S"), "lines": lines, "raw": raw}
+        ok = any(ln.startswith("✓ вход") for ln in lines)
+        self.set_chip("● настройки прочитаны" if ok else "● не прочитал", "ok" if ok else "warn")
+
     # ── отчёт ──
     def build_report(self):
         lines = [f"antenna_setup v{VERSION} · {time.strftime('%Y-%m-%d %H:%M:%S')} · "
@@ -2665,7 +2950,18 @@ class MainWindow(QWidget):
                   "НАЙДЕНО: " + ("; ".join(self.found.item(i).text().replace("\n", " ")
                                           for i in range(self.found.count())) or "—"),
                   "СНИМКИ СЕТИ: " + json.dumps(self.cfg.get("saved_net") or {}, ensure_ascii=False),
-                  "ПОДСЕТИ ПОИСКА: " + self.e_subnets.text(), "", "ЖУРНАЛ:", self.logv.toPlainText()]
+                  "ПОДСЕТИ ПОИСКА: " + self.e_subnets.text(),
+                  "МАРШРУТЫ ЧЕРЕЗ КАБЕЛЬ: " + json.dumps(self.cfg.get("pinned_routes") or [], ensure_ascii=False)]
+        rd = getattr(self, "last_read", None)
+        if rd:
+            lines += ["", f"НАСТРОЙКИ АНТЕННЫ {rd['ip']} ({rd['time']}):"] + rd["lines"] + ["", "СЫРЫЕ ДАННЫЕ:"]
+            pw = self.e_pw.text()
+            for k, v in rd["raw"].items():
+                v = str(v)
+                if pw:
+                    v = v.replace(pw, "***")
+                lines += [f"--- {k} ---", v]
+        lines += ["", "ЖУРНАЛ:", self.logv.toPlainText()]
         return "\n".join(lines)
 
     def send_report(self):
@@ -2773,6 +3069,8 @@ class MainWindow(QWidget):
             self.set_chip("● останавливаю…", "warn")
             e.ignore()
             return
+        if IS_WIN and self.cfg.get("pinned_routes"):
+            self.unpin_all()
         self.save_now()
         e.accept()
 
