@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.4.1
+antenna_setup.pyw  v0.4.2
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,10 @@ antenna_setup.pyw  v0.4.1
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.4.2: чтение настроек: ждём ответа веба до 20 с (было 5 — медленная антенна «timed out» до логина),
+          заголовки как у браузера, не вышло с адреса кабеля — пробуем как браузер; диагностика
+          (соединение / первый байт / что прислала) — в журнал и в отчёт; логин / пароль по умолчанию
+          admin / admin (не подошли — пробуются заводские других марок).
   v0.4.1: интернет — только через Wi-Fi, кабель — для антенн: кабелю низкий приоритет маршрутов
           (метрика 500, настройка «Интернет только через Wi-Fi», по умолчанию вкл; «Вернуть как было»
           возвращает); «Отправить журнал» подключается к GitHub с адреса Wi-Fi.
@@ -61,7 +65,7 @@ antenna_setup.pyw  v0.4.1
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -211,7 +215,7 @@ DEFAULT_CONFIG = {
     "upd_token": "", "upd_auto": True, "upd_branch": GITHUB_BRANCH, "upd_every_h": 12,
     "saved_net": {}, "geometry": "", "page": 0,
     "wifi_internet": True, "metric_orig": {},
-    "report_repo": REPORT_REPO, "report_token": "", "ant_user": "", "ant_pass": "", "pinned_routes": [],
+    "report_repo": REPORT_REPO, "report_token": "", "ant_user": "admin", "ant_pass": "admin", "pinned_routes": [],
 }
 
 # ───────────────────────── конфиг (атомарно, с .bak) ─────────────────────────
@@ -461,12 +465,21 @@ def check_antenna(ip, timeout=3.0, src=None):
     return res
 
 
-def http_get(ip, path, src=None, headers=None, method="GET", body=None, timeout=5.0, limit=512 * 1024):
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/124.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8", "Connection": "close"}
+HTTP_TIMEOUT = 20.0   # старые антенны отвечают медленно (TP-Link — до 10+ с на первый запрос)
+
+
+def http_get(ip, path, src=None, headers=None, method="GET", body=None, timeout=HTTP_TIMEOUT, limit=512 * 1024):
     """HTTP к антенне С АДРЕСА КАБЕЛЯ (src): Wi-Fi в той же подсети не перехватит.
-    Без перехода по редиректам. -> (код, {заголовок: значение}, тело); Set-Cookie — все, через «\n»."""
+    Заголовки — как у браузера. Без перехода по редиректам.
+    -> (код, {заголовок: значение}, тело); Set-Cookie — все, через «\n»."""
     c = http.client.HTTPConnection(ip, 80, timeout=timeout, source_address=(src, 0) if src else None)
     try:
-        h = {"User-Agent": "Mozilla/5.0 antenna_setup", "Connection": "close"}
+        h = dict(BROWSER_HEADERS)
         h.update(headers or {})
         c.request(method, path, body=body, headers=h)
         r = c.getresponse()
@@ -601,14 +614,59 @@ def read_mikrotik(ip, src, user, pw):
     return (out if len(out) > 1 else None), raw
 
 
+def raw_probe(ip, src=None, timeout=HTTP_TIMEOUT):
+    """Диагностика: соединиться, послать запрос как браузер и записать, что и когда пришло.
+    -> (текст для журнала, сырые байты)."""
+    t0 = time.monotonic()
+    try:
+        sk = socket.create_connection((ip, 80), timeout=timeout, source_address=(src, 0) if src else None)
+    except OSError as e:
+        return f"порт 80: не соединиться ({e})", b""
+    t_conn = time.monotonic() - t0
+    data = b""
+    try:
+        req = f"GET / HTTP/1.1\r\nHost: {ip}\r\n" + "".join(f"{k}: {v}\r\n" for k, v in BROWSER_HEADERS.items())
+        sk.sendall((req + "\r\n").encode())
+        sk.settimeout(timeout)
+        t1 = time.monotonic()
+        first = None
+        while len(data) < 8192:
+            try:
+                chunk = sk.recv(4096)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            first = first or (time.monotonic() - t1)
+            data += chunk
+    except OSError as e:
+        return f"соединение есть ({t_conn:.1f} с), но запрос оборвался: {e}", data
+    finally:
+        sk.close()
+    if not data:
+        return (f"соединение есть ({t_conn:.1f} с), но за {timeout:.0f} с антенна не прислала ни байта — "
+                "веб занят (открыта вкладка в браузере?) или сервер завис"), data
+    return f"соединение {t_conn:.1f} с, первый ответ через {first:.1f} с, {len(data)} байт", data
+
+
 def read_antenna(ip, src=None, user="", pw="", log=print):
     """Определить, что за антенна, и прочитать её настройки через её веб (порт 80).
     -> (строки для человека, сырые данные для отчёта). Пароль в отчёт не попадает."""
     raw = {}
-    try:
-        st, hd, body = http_get(ip, "/", src)
-    except OSError as e:
-        return [f"✗ {ip}: веб (порт 80) не отвечает — {e}"], raw
+    st = hd = body = None
+    for s_ in ([src, None] if src else [None]):     # с адреса кабеля; не вышло — как браузер (без привязки)
+        try:
+            st, hd, body = http_get(ip, "/", s_)
+            src = s_
+            break
+        except (OSError, http.client.HTTPException) as e:
+            log(f"… {ip}{' с ' + s_ if s_ else ''}: {e}")
+            note, data = raw_probe(ip, s_)
+            log(f"… диагностика: {note}")
+            raw[f"probe{'@' + s_ if s_ else ''}"] = note + "\n" + data[:3000].decode("latin-1")
+    if st is None:
+        return [f"✗ {ip}: веб не ответил — до логина не дошло. Закрой вкладку антенны в браузере "
+                "(её веб держит одно соединение) и нажми ещё раз."], raw
     title, server = _html_title(body), hd.get("server", "")
     realm, loc = hd.get("www-authenticate", ""), hd.get("location", "")
     raw["/"] = f"код {st} · server {server} · realm {realm} · location {loc} · title {title}\n" + \
@@ -636,7 +694,7 @@ def read_antenna(ip, src=None, user="", pw="", log=print):
             log(f"… пробую {vendor}, логин «{u}»")
             try:
                 lines, r = fn(ip, src, u, p)
-            except (OSError, http.client.HTTPException) as e:
+            except (OSError, http.client.HTTPException, ValueError) as e:
                 lines, r = None, {vendor: f"ошибка: {e}"}
             raw.update({f"{vendor}:{k}": v for k, v in (r or {}).items()})
             if lines:
@@ -1732,10 +1790,10 @@ class MainWindow(QWidget):
         g.addWidget(self.e_my, 2, 1)
         g.addWidget(self.btn_auto, 2, 2)
         self.e_user = QLineEdit()
-        self.e_user.setPlaceholderText("логин (пусто — заводской)")
+        self.e_user.setPlaceholderText("логин (по умолчанию admin)")
         self.e_pw = QLineEdit()
         self.e_pw.setEchoMode(QLineEdit.Password)
-        self.e_pw.setPlaceholderText("пароль (пусто — заводской)")
+        self.e_pw.setPlaceholderText("пароль (по умолчанию admin)")
         self.e_pw.setToolTip("Для «📖 Прочитать настройки». Хранится только в config.json; в отчёт не попадает")
         g.addWidget(_lab("Логин"), 3, 0)
         g.addWidget(self.e_user, 3, 1, 1, 2)
@@ -2130,8 +2188,8 @@ class MainWindow(QWidget):
             self.e_ant.setText(c["antenna_ip"])
             self.e_mask.setText(c.get("mask") or "255.255.255.0")
             self.e_my.setText(c.get("my_ip", ""))
-        self.e_user.setText(c.get("ant_user", ""))
-        self.e_pw.setText(c.get("ant_pass", ""))
+        self.e_user.setText(c.get("ant_user") or "admin")      # по умолчанию admin / admin
+        self.e_pw.setText(c.get("ant_pass") or ("admin" if not c.get("ant_user") else ""))
         page = int(c.get("page", 0) or 0)
         self.set_page(page if 0 <= page < self.stack.count() else 0)
         self.update_saved_label()
