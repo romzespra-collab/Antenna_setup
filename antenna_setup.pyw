@@ -1,49 +1,513 @@
 # -*- coding: utf-8 -*-
 """
-Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
-Ставит статический IP на выбранный адаптер, проверяет, что антенна отвечает,
-и открывает её веб-интерфейс в браузере. Только Windows.
+antenna_setup.pyw  v0.2.0
 
-VERSION = "0.1.0"
+Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
+Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
+проверяет, что антенна отвечает (пинг, порты 80/443, веб), открывает её
+веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
-  0.1.0 — первая версия: пресеты антенн, статический IP через netsh,
-          возврат на DHCP, проверка доступности, открытие в браузере,
-          тёмная/светлая тема, запуск с правами администратора.
+  v0.2.0: исправлен вылет при запуске (не было log_menu); проверка в фоне,
+          окно не зависает; редирект антенны на https больше не даёт
+          «нет ответа»; пинг считается только по TTL=; маска пресета
+          учитывается при расчёте IP; проверка подсети и конфликтов адреса;
+          «Вернуть как было» — прежние IP/шлюз/DNS или DHCP; свои пресеты;
+          автопроверка после смены IP; запрос прав администратора;
+          свой заголовок окна, шапка, плитки, боковая панель, тема ☀/☾,
+          меню ⋯ и правый клик везде; настройки сохраняются сами;
+          обновление с GitHub; --selftest.
+  v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
+          возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.1.0"
+VERSION = "0.2.0"
+APP_NAME = "Настройка антенны"
+APP_ID = "AntennaSetup.App"
+GITHUB_REPO = "romzespra-collab/Antenna_setup"
+GITHUB_BRANCH = "main"
 
+import base64
 import ctypes
+import http.client
+import importlib
+import importlib.util
 import ipaddress
 import json
 import os
+import queue
+import shutil
+import socket
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 import urllib.error
 import urllib.request
+import zipfile
+from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QKeySequence, QPalette, QShortcut
-from PySide6.QtWidgets import (
-    QApplication, QComboBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget,
-)
+FROZEN = bool(getattr(sys, "frozen", False))
+APP_ROOT = Path(sys.executable).parent if FROZEN else Path(os.path.abspath(__file__)).parent
+CONFIG_PATH = APP_ROOT / "config.json"
+NO_WINDOW = 0x08000000
+IS_WIN = sys.platform == "win32"
 
-# Пресеты: адрес антенны, маска, логин/пароль по умолчанию (с этикеток).
-PRESETS = {
-    "Comfast CF-E314N (192.168.10.1)": ("192.168.10.1", "255.255.255.0", "admin / admin"),
-    "TP-Link TL-WA5210G (192.168.1.254)": ("192.168.1.254", "255.255.255.0", "admin / admin"),
-    "Ubiquiti NanoStation M5 (192.168.1.20)": ("192.168.1.20", "255.255.255.0", "ubnt / ubnt"),
+# ───────────────────────── авто-установка библиотек ─────────────────────────
+REQUIRED = (("PySide6", "PySide6>=6.5"),)
+
+
+def _python_exe():
+    exe = Path(sys.executable)
+    if exe.name.lower() == "pythonw.exe" and (exe.parent / "python.exe").exists():
+        return str(exe.parent / "python.exe")
+    return str(exe)
+
+
+def pip_install(pips, console=True):
+    py = _python_exe()
+    flags = 0x10 if (IS_WIN and console) else (NO_WINDOW if IS_WIN else 0)
+    base = [py, "-m", "pip", "install", "--disable-pip-version-check"]
+    try:
+        if subprocess.run([py, "-m", "pip", "--version"], creationflags=flags,
+                          capture_output=not console).returncode != 0:
+            subprocess.run([py, "-m", "ensurepip", "--upgrade"], creationflags=flags)
+        ok = subprocess.run(base + list(pips), creationflags=flags).returncode == 0
+        if not ok:
+            ok = subprocess.run(base + ["--user"] + list(pips), creationflags=flags).returncode == 0
+    except Exception:
+        ok = False
+    importlib.invalidate_caches()
+    return ok
+
+
+def ensure_packages():
+    if FROZEN or "--selftest" in sys.argv:
+        return
+    missing = [(m, p) for m, p in REQUIRED if importlib.util.find_spec(m) is None]
+    if not missing:
+        return
+    pip_install([p for _, p in missing])
+    still = [p for m, p in missing if importlib.util.find_spec(m) is None]
+    if still:
+        msg = ("Не удалось поставить библиотеки:\n  " + "\n  ".join(still) +
+               "\n\nПоставь вручную:\n  pip install " + " ".join(still))
+        if IS_WIN:
+            ctypes.windll.user32.MessageBoxW(None, msg, APP_NAME, 0x10)
+        else:
+            print(msg)
+        sys.exit(1)
+
+
+ensure_packages()
+
+from PySide6.QtCore import (QEvent, QLibraryInfo, QObject, QTranslator, QPoint, QPointF, QProcess, QRectF,  # noqa: E402
+                            Qt, QTimer, QUrl, Signal)
+from PySide6.QtGui import (QColor, QDesktopServices, QFont, QIcon,  # noqa: E402
+                           QKeySequence, QPainter, QPalette, QPen,
+                           QPixmap, QShortcut, QTextCursor)
+from PySide6.QtWidgets import (QAbstractButton, QApplication, QButtonGroup,  # noqa: E402
+                               QComboBox, QFileDialog, QFrame, QGridLayout,
+                               QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+                               QListWidget, QListWidgetItem, QMenu, QMessageBox,
+                               QPlainTextEdit, QProgressBar, QPushButton,
+                               QStackedWidget, QTextEdit, QVBoxLayout,
+                               QWidget)
+
+# ───────────────────────── пресеты и тема ─────────────────────────
+# имя: (адрес антенны, маска, логин / пароль по умолчанию)
+BUILTIN_PRESETS = {
+    "Comfast CF-E314N": ("192.168.10.1", "255.255.255.0", "admin / admin"),
+    "TP-Link TL-WA5210G": ("192.168.1.254", "255.255.255.0", "admin / admin"),
+    "Ubiquiti NanoStation M5": ("192.168.1.20", "255.255.255.0", "ubnt / ubnt"),
 }
-MY_HOST_OFFSET = 50  # адрес ноутбука = адрес антенны, последний октет заменён на 50
+MY_HOST_OFFSET = 50  # адрес ноутбука = номер сети + 50
 
-DARK = dict(bg="#1e2227", panel="#262b32", panel2="#2e343c",
-            text="#e6e8eb", muted="#8a919b", accent="#3d8bfd", ok="#3fb950", err="#f85149")
-LIGHT = dict(bg="#f3f4f6", panel="#ffffff", panel2="#e9ecf0",
-             text="#1d2228", muted="#6b7280", accent="#2563eb", ok="#15803d", err="#b91c1c")
+THEMES = {
+    "dark": {"bg": "#1b1d23", "side": "#16181d", "panel": "#23262e", "panel2": "#2a2e38",
+             "line": "#343946", "text": "#e6e8ee", "muted": "#8a91a3", "log_bg": "#111318",
+             "log_fg": "#d5d8e0", "accent": "#4f8cff", "ok": "#3ecf8e", "err": "#ff5d6c",
+             "warn": "#f5b545", "toggle_off": "#454b59", "side_text": "#ffffff"},
+    "light": {"bg": "#f3f4f7", "side": "#2b3445", "panel": "#ffffff", "panel2": "#f1f3f7",
+              "line": "#dde1e8", "text": "#1c2230", "muted": "#6b7385", "log_bg": "#fbfbfd",
+              "log_fg": "#1c2230", "accent": "#2f6fe4", "ok": "#1f9d63", "err": "#d93848",
+              "warn": "#b9800f", "toggle_off": "#c3c8d2", "side_text": "#ffffff"},
+}
+# цвета страниц боковой панели: (тёмная тема, светлая — темнее)
+PAGE_COLORS = {"antenna": ("#4f8cff", "#2f6fe4"), "settings": ("#b07cff", "#7c4ad9"),
+               "update": ("#f5a142", "#c26e0f")}
+P = dict(THEMES["dark"])  # текущая палитра
+
+DEFAULT_CONFIG = {
+    "theme": "dark", "preset": "Comfast CF-E314N", "custom_presets": {},
+    "antenna_ip": "", "mask": "", "my_ip": "", "adapter": "",
+    "check_timeout": 3, "check_retries": 6, "auto_check": True, "ask_admin": True,
+    "check_updates": True, "github_repo": GITHUB_REPO, "github_branch": GITHUB_BRANCH,
+    "github_token": "", "saved_net": {}, "geometry": "", "page": 0,
+}
+
+# ───────────────────────── конфиг (атомарно, с .bak) ─────────────────────────
+
+
+def _replace_retry(src, dst, tries=10):
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:  # WinError 5/32 — файл занят антивирусом/редактором
+            if i == tries - 1:
+                raise
+            time.sleep(0.2)
+
+
+def atomic_write_text(path, text):
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    _replace_retry(tmp, path)
+
+
+def load_config(path=CONFIG_PATH):
+    """(cfg, можно_писать). Битый JSON → .bak; и он битый → не писать вовсе."""
+    cfg = dict(DEFAULT_CONFIG)
+    path = Path(path)
+    if not path.exists():
+        return cfg, True
+    for p in (path, path.with_name(path.name + ".bak")):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                cfg.update(data)
+                return cfg, True
+        except Exception:
+            continue
+    return cfg, False
+
+
+def save_config(cfg, path=CONFIG_PATH):
+    path = Path(path)
+    text = json.dumps(cfg, ensure_ascii=False, indent=2)
+    if path.exists():
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+            shutil.copyfile(path, path.with_name(path.name + ".bak"))
+        except Exception:
+            pass
+    atomic_write_text(path, text)
+
+# ───────────────────────── сеть ─────────────────────────
+
+
+def decode_out(b):
+    if isinstance(b, str):
+        return b
+    for enc in ("utf-8", "cp866", "cp1251"):
+        try:
+            return b.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return b.decode("utf-8", "replace")
+
+
+def run_cmd(args, timeout=30):
+    """Команда без окна консоли. Возвращает (ok, текст)."""
+    try:
+        r = subprocess.run(args, capture_output=True, timeout=timeout,
+                           creationflags=NO_WINDOW if IS_WIN else 0)
+        out = decode_out(r.stdout or b"") + decode_out(r.stderr or b"")
+        return r.returncode == 0, out.strip()
+    except subprocess.TimeoutExpired:
+        return False, "команда не ответила за %d с" % timeout
+    except Exception as e:
+        return False, str(e)
+
+
+def run_ps(script, timeout=40):
+    pre = "[Console]::OutputEncoding=[Text.Encoding]::UTF8;$ProgressPreference='SilentlyContinue';"
+    enc = base64.b64encode((pre + script).encode("utf-16-le")).decode()
+    return run_cmd(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                    "-EncodedCommand", enc], timeout)
+
+
+def ps_str(s):
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+def list_adapters():
+    """Физические адаптеры: [{Name, Desc, Status, Media, IP, Prefix, Dhcp}]. Проводные — первыми."""
+    script = (
+        "$r=foreach($a in Get-NetAdapter -Physical){"
+        "$ip=Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -EA SilentlyContinue|"
+        "?{$_.PrefixOrigin -ne 'WellKnown'}|select -First 1;"
+        "$if=Get-NetIPInterface -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -EA SilentlyContinue;"
+        "[pscustomobject]@{Name=$a.Name;Desc=$a.InterfaceDescription;Status=[string]$a.Status;"
+        "Media=[string]$a.PhysicalMediaType;IP=[string]$ip.IPAddress;Prefix=[int]$ip.PrefixLength;"
+        "Dhcp=[string]$if.Dhcp}};ConvertTo-Json -Compress -InputObject @($r)")
+    ok, out = run_ps(script)
+    if not ok:
+        raise RuntimeError(out or "PowerShell не ответил")
+    data = json.loads(out or "[]")
+    if isinstance(data, dict):
+        data = [data]
+    wifi = ("802.11", "wireless", "wi-fi", "wlan")
+    for a in data:
+        text = (a.get("Media", "") + " " + a.get("Desc", "")).lower()
+        a["Wifi"] = any(w in text for w in wifi)
+    data.sort(key=lambda a: (a["Wifi"], a.get("Status") != "Up", a.get("Name", "")))
+    return data
+
+
+def snapshot_adapter(name):
+    """Текущие IPv4-настройки адаптера, чтобы потом вернуть как было."""
+    n = ps_str(name)
+    script = (
+        f"$n={n};$i=Get-NetIPInterface -InterfaceAlias $n -AddressFamily IPv4 -EA Stop;"
+        "$ip=Get-NetIPAddress -InterfaceAlias $n -AddressFamily IPv4 -EA SilentlyContinue|"
+        "?{$_.PrefixOrigin -ne 'WellKnown'}|select -First 1;"
+        "$gw=(Get-NetRoute -InterfaceAlias $n -DestinationPrefix '0.0.0.0/0' -EA SilentlyContinue|"
+        "select -First 1).NextHop;"
+        "$d=(Get-DnsClientServerAddress -InterfaceAlias $n -AddressFamily IPv4 -EA SilentlyContinue).ServerAddresses;"
+        "ConvertTo-Json -Compress -InputObject ([pscustomobject]@{Dhcp=[string]$i.Dhcp;"
+        "IP=[string]$ip.IPAddress;Prefix=[int]$ip.PrefixLength;Gw=[string]$gw;Dns=@($d)})")
+    ok, out = run_ps(script)
+    if not ok:
+        raise RuntimeError(out or "не удалось прочитать настройки адаптера")
+    d = json.loads(out)
+    snap = {"dhcp": d.get("Dhcp", "").lower() == "enabled", "ip": d.get("IP") or "",
+            "mask": "", "gw": d.get("Gw") or "", "dns": [x for x in (d.get("Dns") or []) if x]}
+    if snap["ip"] and d.get("Prefix"):
+        snap["mask"] = str(ipaddress.ip_network(f"0.0.0.0/{d['Prefix']}").netmask)
+    return snap
+
+
+def restore_commands(name, snap):
+    """Команды netsh, возвращающие адаптер к снимку."""
+    nm = f"name={name}"
+    base = ["netsh", "interface", "ipv4"]
+    if snap.get("dhcp") or not snap.get("ip"):
+        return [base + ["set", "address", nm, "source=dhcp"],
+                base + ["set", "dnsservers", nm, "source=dhcp"]]
+    cmds = [base + ["set", "address", nm, "static", snap["ip"], snap["mask"] or "255.255.255.0"]
+            + ([snap["gw"]] if snap.get("gw") else [])]
+    dns = snap.get("dns") or []
+    if dns:
+        cmds.append(base + ["set", "dnsservers", nm, "static", dns[0], "primary", "validate=no"])
+        for i, d in enumerate(dns[1:], 2):
+            cmds.append(base + ["add", "dnsservers", nm, d, f"index={i}", "validate=no"])
+    else:
+        cmds.append(base + ["set", "dnsservers", nm, "static", "none"])
+    return cmds
+
+
+def host_ip_for(antenna_ip, mask="255.255.255.0"):
+    """Адрес ноутбука в той же подсети: сеть+50, при совпадении — +51, иначе первый свободный."""
+    net = ipaddress.ip_network(f"{antenna_ip}/{mask}", strict=False)
+    ant = ipaddress.ip_address(antenna_ip)
+    hosts = list(net.hosts()) if net.num_addresses <= 65536 else []
+    for off in (MY_HOST_OFFSET, MY_HOST_OFFSET + 1):
+        cand = net.network_address + off
+        if cand in net and cand != ant and cand not in (net.network_address, net.broadcast_address):
+            return str(cand)
+    for h in hosts:
+        if h != ant:
+            return str(h)
+    raise ValueError("в подсети нет свободного адреса")
+
+
+def validate(antenna_ip, mask, my_ip):
+    """Текст ошибки или None."""
+    try:
+        ant = ipaddress.IPv4Address(antenna_ip)
+    except ValueError:
+        return "Неверный адрес антенны."
+    try:
+        net = ipaddress.IPv4Network(f"{antenna_ip}/{mask}", strict=False)
+    except ValueError:
+        return "Неверная маска."
+    if net.prefixlen > 30:
+        return "Маска слишком узкая (больше /30)."
+    try:
+        me = ipaddress.IPv4Address(my_ip)
+    except ValueError:
+        return "Неверный IP ноутбука."
+    if me not in net:
+        return f"IP ноутбука {me} не в подсети антенны {net}."
+    if me == ant:
+        return "IP ноутбука совпадает с адресом антенны."
+    if me in (net.network_address, net.broadcast_address):
+        return "IP ноутбука — служебный адрес сети."
+    if ant in (net.network_address, net.broadcast_address):
+        return "Адрес антенны — служебный адрес сети."
+    return None
+
+
+def ping(ip, timeout_s=1.0):
+    """True — только если пришёл ответ с TTL (а не «узел недоступен»)."""
+    if IS_WIN:
+        args = ["ping", "-n", "1", "-w", str(int(timeout_s * 1000)), ip]
+    else:
+        args = ["ping", "-c", "1", "-W", str(max(1, int(timeout_s))), ip]
+    ok, out = run_cmd(args, timeout=timeout_s + 5)
+    return ok and "ttl=" in out.lower()
+
+
+def tcp_open(ip, port, timeout=2.0):
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def http_status(ip, timeout=3.0):
+    """(код, Location) с порта 80 без перехода по редиректам; None — нет ответа."""
+    c = http.client.HTTPConnection(ip, 80, timeout=timeout)
+    try:
+        c.request("GET", "/", headers={"User-Agent": "antenna_setup"})
+        r = c.getresponse()
+        return r.status, r.getheader("Location") or ""
+    except (OSError, http.client.HTTPException):
+        return None
+    finally:
+        c.close()
+
+
+def check_antenna(ip, timeout=3.0):
+    res = {"ping": ping(ip, min(timeout, 2.0)), "p80": tcp_open(ip, 80, timeout),
+           "p443": tcp_open(ip, 443, timeout), "http": None}
+    if res["p80"]:
+        res["http"] = http_status(ip, timeout)
+    res["alive"] = res["ping"] or res["p80"] or res["p443"]
+    return res
+
+
+def web_url(ip, res=None):
+    if res and not res.get("p80") and res.get("p443"):
+        return f"https://{ip}/"
+    if res and res.get("http") and res["http"][1].lower().startswith("https://"):
+        return f"https://{ip}/"
+    return f"http://{ip}/"
+
+# ───────────────────────── обновление с GitHub ─────────────────────────
+
+
+UPDATE_SKIP_DIRS = {"release", ".git", ".github", "modules", "tools", "_backup", "_other",
+                    "_update_tmp", "__pycache__", "build", "dist"}
+UPDATE_SKIP_FILES = {"config.json", "config.json.bak", "selftest.txt"}
+
+
+class UpdateError(Exception):
+    def __init__(self, text, permanent=False):
+        super().__init__(text)
+        self.permanent = permanent
+
+
+def ver_tuple(v):
+    out = []
+    for part in str(v).strip().lstrip("vV").split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        out.append(int(digits) if digits else 0)
+    return tuple(out + [0] * (3 - len(out)))
+
+
+def _gh_request(url, token, accept, timeout=30):
+    req = urllib.request.Request(url, headers={"Accept": accept, "User-Agent": "antenna_setup",
+                                               "X-GitHub-Api-Version": "2022-11-28"})
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise UpdateError("GitHub отклонил токен (401) — проверь токен в настройках.", True)
+        if e.code == 404:
+            raise UpdateError("Не найдено (404): репозиторий приватный — нужен токен с доступом "
+                              "к нему, или неверное имя репозитория/ветки.", True)
+        if e.code in (403, 429):
+            raise UpdateError(f"GitHub ограничил доступ ({e.code}) — попробуй позже.")
+        raise UpdateError(f"GitHub ответил {e.code} — попробуй позже.")
+    except (urllib.error.URLError, OSError) as e:
+        raise UpdateError(f"Нет связи с GitHub: {getattr(e, 'reason', e)}")
+
+
+def remote_version(repo, branch, token):
+    url = f"https://api.github.com/repos/{repo}/contents/VERSION?ref={branch}"
+    with _gh_request(url, token, "application/vnd.github.raw") as r:
+        v = r.read(100).decode("utf-8", "replace").strip()
+    if not v or ver_tuple(v) == (0, 0, 0):
+        raise UpdateError(f"Непонятная версия на GitHub: {v!r}")
+    return v
+
+
+def update_plan(src_root):
+    """Относительные пути файлов из архива, которые ставим (свои файлы пользователя не трогаем)."""
+    plan = []
+    src_root = Path(src_root)
+    for p in sorted(src_root.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(src_root)
+        if rel.parts[0] in UPDATE_SKIP_DIRS or "__pycache__" in rel.parts:
+            continue
+        if rel.name in UPDATE_SKIP_FILES or rel.suffix.lower() in (".zip", ".log", ".tmp"):
+            continue
+        plan.append(rel)
+    return plan
+
+
+def install_update(repo, branch, token, dest_root, old_version, log=print, stopped=lambda: False):
+    """Качает архив ветки, кладёт новые файлы поверх. Заменяемые — в _backup/v<старая>/. Ничего не удаляет."""
+    dest_root = Path(dest_root)
+    url = f"https://api.github.com/repos/{repo}/zipball/{branch}"
+    tmp = Path(tempfile.mkdtemp(prefix="antenna_upd_"))
+    try:
+        zpath = tmp / "src.zip"
+        log("⏳ качаю архив ветки …")
+        with _gh_request(url, token, "application/vnd.github+json", timeout=60) as r, open(zpath, "wb") as f:
+            shutil.copyfileobj(r, f)
+        if stopped():
+            raise UpdateError("Остановлено.")
+        with zipfile.ZipFile(zpath) as z:
+            for n in z.namelist():
+                if n.startswith("/") or ".." in Path(n).parts:
+                    raise UpdateError("В архиве подозрительный путь — обновление отменено.", True)
+            z.extractall(tmp / "x")
+        tops = [p for p in (tmp / "x").iterdir() if p.is_dir()]
+        if len(tops) != 1:
+            raise UpdateError("Неожиданная структура архива.", True)
+        src = tops[0]
+        if not (src / "antenna_setup.pyw").exists():
+            raise UpdateError("В архиве нет antenna_setup.pyw — это не та программа.", True)
+        backup = dest_root / "_backup" / f"v{old_version}"
+        changed = 0
+        for rel in update_plan(src):
+            s, d = src / rel, dest_root / rel
+            data = s.read_bytes()
+            if d.exists() and d.read_bytes() == data:
+                continue
+            if d.exists():
+                b = backup / rel
+                b.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(d, b)
+            d.parent.mkdir(parents=True, exist_ok=True)
+            t = d.with_name(d.name + ".tmp")
+            t.write_bytes(data)
+            _replace_retry(t, d)
+            changed += 1
+            log(f"✓ {rel.as_posix()}")
+        return changed
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+# ───────────────────────── права администратора ─────────────────────────
 
 
 def is_admin():
+    if not IS_WIN:
+        return True
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
@@ -51,278 +515,1870 @@ def is_admin():
 
 
 def relaunch_as_admin():
+    """Перезапуск с UAC. True — новый процесс запущен."""
     try:
-        ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, f'"{os.path.abspath(sys.argv[0])}"', None, 1)
-        return True
+        exe = sys.executable
+        if FROZEN:
+            params = "--no-admin"
+        else:
+            w = Path(exe).with_name("pythonw.exe")
+            exe = str(w) if w.exists() else exe
+            params = f'"{os.path.abspath(__file__)}" --no-admin'
+        return ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params,
+                                                   str(APP_ROOT), 1) > 32
     except Exception:
         return False
 
-
-def run_cmd(args):
-    """Запускает команду без окна консоли. Возвращает (ok, текст)."""
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    try:
-        r = subprocess.run(args, capture_output=True, text=True, encoding="cp866",
-                           errors="replace", timeout=30, creationflags=flags)
-        out = (r.stdout or "") + (r.stderr or "")
-        return r.returncode == 0, out.strip()
-    except Exception as e:
-        return False, str(e)
+# ───────────────────────── фоновая работа ─────────────────────────
 
 
-def list_adapters():
-    """Список имён физических адаптеров через PowerShell."""
-    ok, out = run_cmd(["powershell", "-NoProfile", "-Command",
-                       "Get-NetAdapter -Physical | Select-Object -ExpandProperty Name"])
-    if not ok:
-        return []
-    return [line.strip() for line in out.splitlines() if line.strip()]
+_DONE = object()
 
 
-def host_ip_for(antenna_ip):
-    net = ipaddress.ip_network(antenna_ip + "/24", strict=False)
-    hosts = list(net.hosts())
-    last = int(antenna_ip.split(".")[-1])
-    candidate = hosts[0] if last != MY_HOST_OFFSET else hosts[1]
-    base = ".".join(antenna_ip.split(".")[:3])
-    return f"{base}.{MY_HOST_OFFSET}" if last != MY_HOST_OFFSET else f"{base}.{MY_HOST_OFFSET + 1}"
+class Worker:
+    """Одно действие за раз в отдельном потоке. Связь с UI — через очередь."""
 
+    def __init__(self, q):
+        self.q = q
+        self.thread = None
+        self.stop_flag = threading.Event()
+        self.name = ""
+        self.blocking_close = False
 
-def check_http(ip, timeout=3.0):
-    """Возвращает код HTTP или None, если нет ответа."""
-    try:
-        with urllib.request.urlopen(f"http://{ip}/", timeout=timeout) as r:
-            return r.status
-    except urllib.error.HTTPError as e:
-        return e.code
-    except Exception:
-        return None
+    def busy(self):
+        return self.thread is not None and self.thread.is_alive()
 
+    def start(self, name, fn, blocking_close=False):
+        if self.busy():
+            return False
+        self.name = name
+        self.blocking_close = blocking_close
+        self.stop_flag.clear()
 
-def apply_theme(app, p):
-    pal = QPalette(QColor(p["bg"]))
-    pal.setColor(QPalette.Window, QColor(p["bg"]))
-    pal.setColor(QPalette.WindowText, QColor(p["text"]))
-    pal.setColor(QPalette.Base, QColor(p["panel"]))
-    pal.setColor(QPalette.AlternateBase, QColor(p["panel2"]))
-    pal.setColor(QPalette.Text, QColor(p["text"]))
-    pal.setColor(QPalette.Button, QColor(p["panel2"]))
-    pal.setColor(QPalette.ButtonText, QColor(p["text"]))
-    pal.setColor(QPalette.Highlight, QColor(p["accent"]))
-    pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
-    pal.setColor(QPalette.PlaceholderText, QColor(p["muted"]))
-    pal.setColor(QPalette.ToolTipBase, QColor(p["panel"]))
-    pal.setColor(QPalette.ToolTipText, QColor(p["text"]))
-    for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
-        pal.setColor(QPalette.Disabled, role, QColor(p["muted"]))
-    app.setPalette(pal)
-    app.setStyleSheet(f"""
-        QWidget {{ color: {p['text']}; font-size: 10pt; }}
-        QLineEdit, QComboBox, QPlainTextEdit {{
-            background: {p['panel']}; color: {p['text']};
-            border: 1px solid {p['panel2']}; border-radius: 6px; padding: 4px;
-        }}
-        QComboBox QAbstractItemView {{ background: {p['panel']}; color: {p['text']}; }}
-        QPushButton {{
-            background: {p['panel2']}; color: {p['text']};
-            border: 1px solid {p['panel2']}; border-radius: 6px;
-            padding: 6px 12px; min-width: 80px;
-        }}
-        QPushButton:hover {{ border-color: {p['accent']}; }}
-        QPushButton:disabled {{ color: {p['muted']}; }}
-        QPushButton#primary {{ background: {p['accent']}; color: #ffffff; border: none; }}
-        QMenu {{ background: {p['panel']}; color: {p['text']}; border: 1px solid {p['panel2']}; }}
-        QMenu::item:selected {{ background: {p['accent']}; color: #ffffff; }}
-        QMessageBox, QFileDialog, QInputDialog {{ background: {p['panel']}; }}
-        QMessageBox QLabel {{ color: {p['text']}; background: transparent; }}
-        QLabel#chip {{ border-radius: 10px; padding: 3px 10px;
-                       background: {p['panel2']}; color: {p['text']}; }}
-    """)
-
-
-class Main(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle(f"Настройка антенны {VERSION}")
-        self.resize(640, 520)
-        self.dark = True
-
-        cw = QWidget()
-        self.setCentralWidget(cw)
-        root = QVBoxLayout(cw)
-
-        head = QHBoxLayout()
-        title = QLabel("Настройка антенны")
-        title.setStyleSheet("font-size: 15pt; font-weight: bold;")
-        self.chip = QLabel("● готов")
-        self.chip.setObjectName("chip")
-        self.btn_theme = QPushButton("☀")
-        self.btn_theme.setFixedWidth(44)
-        self.btn_theme.clicked.connect(self.toggle_theme)
-        head.addWidget(title)
-        head.addStretch()
-        head.addWidget(self.chip)
-        head.addWidget(self.btn_theme)
-        root.addLayout(head)
-
-        self.preset = QComboBox()
-        self.preset.addItems(PRESETS.keys())
-        self.preset.currentIndexChanged.connect(self.on_preset)
-        root.addWidget(QLabel("Антенна:"))
-        root.addWidget(self.preset)
-
-        self.info = QLabel()
-        self.info.setWordWrap(True)
-        root.addWidget(self.info)
-
-        row = QHBoxLayout()
-        self.adapter = QComboBox()
-        self.btn_refresh = QPushButton("Обновить")
-        self.btn_refresh.clicked.connect(self.load_adapters)
-        row.addWidget(QLabel("Сетевой адаптер:"))
-        row.addWidget(self.adapter, 1)
-        row.addWidget(self.btn_refresh)
-        root.addLayout(row)
-
-        row2 = QHBoxLayout()
-        self.my_ip = QLineEdit()
-        self.my_ip.setToolTip("Адрес ноутбука на время настройки")
-        row2.addWidget(QLabel("IP ноутбука:"))
-        row2.addWidget(self.my_ip, 1)
-        root.addLayout(row2)
-
-        btns = QHBoxLayout()
-        self.btn_set = QPushButton("Поставить IP  F5")
-        self.btn_set.setObjectName("primary")
-        self.btn_set.clicked.connect(self.set_static)
-        self.btn_check = QPushButton("Проверить  F6")
-        self.btn_check.clicked.connect(self.check)
-        self.btn_open = QPushButton("Открыть в браузере  Ctrl+O")
-        self.btn_open.clicked.connect(self.open_browser)
-        self.btn_dhcp = QPushButton("Вернуть DHCP")
-        self.btn_dhcp.clicked.connect(self.restore_dhcp)
-        for b in (self.btn_set, self.btn_check, self.btn_open, self.btn_dhcp):
-            btns.addWidget(b)
-        root.addLayout(btns)
-
-        self.log_view = QPlainTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.log_view.customContextMenuRequested.connect(self.log_menu)
-        root.addWidget(self.log_view, 1)
-
-        QShortcut(QKeySequence("F5"), self, self.set_static)
-        QShortcut(QKeySequence("F6"), self, self.check)
-        QShortcut(QKeySequence("Ctrl+O"), self, self.open_browser)
-        QShortcut(QKeySequence("Ctrl+T"), self, self.toggle_theme)
-
-        self.on_preset(0)
-        self.load_adapters()
-        self.set_chip("● готов", self.color("muted"))
-
-        if sys.platform == "win32" and not is_admin():
-            self.log("Нужны права администратора. Запусти программу от имени администратора.")
-            self.btn_set.setEnabled(False)
-            self.btn_dhcp.setEnabled(False)
-
-    # --- тема и состояние ---
-    def color(self, key):
-        return (DARK if self.dark else LIGHT)[key]
-
-    def toggle_theme(self):
-        self.dark = not self.dark
-        self.btn_theme.setText("☀" if self.dark else "☾")
-        apply_theme(QApplication.instance(), DARK if self.dark else LIGHT)
-        self.set_chip(self.chip.text(), self.color("muted"))
-
-    def set_chip(self, text, color):
-        self.chip.setText(text)
-        self.chip.setStyleSheet(f"color: {color};")
+        def run():
+            try:
+                fn(self)
+            except UpdateError as e:
+                self.log(f"✗ {e}")
+            except Exception as e:
+                self.log(f"✗ {name}: {e}")
+            finally:
+                self.q.put(_DONE)
+        self.thread = threading.Thread(target=run, daemon=True)
+        self.thread.start()
+        return True
 
     def log(self, text):
-        self.log_view.appendPlainText(text)
+        self.q.put(("log", text))
 
-    # --- данные ---
-    def current_antenna_ip(self):
-        return list(PRESETS.values())[self.preset.currentIndex()][0]
+    def ui(self, fn):
+        self.q.put(fn)
 
-    def on_preset(self, _):
-        ip, mask, creds = list(PRESETS.values())[self.preset.currentIndex()]
-        self.info.setText(f"Адрес антенны: {ip}    Логин / пароль по умолчанию: {creds}")
-        self.my_ip.setText(host_ip_for(ip))
+    def stopped(self):
+        return self.stop_flag.is_set()
 
-    def load_adapters(self):
-        self.adapter.clear()
-        names = list_adapters() if sys.platform == "win32" else []
-        if names:
-            self.adapter.addItems(names)
-            self.log(f"Найдено адаптеров: {len(names)}")
+    def sleep(self, sec):
+        return self.stop_flag.wait(sec)
+
+# ───────────────────────── тема: QSS + палитра ─────────────────────────
+
+
+def _qss(p):
+    return f"""
+    * {{ font-family: "Segoe UI"; font-size: 10pt; }}
+    QWidget {{ color: {p['text']}; }}
+    QWidget#root, QStackedWidget, QWidget#page {{ background: {p['bg']}; }}
+    QDialog, QMessageBox, QFileDialog, QInputDialog {{ background: {p['panel']}; color: {p['text']}; }}
+    QMessageBox QLabel, QDialog QLabel {{ color: {p['text']}; background: transparent; }}
+    QWidget#titleBar {{ background: {p['side']}; }}
+    QLabel#titleText {{ color: {p['side_text']}; font-weight: 600; }}
+    QPushButton#winBtn, QPushButton#winClose {{ background: transparent; border: none;
+        min-width: 44px; max-width: 44px; padding: 0; border-radius: 0; }}
+    QPushButton#winBtn:hover {{ background: rgba(255,255,255,0.12); }}
+    QPushButton#winClose:hover {{ background: #e81123; }}
+    QWidget#side {{ background: {p['side']}; }}
+    QLabel#h1 {{ font-size: 15pt; font-weight: 700; }}
+    QLabel#chip {{ border-radius: 11px; padding: 3px 12px; background: {p['panel2']};
+        border: 1px solid {p['line']}; font-weight: 600; }}
+    QFrame#card, QFrame#tile {{ background: {p['panel']}; border: 1px solid {p['line']}; border-radius: 10px; }}
+    QLabel#cardTitle {{ color: {p['muted']}; font-size: 8pt; font-weight: 700; letter-spacing: 1px; background: transparent; }}
+    QLabel#tileCap {{ color: {p['muted']}; font-size: 8pt; background: transparent; }}
+    QLabel#tileVal {{ font-size: 13pt; font-weight: 700; background: transparent; }}
+    QLabel#tileSub, QLabel#hint {{ color: {p['muted']}; font-size: 9pt; background: transparent; }}
+    QLineEdit, QComboBox, QPlainTextEdit, QTextEdit {{ background: {p['panel2']}; color: {p['text']};
+        border: 1px solid {p['line']}; border-radius: 7px; padding: 4px 6px;
+        selection-background-color: {p['accent']}; selection-color: #ffffff; }}
+    QLineEdit:focus, QComboBox:focus, QPlainTextEdit:focus {{ border-color: {p['accent']}; }}
+    QLineEdit:disabled {{ color: {p['muted']}; }}
+    QLineEdit#intField {{ padding: 2px; }}
+    QComboBox::drop-down {{ border: none; width: 22px; }}
+    QComboBox QAbstractItemView {{ background: {p['panel']}; color: {p['text']};
+        border: 1px solid {p['line']}; selection-background-color: {p['accent']}; selection-color: #ffffff; }}
+    QPlainTextEdit#log {{ background: {p['log_bg']}; color: {p['log_fg']};
+        font-family: Consolas, "DejaVu Sans Mono", monospace; font-size: 9pt; }}
+    QListWidget {{ background: {p['panel2']}; color: {p['text']}; border: 1px solid {p['line']};
+        border-radius: 7px; padding: 4px; outline: none; }}
+    QListWidget::item {{ padding: 6px 8px; border-radius: 6px; }}
+    QListWidget::item:hover {{ background: {p['panel']}; }}
+    QListWidget::item:selected {{ background: {p['accent']}; color: #ffffff; }}
+    QPushButton {{ background: {p['panel2']}; color: {p['text']}; border: 1px solid {p['line']};
+        border-radius: 7px; padding: 6px 12px; min-width: 80px; }}
+    QPushButton:hover {{ border-color: {p['accent']}; }}
+    QPushButton:pressed {{ background: {p['line']}; }}
+    QPushButton:disabled {{ color: {p['muted']}; background: {p['panel']}; }}
+    QPushButton#primary {{ background: {p['accent']}; color: #ffffff; border: 1px solid {p['accent']}; font-weight: 700; }}
+    QPushButton#primary:disabled {{ background: {p['line']}; border-color: {p['line']}; color: {p['muted']}; }}
+    QPushButton#danger {{ color: {p['err']}; border: 1px solid {p['err']}; background: transparent; }}
+    QPushButton#tool {{ min-width: 34px; max-width: 34px; padding: 4px 0; font-size: 12pt; }}
+    QPushButton#step {{ min-width: 26px; max-width: 26px; padding: 2px 0; font-weight: 700; }}
+    QProgressBar {{ background: {p['panel2']}; border: none; border-radius: 3px; max-height: 6px; }}
+    QProgressBar::chunk {{ background: {p['accent']}; border-radius: 3px; }}
+    QMenu {{ background: {p['panel']}; color: {p['text']}; border: 1px solid {p['line']}; padding: 4px; }}
+    QMenu::item {{ padding: 5px 22px 5px 14px; border-radius: 5px; }}
+    QMenu::item:selected {{ background: {p['accent']}; color: #ffffff; }}
+    QMenu::item:disabled {{ color: {p['muted']}; }}
+    QMenu::separator {{ height: 1px; background: {p['line']}; margin: 4px 6px; }}
+    QToolTip {{ background: {p['panel2']}; color: {p['text']}; border: 1px solid {p['accent']}; padding: 4px; }}
+    QScrollBar:vertical {{ background: transparent; width: 10px; }}
+    QScrollBar::handle:vertical {{ background: {p['line']}; border-radius: 5px; min-height: 24px; }}
+    QScrollBar:horizontal {{ background: transparent; height: 10px; }}
+    QScrollBar::handle:horizontal {{ background: {p['line']}; border-radius: 5px; min-width: 24px; }}
+    QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
+    QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+    QSplitter::handle {{ background: transparent; }}
+    QWidget#statusbar {{ background: {p['panel']}; border-top: 1px solid {p['line']}; }}
+    QLabel#status {{ color: {p['muted']}; font-size: 9pt; background: transparent; }}
+    """
+
+
+def _palette(p):
+    pal = QPalette(QColor(p["bg"]))
+    roles = {QPalette.Window: p["bg"], QPalette.WindowText: p["text"], QPalette.Base: p["panel2"],
+             QPalette.AlternateBase: p["panel"], QPalette.Text: p["text"], QPalette.Button: p["panel2"],
+             QPalette.ButtonText: p["text"], QPalette.Highlight: p["accent"],
+             QPalette.HighlightedText: "#ffffff", QPalette.PlaceholderText: p["muted"],
+             QPalette.ToolTipBase: p["panel2"], QPalette.ToolTipText: p["text"],
+             QPalette.BrightText: "#ffffff", QPalette.Link: p["accent"]}
+    for grp in (QPalette.Active, QPalette.Inactive, QPalette.Disabled):
+        for role, c in roles.items():
+            pal.setColor(grp, role, QColor(c))
+    for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
+        pal.setColor(QPalette.Disabled, role, QColor(p["muted"]))
+    return pal
+
+
+def apply_theme(app, name):
+    P.clear()
+    P.update(THEMES.get(name, THEMES["dark"]))
+    app.setPalette(_palette(P))
+    app.setStyleSheet(_qss(P))
+
+
+def _dwm_paint(w):
+    """Системная полоса диалогов в цвет темы (Windows 10/11). Ошибки — молча."""
+    if not IS_WIN:
+        return
+    try:
+        hwnd = int(w.winId())
+        dark = ctypes.c_int(1 if QColor(P["bg"]).lightness() < 128 else 0)
+        dwm = ctypes.windll.dwmapi
+        if dwm.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(dark), 4) != 0:
+            dwm.DwmSetWindowAttribute(hwnd, 19, ctypes.byref(dark), 4)
+
+        def colorref(hexc):
+            c = QColor(hexc)
+            return ctypes.c_int(c.red() | (c.green() << 8) | (c.blue() << 16))
+        dwm.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(colorref(P["panel"])), 4)
+        dwm.DwmSetWindowAttribute(hwnd, 36, ctypes.byref(colorref(P["text"])), 4)
+        ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027)  # NOSIZE|NOMOVE|NOZORDER|FRAMECHANGED
+    except Exception:
+        pass
+
+# ───────────────────────── значки (QPainter) ─────────────────────────
+
+
+def draw_antenna(p, r, color, width=2.0):
+    """Мачта с волнами в прямоугольнике r."""
+    cx, w, h = r.center().x(), r.width(), r.height()
+    pen = QPen(QColor(color), width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    top = r.top() + h * 0.42
+    p.drawLine(QPointF(cx, top), QPointF(cx - w * 0.2, r.bottom() - h * 0.05))
+    p.drawLine(QPointF(cx, top), QPointF(cx + w * 0.2, r.bottom() - h * 0.05))
+    p.drawLine(QPointF(cx - w * 0.11, r.top() + h * 0.72), QPointF(cx + w * 0.11, r.top() + h * 0.72))
+    p.setBrush(QColor(color))
+    p.drawEllipse(QPointF(cx, top), width * 1.3, width * 1.3)
+    p.setBrush(Qt.NoBrush)
+    for k in (0.17, 0.31):
+        rr = QRectF(cx - w * k, top - w * k, w * k * 2, w * k * 2)
+        p.drawArc(rr, 30 * 16, 120 * 16)
+
+
+def draw_gear(p, r, color, width=2.0):
+    p.setPen(QPen(QColor(color), width, Qt.SolidLine, Qt.RoundCap))
+    p.setBrush(Qt.NoBrush)
+    c = r.center()
+    rad = r.width() * 0.26
+    p.drawEllipse(c, rad, rad)
+    p.drawEllipse(c, rad * 0.4, rad * 0.4)
+    p.save()
+    p.translate(c)
+    for _ in range(8):
+        p.drawLine(QPointF(0, -rad), QPointF(0, -rad * 1.45))
+        p.rotate(45)
+    p.restore()
+
+
+def draw_update(p, r, color, width=2.0):
+    p.setPen(QPen(QColor(color), width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+    p.setBrush(Qt.NoBrush)
+    c = r.center()
+    rad = r.width() * 0.32
+    rr = QRectF(c.x() - rad, c.y() - rad, rad * 2, rad * 2)
+    p.drawArc(rr, 100 * 16, 250 * 16)
+    tip = QPointF(c.x() - rad * 0.17, c.y() - rad)
+    p.drawLine(tip, tip + QPointF(rad * 0.45, -rad * 0.35))
+    p.drawLine(tip, tip + QPointF(rad * 0.45, rad * 0.35))
+    p.drawLine(QPointF(c.x(), c.y() - rad * 0.35), QPointF(c.x(), c.y() + rad * 0.35))
+    p.drawLine(QPointF(c.x(), c.y() + rad * 0.35), QPointF(c.x() - rad * 0.25, c.y() + rad * 0.1))
+    p.drawLine(QPointF(c.x(), c.y() + rad * 0.35), QPointF(c.x() + rad * 0.25, c.y() + rad * 0.1))
+
+
+ICON_DRAW = {"antenna": draw_antenna, "settings": draw_gear, "update": draw_update}
+
+
+def app_icon():
+    icon = QIcon()
+    for s in (16, 20, 24, 32, 48, 64, 128, 256):
+        pm = QPixmap(s, s)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#2f6fe4"))
+        p.drawRoundedRect(QRectF(0, 0, s, s), s * 0.22, s * 0.22)
+        m = s * 0.12
+        draw_antenna(p, QRectF(m, m, s - 2 * m, s - 2 * m), "#ffffff", max(1.2, s / 14))
+        p.end()
+        icon.addPixmap(pm)
+    return icon
+
+# ───────────────────────── виджеты ─────────────────────────
+
+
+class Toggle(QAbstractButton):
+    def __init__(self, checked=False, parent=None):
+        super().__init__(parent)
+        self.setCheckable(True)
+        self.setChecked(checked)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(40, 22)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(P["accent"] if self.isChecked() else P["toggle_off"]))
+        p.drawRoundedRect(QRectF(0, 0, 40, 22), 11, 11)
+        p.setBrush(QColor("#ffffff"))
+        x = 21 if self.isChecked() else 3
+        p.drawEllipse(QRectF(x, 3, 16, 16))
+
+
+class Dot(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.color = "muted"
+        self.setFixedSize(12, 12)
+
+    def set(self, color):
+        self.color = color
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(P.get(self.color, self.color)))
+        p.drawEllipse(QRectF(1, 1, 10, 10))
+
+
+class _IntField(QWidget):
+    """Число без QSpinBox: [−] поле [+]; колесо и ↑/↓; ввод по Enter/уходу фокуса, кривой — откат."""
+    valueChanged = Signal(int)
+
+    def __init__(self, lo=0, hi=100, value=0, suffix="", parent=None):
+        super().__init__(parent)
+        self._lo, self._hi, self._val, self._suffix, self._special = lo, hi, value, suffix, ""
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        self.minus = QPushButton("−")
+        self.plus = QPushButton("+")
+        for b in (self.minus, self.plus):
+            b.setObjectName("step")
+            b.setAutoRepeat(True)
+            b.setFocusPolicy(Qt.NoFocus)
+        self.edit = QLineEdit()
+        self.edit.setObjectName("intField")
+        self.edit.setAlignment(Qt.AlignCenter)
+        self.edit.setFixedWidth(self.edit.fontMetrics().horizontalAdvance("720 мин") + 28)
+        self.edit.installEventFilter(self)
+        self.edit.editingFinished.connect(self._commit)
+        self.minus.clicked.connect(lambda: self.stepBy(-1))
+        self.plus.clicked.connect(lambda: self.stepBy(1))
+        lay.addWidget(self.minus)
+        lay.addWidget(self.edit)
+        lay.addWidget(self.plus)
+        lay.addStretch()
+        self._show()
+
+    def value(self):
+        return self._val
+
+    def setRange(self, lo, hi):
+        self._lo, self._hi = lo, hi
+        self.setValue(self._val)
+
+    def setSuffix(self, s):
+        self._suffix = s
+        self._show()
+
+    def setSpecialValueText(self, s):
+        self._special = s
+        self._show()
+
+    def setValue(self, v):
+        v = max(self._lo, min(self._hi, int(v)))
+        changed = v != self._val
+        self._val = v
+        self._show()
+        if changed:
+            self.valueChanged.emit(v)
+
+    def stepBy(self, n):
+        self.setValue(self._val + n)
+
+    def _show(self):
+        if self._special and self._val == self._lo:
+            self.edit.setText(self._special)
         else:
-            self.log("Адаптеры не найдены (нужен Windows и PowerShell).")
+            self.edit.setText(f"{self._val} {self._suffix}".strip())
 
-    # --- действия ---
-    def set_static(self):
-        name = self.adapter.currentText()
-        ip = self.my_ip.text().strip()
-        if not name:
-            QMessageBox.warning(self, "Адаптер", "Выбери сетевой адаптер.")
+    def _commit(self):
+        t = self.edit.text().strip()
+        if self._special and t == self._special:
+            self.setValue(self._lo)
             return
+        digits = t[:-len(self._suffix)].strip() if self._suffix and t.endswith(self._suffix) else t
         try:
-            ipaddress.ip_address(ip)
+            self.setValue(int(digits))
         except ValueError:
-            QMessageBox.warning(self, "IP", "Неверный IP-адрес ноутбука.")
-            return
-        mask = list(PRESETS.values())[self.preset.currentIndex()][1]
-        ok, out = run_cmd(["netsh", "interface", "ip", "set", "address",
-                           f"name={name}", "static", ip, mask])
-        if ok:
-            self.set_chip("● IP задан", self.color("ok"))
-            self.log(f"Статический IP {ip} на «{name}» установлен.")
-        else:
-            self.set_chip("● ошибка", self.color("err"))
-            self.log(f"Ошибка netsh: {out}")
+            self._show()
 
-    def restore_dhcp(self):
-        name = self.adapter.currentText()
-        if not name:
-            return
-        ok, out = run_cmd(["netsh", "interface", "ip", "set", "address", f"name={name}", "dhcp"])
-        if ok:
-            self.set_chip("● DHCP", self.color("muted"))
-            self.log(f"Адаптер «{name}» переведён на DHCP.")
+    def eventFilter(self, obj, ev):
+        if obj is self.edit:
+            if ev.type() == QEvent.Wheel:
+                self.stepBy(1 if ev.angleDelta().y() > 0 else -1)
+                return True
+            if ev.type() == QEvent.KeyPress and ev.key() in (Qt.Key_Up, Qt.Key_Down):
+                self.stepBy(1 if ev.key() == Qt.Key_Up else -1)
+                return True
+        return super().eventFilter(obj, ev)
+
+
+class SideButton(QAbstractButton):
+    """Кнопка боковой панели: значок QPainter (цветной контур) + белая жирная подпись."""
+
+    def __init__(self, key, text, parent=None):
+        super().__init__(parent)
+        self.key = key
+        self.setText(text)
+        self.setCheckable(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(88, 70)
+        self.setToolTip(text)
+
+    def color(self):
+        dark, light = PAGE_COLORS[self.key]
+        return light if QColor(P["bg"]).lightness() > 128 else dark
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        col = QColor(self.color())
+        if self.isChecked() or self.underMouse():
+            bg = QColor(col)
+            bg.setAlpha(60 if self.isChecked() else 28)
+            p.setPen(Qt.NoPen)
+            p.setBrush(bg)
+            p.drawRoundedRect(QRectF(6, 3, self.width() - 10, self.height() - 6), 9, 9)
+        if self.isChecked():
+            p.setBrush(col)
+            p.drawRoundedRect(QRectF(0, 12, 4, self.height() - 24), 2, 2)
+        ICON_DRAW[self.key](p, QRectF(self.width() / 2 - 14, 8, 28, 28), col.lighter(115), 2.2)
+        f = QFont(self.font())
+        f.setPointSizeF(8.5)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor(P["side_text"]))
+        p.drawText(QRectF(0, 40, self.width(), 24), Qt.AlignHCenter | Qt.AlignVCenter, self.text())
+
+    def enterEvent(self, e):
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self.update()
+        super().leaveEvent(e)
+
+
+class _WinBtn(QPushButton):
+    def __init__(self, kind, parent=None):
+        super().__init__(parent)
+        self.kind = kind
+        self.setObjectName("winClose" if kind == "close" else "winBtn")
+        self.setFixedHeight(34)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.maxed = False
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        col = "#ffffff" if (self.kind == "close" and self.underMouse()) else P["side_text"]
+        p.setPen(QPen(QColor(col), 1.2))
+        c = self.rect().center()
+        x, y, s = c.x() + 0.5, c.y() + 0.5, 5
+        if self.kind == "min":
+            p.drawLine(QPointF(x - s, y), QPointF(x + s, y))
+        elif self.kind == "max":
+            if self.maxed:
+                p.drawRect(QRectF(x - s, y - s + 2, s * 2 - 2, s * 2 - 2))
+                p.drawPolyline([QPointF(x - s + 2, y - s + 2), QPointF(x - s + 2, y - s),
+                                QPointF(x + s, y - s), QPointF(x + s, y + s - 2), QPointF(x + s - 2, y + s - 2)])
+            else:
+                p.drawRect(QRectF(x - s, y - s, s * 2, s * 2))
         else:
-            self.log(f"Ошибка netsh: {out}")
+            p.drawLine(QPointF(x - s, y - s), QPointF(x + s, y + s))
+            p.drawLine(QPointF(x - s, y + s), QPointF(x + s, y - s))
+
+
+class TitleBar(QWidget):
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+        self.setObjectName("titleBar")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setFixedHeight(34)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 0, 0, 0)
+        lay.setSpacing(8)
+        self.icon = QLabel()
+        self.icon.setPixmap(app_icon().pixmap(18, 18))
+        self.title = QLabel(f"{APP_NAME} — v{VERSION} · Qt6")
+        self.title.setObjectName("titleText")
+        for w in (self.icon, self.title):
+            w.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.b_min, self.b_max, self.b_close = _WinBtn("min"), _WinBtn("max"), _WinBtn("close")
+        self.b_min.clicked.connect(win.showMinimized)
+        self.b_max.clicked.connect(win.toggle_max)
+        self.b_close.clicked.connect(win.close)
+        lay.addWidget(self.icon)
+        lay.addWidget(self.title)
+        lay.addStretch()
+        for b in (self.b_min, self.b_max, self.b_close):
+            lay.addWidget(b)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and self.childAt(e.position().toPoint()) is None:
+            if self.win.maxed:
+                return
+            h = self.win.windowHandle()
+            if h is not None:
+                h.startSystemMove()
+        elif e.button() == Qt.RightButton:
+            self.win.window_menu(e.globalPosition().toPoint())
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.win.toggle_max()
+
+
+class _Edge(QWidget):
+    """5-пиксельная полоска по краю: тянуть размер + рисует 1px рамку."""
+
+    def __init__(self, win, edges):
+        super().__init__(win)
+        self.win, self.edges = win, edges
+        cur = {Qt.LeftEdge: Qt.SizeHorCursor, Qt.RightEdge: Qt.SizeHorCursor,
+               Qt.TopEdge: Qt.SizeVerCursor, Qt.BottomEdge: Qt.SizeVerCursor}
+        if edges in cur:
+            self.setCursor(cur[edges])
+        elif edges in (Qt.TopEdge | Qt.LeftEdge, Qt.BottomEdge | Qt.RightEdge):
+            self.setCursor(Qt.SizeFDiagCursor)
+        else:
+            self.setCursor(Qt.SizeBDiagCursor)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and not self.win.maxed and self.win.windowHandle():
+            self.win.windowHandle().startSystemResize(self.edges)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setPen(QColor(P["line"]))
+        r = self.rect()
+        if self.edges & Qt.LeftEdge:
+            p.drawLine(0, 0, 0, r.height())
+        if self.edges & Qt.RightEdge:
+            p.drawLine(r.width() - 1, 0, r.width() - 1, r.height())
+        if self.edges & Qt.TopEdge:
+            p.drawLine(0, 0, r.width(), 0)
+        if self.edges & Qt.BottomEdge:
+            p.drawLine(0, r.height() - 1, r.width(), r.height() - 1)
+
+
+def _card(title):
+    f = QFrame()
+    f.setObjectName("card")
+    lay = QVBoxLayout(f)
+    lay.setContentsMargins(14, 10, 14, 12)
+    lay.setSpacing(8)
+    t = QLabel(title.upper())
+    t.setObjectName("cardTitle")
+    lay.addWidget(t)
+    return f, lay
+
+
+def _lab(text, name=None):
+    lab = QLabel(text)
+    if name:
+        lab.setObjectName(name)
+    return lab
+
+
+class Tile(QFrame):
+    def __init__(self, caption):
+        super().__init__()
+        self.setObjectName("tile")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 8, 14, 10)
+        lay.setSpacing(2)
+        self.cap = _lab(caption.upper(), "tileCap")
+        self.val = _lab("—", "tileVal")
+        self.sub = _lab("", "tileSub")
+        for w in (self.cap, self.val, self.sub):
+            lay.addWidget(w)
+        self._color = None
+
+    def set(self, value, sub="", color=None):
+        self.val.setText(value)
+        self.sub.setText(sub)
+        self._color = color
+        self.restyle()
+
+    def restyle(self):
+        self.val.setStyleSheet(f"color: {P[self._color]};" if self._color else "")
+
+# ───────────────────────── фильтр событий приложения ─────────────────────────
+
+
+class AppFilter(QObject):
+    """DWM-полоса у диалогов до показа + русское меню по правому клику везде."""
+
+    def __init__(self, win):
+        super().__init__()
+        self.win = win
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t == QEvent.Show and isinstance(obj, QWidget) and obj.isWindow() \
+                and not (obj.windowFlags() & Qt.FramelessWindowHint) \
+                and obj.windowType() in (Qt.Window, Qt.Dialog, Qt.Tool):
+            _dwm_paint(obj)
+        elif t == QEvent.ContextMenu and isinstance(obj, QWidget):
+            if self.win.context_menu(obj, ev.globalPos(), own=obj.window() is self.win):
+                return True
+        return False
+
+# ───────────────────────── главное окно ─────────────────────────
+
+
+class MainWindow(QWidget):
+    def __init__(self, cfg, cfg_writable=True):
+        super().__init__(None, Qt.Window | Qt.FramelessWindowHint | Qt.WindowSystemMenuHint
+                         | Qt.WindowMinMaxButtonsHint)
+        self.cfg = cfg
+        self.cfg_writable = cfg_writable
+        self._saved_dump = json.dumps(cfg, ensure_ascii=False, sort_keys=True)
+        self.q = queue.Queue()
+        self.worker = Worker(self.q)
+        self.adapters = []
+        self.last_check = None
+        self.maxed = False
+        self._normal_geo = None
+        self._closing = False
+        self.setWindowTitle(f"{APP_NAME} — v{VERSION}")
+        self.setWindowIcon(app_icon())
+        self.setMinimumSize(900, 600)
+        self._loading = True
+        self._build()
+        self._load_ui_from_cfg()
+        self._loading = False
+        self.timer = QTimer(self, interval=150, timeout=self._drain)
+        self.timer.start()
+        self.autosave = QTimer(self, interval=10000, timeout=self.save_if_changed)
+        self.autosave.start()
+        self._shortcuts()
+        if not cfg_writable:
+            self.log("⚠ config.json повреждён, и .bak тоже — настройки не будут записываться.")
+
+    # ── построение ──
+    def _build(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self.titlebar = TitleBar(self)
+        outer.addWidget(self.titlebar)
+
+        body = QWidget()
+        body.setObjectName("root")
+        body.setAttribute(Qt.WA_StyledBackground, True)
+        bl = QHBoxLayout(body)
+        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setSpacing(0)
+        outer.addWidget(body, 1)
+
+        side = QWidget()
+        side.setObjectName("side")
+        side.setAttribute(Qt.WA_StyledBackground, True)
+        side.setFixedWidth(88)
+        sl = QVBoxLayout(side)
+        sl.setContentsMargins(0, 8, 0, 8)
+        sl.setSpacing(4)
+        self.side_group = QButtonGroup(self)
+        self.side_btns = []
+        for i, (key, text) in enumerate((("antenna", "Антенна"), ("settings", "Настройки"),
+                                         ("update", "Обновление"))):
+            b = SideButton(key, text)
+            self.side_group.addButton(b, i)
+            self.side_btns.append(b)
+            if key == "update":
+                sl.addStretch()  # «Обновление с GitHub» — последней кнопкой
+            sl.addWidget(b)
+        self.side_group.idClicked.connect(self.set_page)
+        bl.addWidget(side)
+
+        right = QWidget()
+        right.setObjectName("page")
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(16, 12, 16, 0)
+        rl.setSpacing(10)
+        bl.addWidget(right, 1)
+
+        head = QHBoxLayout()
+        ico = QLabel()
+        ico.setPixmap(app_icon().pixmap(30, 30))
+        head.addWidget(ico)
+        head.addWidget(_lab(APP_NAME, "h1"))
+        head.addStretch()
+        self.chip = _lab("● готов", "chip")
+        self.btn_theme = QPushButton("☀")
+        self.btn_theme.setObjectName("tool")
+        self.btn_theme.setToolTip("Тема (Ctrl+T)")
+        self.btn_theme.clicked.connect(self.toggle_theme)
+        self.btn_more = QPushButton("⋯")
+        self.btn_more.setObjectName("tool")
+        self.btn_more.setToolTip("Меню")
+        self.btn_more.clicked.connect(lambda: self.main_menu().exec(
+            self.btn_more.mapToGlobal(QPoint(0, self.btn_more.height()))))
+        for w in (self.chip, self.btn_theme, self.btn_more):
+            head.addWidget(w)
+        rl.addLayout(head)
+
+        tiles = QHBoxLayout()
+        tiles.setSpacing(10)
+        self.t_adapter, self.t_myip = Tile("Адаптер"), Tile("IP ноутбука сейчас")
+        self.t_ant, self.t_resp = Tile("Антенна"), Tile("Ответ")
+        self.tiles = (self.t_adapter, self.t_myip, self.t_ant, self.t_resp)
+        for t in self.tiles:
+            tiles.addWidget(t, 1)
+        rl.addLayout(tiles)
+
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._page_antenna())
+        self.stack.addWidget(self._page_settings())
+        self.stack.addWidget(self._page_update())
+        rl.addWidget(self.stack, 1)
+
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        outer.addWidget(self.progress)
+
+        sb = QWidget()
+        sb.setObjectName("statusbar")
+        sb.setAttribute(Qt.WA_StyledBackground, True)
+        sb.setFixedHeight(28)
+        sbl = QHBoxLayout(sb)
+        sbl.setContentsMargins(12, 0, 12, 0)
+        adm = "администратор" if is_admin() else "без прав администратора"
+        self.status_left = _lab(f"v{VERSION} · {adm}", "status")
+        self.status = _lab("", "status")
+        sbl.addWidget(self.status_left)
+        sbl.addStretch()
+        sbl.addWidget(self.status)
+        outer.addWidget(sb)
+
+        self.edges = []
+        for e in (Qt.LeftEdge, Qt.RightEdge, Qt.TopEdge, Qt.BottomEdge,
+                  Qt.TopEdge | Qt.LeftEdge, Qt.TopEdge | Qt.RightEdge,
+                  Qt.BottomEdge | Qt.LeftEdge, Qt.BottomEdge | Qt.RightEdge):
+            self.edges.append(_Edge(self, e))
+
+    def _page_antenna(self):
+        page = QWidget()
+        page.setObjectName("page")
+        lay = QHBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 8)
+        lay.setSpacing(12)
+
+        left = QVBoxLayout()
+        left.setSpacing(10)
+        c, cl = _card("Антенны")
+        self.presets = QListWidget()
+        self.presets.setToolTip("Пресеты. Правый клик — добавить свой / удалить")
+        self.presets.currentRowChanged.connect(self.on_preset)
+        cl.addWidget(self.presets)
+        c.setFixedWidth(300)
+        left.addWidget(c, 1)
+
+        c, cl = _card("Параметры")
+        g = QGridLayout()
+        g.setHorizontalSpacing(8)
+        g.setVerticalSpacing(6)
+        self.e_ant = QLineEdit()
+        self.e_ant.setToolTip("Адрес антенны (можно поменять, если сброшена не на заводской)")
+        self.e_mask = QLineEdit()
+        self.e_my = QLineEdit()
+        self.e_my.setToolTip("Адрес ноутбука на время настройки — в той же подсети, что антенна")
+        self.btn_auto = QPushButton("авто")
+        self.btn_auto.setObjectName("step")
+        self.btn_auto.setStyleSheet("min-width: 44px; max-width: 44px;")
+        self.btn_auto.setToolTip("Посчитать IP ноутбука по адресу антенны и маске")
+        self.btn_auto.clicked.connect(self.auto_my_ip)
+        self.l_creds = _lab("", "hint")
+        self.l_creds.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        g.addWidget(_lab("Антенна"), 0, 0)
+        g.addWidget(self.e_ant, 0, 1, 1, 2)
+        g.addWidget(_lab("Маска"), 1, 0)
+        g.addWidget(self.e_mask, 1, 1, 1, 2)
+        g.addWidget(_lab("Ноутбук"), 2, 0)
+        g.addWidget(self.e_my, 2, 1)
+        g.addWidget(self.btn_auto, 2, 2)
+        g.addWidget(self.l_creds, 3, 0, 1, 3)
+        cl.addLayout(g)
+        c.setFixedWidth(300)
+        left.addWidget(c)
+        for e in (self.e_ant, self.e_mask, self.e_my):
+            e.textEdited.connect(self._params_edited)
+        lay.addLayout(left)
+
+        right = QVBoxLayout()
+        right.setSpacing(10)
+        c, cl = _card("Сетевой адаптер")
+        row = QHBoxLayout()
+        self.cb_adapter = QComboBox()
+        self.cb_adapter.setToolTip("Адаптер, к которому подключена антенна (обычно Ethernet). Правый клик — обновить")
+        self.cb_adapter.currentIndexChanged.connect(self.on_adapter)
+        self.btn_refresh = QPushButton("🔄 Обновить")
+        self.btn_refresh.setToolTip("Перечитать адаптеры (F5)")
+        self.btn_refresh.clicked.connect(self.refresh)
+        row.addWidget(self.cb_adapter, 1)
+        row.addWidget(self.btn_refresh)
+        cl.addLayout(row)
+        self.l_adapter = _lab("", "hint")
+        self.l_adapter.setWordWrap(True)
+        cl.addWidget(self.l_adapter)
+        right.addWidget(c)
+
+        c, cl = _card("Действия")
+        row = QHBoxLayout()
+        self.btn_set = QPushButton("⚡ Поставить IP")
+        self.btn_set.setObjectName("primary")
+        self.btn_set.setToolTip("Запомнить текущие настройки адаптера и поставить статический IP (Ctrl+Enter)")
+        self.btn_set.clicked.connect(self.set_static)
+        self.btn_check = QPushButton("🔎 Проверить")
+        self.btn_check.setToolTip("Пинг, порты 80/443 и веб антенны (F6)")
+        self.btn_check.clicked.connect(self.check)
+        self.btn_open = QPushButton("🌐 Открыть веб")
+        self.btn_open.setToolTip("Открыть веб-интерфейс антенны в браузере (Ctrl+O)")
+        self.btn_open.clicked.connect(self.open_browser)
+        self.btn_restore = QPushButton("↩ Вернуть как было")
+        self.btn_restore.setObjectName("danger")
+        self.btn_restore.setToolTip("Вернуть адаптеру прежние настройки (или DHCP, если снимка нет)")
+        self.btn_restore.clicked.connect(self.restore)
+        for b in (self.btn_set, self.btn_check, self.btn_open, self.btn_restore):
+            row.addWidget(b)
+        cl.addLayout(row)
+        res = QGridLayout()
+        res.setHorizontalSpacing(8)
+        self.res_rows = {}
+        for i, (k, t) in enumerate((("ping", "Пинг"), ("p80", "Порт 80 (http)"),
+                                    ("p443", "Порт 443 (https)"), ("http", "Веб-страница"))):
+            d, lab, val = Dot(), _lab(t), _lab("—", "hint")
+            res.addWidget(d, i // 2, (i % 2) * 3)
+            res.addWidget(lab, i // 2, (i % 2) * 3 + 1)
+            res.addWidget(val, i // 2, (i % 2) * 3 + 2)
+            self.res_rows[k] = (d, val)
+        res.setColumnStretch(2, 1)
+        res.setColumnStretch(5, 1)
+        cl.addLayout(res)
+        right.addWidget(c)
+
+        c, cl = _card("Журнал")
+        self.logv = QPlainTextEdit()
+        self.logv.setObjectName("log")
+        self.logv.setReadOnly(True)
+        self.logv.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.logv.setMaximumBlockCount(3000)
+        cl.addWidget(self.logv)
+        right.addWidget(c, 1)
+        lay.addLayout(right, 1)
+        return page
+
+    def _page_settings(self):
+        page = QWidget()
+        page.setObjectName("page")
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 8)
+        lay.setSpacing(10)
+        c, cl = _card("Проверка")
+        g = QGridLayout()
+        g.setHorizontalSpacing(12)
+        self.f_timeout = _IntField(1, 15, 3, "с")
+        self.f_timeout.setToolTip("Сколько ждать ответа антенны")
+        self.f_retries = _IntField(0, 30, 6, "раз")
+        self.f_retries.setSpecialValueText("не ждать")
+        self.f_retries.setToolTip("После смены IP Windows нужно несколько секунд — столько раз повторить проверку")
+        self.tg_auto = Toggle()
+        self.tg_admin = Toggle()
+        self.tg_upd = Toggle()
+        rows = (("Таймаут проверки", self.f_timeout), ("Повторов после смены IP", self.f_retries),
+                ("Проверять антенну сразу после смены IP", self.tg_auto),
+                ("Просить права администратора при запуске", self.tg_admin),
+                ("Проверять обновления при запуске", self.tg_upd))
+        for i, (t, w) in enumerate(rows):
+            g.addWidget(_lab(t), i, 0)
+            g.addWidget(w, i, 1, Qt.AlignLeft)
+        g.setColumnStretch(2, 1)
+        cl.addLayout(g)
+        lay.addWidget(c)
+
+        c, cl = _card("Сохранённые настройки адаптеров")
+        self.l_saved = _lab("", "hint")
+        self.l_saved.setWordWrap(True)
+        self.l_saved.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        cl.addWidget(self.l_saved)
+        btn = QPushButton("🗑 Забыть снимки")
+        btn.setToolTip("Удалить запомненные прежние настройки (сеть не меняется)")
+        btn.clicked.connect(self.forget_snapshots)
+        row = QHBoxLayout()
+        row.addWidget(btn)
+        row.addStretch()
+        cl.addLayout(row)
+        lay.addWidget(c)
+
+        c, cl = _card("Оформление")
+        row = QHBoxLayout()
+        b1 = QPushButton("☾ Тёмная")
+        b1.clicked.connect(lambda: self.set_theme("dark"))
+        b2 = QPushButton("☀ Светлая")
+        b2.clicked.connect(lambda: self.set_theme("light"))
+        b3 = QPushButton("💾 Сохранить")
+        b3.setToolTip("Ctrl+S")
+        b3.clicked.connect(self.save_now)
+        for b in (b1, b2, b3):
+            row.addWidget(b)
+        row.addStretch()
+        cl.addLayout(row)
+        lay.addWidget(c)
+        lay.addStretch()
+        for w in (self.f_timeout, self.f_retries):
+            w.valueChanged.connect(self._sync_cfg)
+        for w in (self.tg_auto, self.tg_admin, self.tg_upd):
+            w.toggled.connect(self._sync_cfg)
+        return page
+
+    def _page_update(self):
+        page = QWidget()
+        page.setObjectName("page")
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 8)
+        lay.setSpacing(10)
+        c, cl = _card("Обновление с GitHub")
+        g = QGridLayout()
+        g.setHorizontalSpacing(10)
+        self.e_repo = QLineEdit()
+        self.e_repo.setPlaceholderText("владелец/репозиторий")
+        self.e_branch = QLineEdit()
+        self.e_token = QLineEdit()
+        self.e_token.setEchoMode(QLineEdit.Password)
+        self.e_token.setPlaceholderText("нужен для приватного репозитория (права: Contents — read)")
+        self.e_token.setToolTip("Хранится только в config.json рядом с программой")
+        self.l_ver = _lab(f"Установлена: v{VERSION}   ·   на GitHub: —", "hint")
+        g.addWidget(_lab("Репозиторий"), 0, 0)
+        g.addWidget(self.e_repo, 0, 1)
+        g.addWidget(_lab("Ветка"), 1, 0)
+        g.addWidget(self.e_branch, 1, 1)
+        g.addWidget(_lab("Токен GitHub"), 2, 0)
+        g.addWidget(self.e_token, 2, 1)
+        cl.addLayout(g)
+        cl.addWidget(self.l_ver)
+        row = QHBoxLayout()
+        self.btn_ucheck = QPushButton("🔎 Проверить")
+        self.btn_ucheck.clicked.connect(lambda: self.check_update(install=False))
+        self.btn_uinst = QPushButton("⬇ Обновить")
+        self.btn_uinst.setObjectName("primary")
+        self.btn_uinst.clicked.connect(lambda: self.check_update(install=True))
+        row.addWidget(self.btn_ucheck)
+        row.addWidget(self.btn_uinst)
+        row.addStretch()
+        cl.addLayout(row)
+        cl.addWidget(_lab("Заменяемые файлы сохраняются в _backup/v<версия>/. config.json, modules/, "
+                          "tools/ и другие свои файлы не трогаются.", "hint"))
+        lay.addWidget(c)
+        lay.addStretch()
+        for e in (self.e_repo, self.e_branch, self.e_token):
+            e.textEdited.connect(self._sync_cfg)
+        return page
+
+    def _shortcuts(self):
+        for key, fn in (("F5", self.refresh), ("F6", self.check), ("Ctrl+O", self.open_browser),
+                        ("Ctrl+Return", self.set_static), ("Ctrl+S", self.save_now),
+                        ("Ctrl+T", self.toggle_theme), ("Esc", self.ask_stop)):
+            QShortcut(QKeySequence(key), self, fn)
+
+    # ── окно: рамка, разворот ──
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        w, h, b = self.width(), self.height(), 5
+        geo = {Qt.LeftEdge: (0, b, b, h - 2 * b), Qt.RightEdge: (w - b, b, b, h - 2 * b),
+               Qt.TopEdge: (b, 0, w - 2 * b, b), Qt.BottomEdge: (b, h - b, w - 2 * b, b),
+               Qt.TopEdge | Qt.LeftEdge: (0, 0, b, b), Qt.TopEdge | Qt.RightEdge: (w - b, 0, b, b),
+               Qt.BottomEdge | Qt.LeftEdge: (0, h - b, b, b),
+               Qt.BottomEdge | Qt.RightEdge: (w - b, h - b, b, b)}
+        for edge in self.edges:
+            edge.setGeometry(*geo[edge.edges])
+            edge.setVisible(not self.maxed)
+            edge.raise_()
+
+    def toggle_max(self):
+        if self.maxed:
+            self.maxed = False
+            if self._normal_geo:
+                self.setGeometry(self._normal_geo)
+        else:
+            self._normal_geo = self.geometry()
+            self.maxed = True
+            self.setGeometry(self.screen().availableGeometry())
+        self.titlebar.b_max.maxed = self.maxed
+        self.titlebar.b_max.update()
+        self._relayout_edges()
+
+    def _relayout_edges(self):
+        for edge in self.edges:
+            edge.setVisible(not self.maxed)
+            edge.raise_()
+
+    def changeEvent(self, e):
+        if e.type() == QEvent.WindowStateChange and self.windowState() & Qt.WindowMaximized:
+            # Win+↑: разворачиваем сами, на рабочую область (не закрывая панель задач)
+            QTimer.singleShot(0, self._native_max_to_ours)
+        super().changeEvent(e)
+
+    def _native_max_to_ours(self):
+        self.setWindowState(Qt.WindowNoState)
+        if not self.maxed:
+            self.toggle_max()
+
+    def window_menu(self, pos):
+        m = QMenu(self)
+        m.addAction("Свернуть", self.showMinimized)
+        m.addAction("Вернуть" if self.maxed else "Развернуть", self.toggle_max)
+        m.addSeparator()
+        m.addAction("Закрыть", self.close)
+        m.exec(pos)
+
+    # ── меню ──
+    def main_menu(self):
+        m = QMenu(self)
+        m.addAction("🔄 Обновить\tF5", self.refresh)
+        m.addAction("💾 Сохранить\tCtrl+S", self.save_now)
+        m.addAction("🎨 Тема\tCtrl+T", self.toggle_theme)
+        m.addSeparator()
+        m.addAction("📂 Папка программы", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(APP_ROOT))))
+        m.addAction("♻ Перезапуск", self.restart)
+        a = m.addAction("⏹ Стоп\tEsc", self.ask_stop)
+        a.setEnabled(self.worker.busy())
+        return m
+
+    def context_menu(self, w, pos, own=True):
+        """Одно меню на всё приложение. True — показали своё."""
+        m = QMenu(w.window())
+        if isinstance(w.parent(), QPlainTextEdit) or isinstance(w.parent(), QTextEdit):
+            w = w.parent()
+        if isinstance(w, QLineEdit) and isinstance(w.parent(), QComboBox):
+            w = w.parent()
+        if isinstance(w, (QPlainTextEdit, QTextEdit)):
+            ro = w.isReadOnly()
+            has = w.textCursor().hasSelection()
+            if not ro:
+                m.addAction("Отменить", w.undo).setEnabled(w.document().isUndoAvailable())
+                m.addAction("Вырезать", w.cut).setEnabled(has)
+            m.addAction("Копировать", w.copy).setEnabled(has)
+            m.addAction("Копировать всё", lambda: QApplication.clipboard().setText(w.toPlainText()))
+            if not ro:
+                m.addAction("Вставить", w.paste)
+            m.addAction("Выделить всё", w.selectAll)
+            if w is self.logv:
+                m.addSeparator()
+                m.addAction("Сохранить в файл…", self.save_log)
+                m.addAction("Очистить", w.clear)
+        elif isinstance(w, QLineEdit):
+            has = w.hasSelectedText()
+            pw = w.echoMode() != QLineEdit.Normal
+            ro = w.isReadOnly()
+            m.addAction("Отменить", w.undo).setEnabled(w.isUndoAvailable() and not ro)
+            m.addAction("Вырезать", w.cut).setEnabled(has and not ro and not pw)
+            m.addAction("Копировать", w.copy).setEnabled(has and not pw)
+            m.addAction("Вставить", w.paste).setEnabled(not ro)
+            m.addAction("Удалить", w.del_).setEnabled(has and not ro)
+            m.addSeparator()
+            m.addAction("Выделить всё", w.selectAll)
+            if w is self.e_token:
+                m.addAction("Показать / скрыть токен", lambda: w.setEchoMode(
+                    QLineEdit.Normal if w.echoMode() == QLineEdit.Password else QLineEdit.Password))
+        elif not own:
+            return False
+        elif w is self.presets or w.parent() is self.presets:
+            it = self.presets.itemAt(self.presets.viewport().mapFromGlobal(pos))
+            if it is not None:
+                self.presets.setCurrentItem(it)
+            m.addAction("➕ Добавить свой пресет…", self.add_preset)
+            name = self.current_preset_name()
+            a = m.addAction("🗑 Удалить пресет", self.del_preset)
+            a.setEnabled(name in self.cfg.get("custom_presets", {}))
+            m.addSeparator()
+            m.addAction("Копировать адрес антенны", lambda: QApplication.clipboard().setText(self.e_ant.text()))
+        elif w is self.cb_adapter:
+            m.addAction("🔄 Обновить список\tF5", self.refresh)
+            m.addAction("Копировать имя", lambda: QApplication.clipboard().setText(self.cb_adapter.currentText()))
+        elif isinstance(w, (QPushButton, QAbstractButton, QProgressBar)) and w is not self.btn_more:
+            return True  # у кнопок своего меню нет — фон не показываем поверх
+        else:
+            m = self.main_menu()
+        m.exec(pos)
+        return True
+
+    # ── конфиг ──
+    def _load_ui_from_cfg(self):
+        c = self.cfg
+        self.f_timeout.setValue(c.get("check_timeout", 3))
+        self.f_retries.setValue(c.get("check_retries", 6))
+        self.tg_auto.setChecked(bool(c.get("auto_check", True)))
+        self.tg_admin.setChecked(bool(c.get("ask_admin", True)))
+        self.tg_upd.setChecked(bool(c.get("check_updates", True)))
+        self.e_repo.setText(c.get("github_repo") or GITHUB_REPO)
+        self.e_branch.setText(c.get("github_branch") or GITHUB_BRANCH)
+        self.e_token.setText(c.get("github_token", ""))
+        self.fill_presets(c.get("preset"))
+        if c.get("antenna_ip"):
+            self.e_ant.setText(c["antenna_ip"])
+            self.e_mask.setText(c.get("mask") or "255.255.255.0")
+            self.e_my.setText(c.get("my_ip", ""))
+        page = int(c.get("page", 0) or 0)
+        self.set_page(page if 0 <= page < self.stack.count() else 0)
+        self.update_saved_label()
+        self.update_tiles()
+        g = c.get("geometry")
+        if g:
+            try:
+                x, y, w, h, mx = g
+                scr = QApplication.screenAt(QPoint(x + 40, y + 10))
+                if scr is not None:
+                    self.setGeometry(x, y, max(w, 900), max(h, 600))
+                else:
+                    self.resize(max(w, 900), max(h, 600))
+                if mx:
+                    QTimer.singleShot(0, self.toggle_max)
+            except Exception:
+                self.resize(1080, 720)
+        else:
+            self.resize(1080, 720)
+
+    def _sync_cfg(self, *_):
+        if getattr(self, "_loading", False):
+            return
+        c = self.cfg
+        c["check_timeout"] = self.f_timeout.value()
+        c["check_retries"] = self.f_retries.value()
+        c["auto_check"] = self.tg_auto.isChecked()
+        c["ask_admin"] = self.tg_admin.isChecked()
+        c["check_updates"] = self.tg_upd.isChecked()
+        c["github_repo"] = self.e_repo.text().strip()
+        c["github_branch"] = self.e_branch.text().strip() or GITHUB_BRANCH
+        c["github_token"] = self.e_token.text().strip()
+        c["preset"] = self.current_preset_name()
+        c["antenna_ip"] = self.e_ant.text().strip()
+        c["mask"] = self.e_mask.text().strip()
+        c["my_ip"] = self.e_my.text().strip()
+        c["adapter"] = self.cb_adapter.currentData() or c.get("adapter", "")
+        c["page"] = self.stack.currentIndex()
+        geo = self._normal_geo if (self.maxed and self._normal_geo) else self.geometry()
+        c["geometry"] = [geo.x(), geo.y(), geo.width(), geo.height(), self.maxed]
+
+    def save_if_changed(self):
+        self._sync_cfg()
+        dump = json.dumps(self.cfg, ensure_ascii=False, sort_keys=True)
+        if dump != self._saved_dump:
+            self._write_cfg(dump)
+
+    def save_now(self):
+        self._sync_cfg()
+        if self._write_cfg(json.dumps(self.cfg, ensure_ascii=False, sort_keys=True)):
+            self.set_status("💾 настройки сохранены")
+
+    def _write_cfg(self, dump):
+        if not self.cfg_writable:
+            return False
+        try:
+            save_config(self.cfg)
+            self._saved_dump = dump
+            return True
+        except Exception as e:
+            self.log(f"✗ не удалось сохранить config.json: {e}")
+            return False
+
+    # ── тема ──
+    def set_theme(self, name):
+        self.cfg["theme"] = name
+        apply_theme(QApplication.instance(), name)
+        self.btn_theme.setText("☀" if name == "dark" else "☾")
+        for t in self.tiles:
+            t.restyle()
+        self.recolor_log()
+        for w in self.findChildren(QWidget):
+            w.update()
+        self.titlebar.update()
+        for e in self.edges:
+            e.update()
+        self.set_chip(*self._chip_state)
+
+    def toggle_theme(self):
+        self.set_theme("light" if self.cfg.get("theme") == "dark" else "dark")
+
+    # ── страницы, состояние, лог ──
+    def set_page(self, i):
+        self.stack.setCurrentIndex(i)
+        self.side_btns[i].setChecked(True)
+
+    _chip_state = ("● готов", "muted")
+
+    def set_chip(self, text, color="muted"):
+        self._chip_state = (text, color)
+        self.chip.setText(text)
+        self.chip.setStyleSheet(f"color: {P.get(color, color)};")
+
+    def set_status(self, text):
+        self.status.setText(text)
+
+    def _line_color(self, text):
+        if text.startswith(("✗", "⛔")):
+            return P["err"]
+        if text.startswith("⚠"):
+            return P["warn"]
+        if text.startswith(("✓", "✅")):
+            return P["ok"]
+        return P["log_fg"]
+
+    def log(self, text):
+        line = f"{time.strftime('%H:%M:%S')}  {text}"
+        self._log_lines = getattr(self, "_log_lines", [])
+        self._log_lines.append(text)
+        self._log_lines = self._log_lines[-3000:]
+        self._append_log(line, text)
+        self.set_status(text)
+
+    def _append_log(self, line, text):
+        sb = self.logv.verticalScrollBar()
+        at_bottom = sb.value() >= sb.maximum() - 2
+        cur = QTextCursor(self.logv.document())
+        cur.movePosition(QTextCursor.End)
+        fmt = cur.charFormat()
+        fmt.setForeground(QColor(self._line_color(text)))
+        if not self.logv.document().isEmpty():
+            cur.insertBlock()
+        cur.insertText(line, fmt)
+        if at_bottom:
+            sb.setValue(sb.maximum())
+
+    def recolor_log(self):
+        doc = self.logv.document()
+        b = doc.firstBlock()
+        while b.isValid():
+            t = b.text()
+            body = t[10:] if len(t) > 10 else t
+            cur = QTextCursor(b)
+            cur.select(QTextCursor.LineUnderCursor)
+            fmt = cur.charFormat()
+            fmt.setForeground(QColor(self._line_color(body)))
+            cur.setCharFormat(fmt)
+            b = b.next()
+
+    def save_log(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить журнал",
+                                              str(APP_ROOT / f"antenna_log_{time.strftime('%Y%m%d_%H%M')}.txt"),
+                                              "Текст (*.txt)")
+        if path:
+            try:
+                atomic_write_text(path, self.logv.toPlainText())
+                self.log(f"✓ журнал сохранён: {path}")
+            except Exception as e:
+                self.log(f"✗ не сохранил журнал: {e}")
+
+    def _drain(self):
+        try:
+            while True:
+                item = self.q.get_nowait()
+                if item is _DONE:
+                    self.work_done()
+                elif isinstance(item, tuple) and item[0] == "log":
+                    self.log(item[1])
+                elif callable(item):
+                    item()
+        except queue.Empty:
+            pass
+
+    def run_job(self, name, fn, blocking_close=False):
+        if self.worker.busy():
+            self.log(f"⚠ уже идёт: {self.worker.name}")
+            return False
+        self.worker.start(name, fn, blocking_close)
+        self.set_chip(f"● работаю: {name}", "accent")
+        self.progress.setRange(0, 0)
+        self.set_busy(True)
+        return True
+
+    def work_done(self):
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.set_busy(False)
+        if self._chip_state[1] == "accent":
+            self.set_chip("● готов", "muted")
+        if self._closing:
+            self._closing = False
+            self.close()
+
+    def set_busy(self, busy):
+        admin = is_admin()
+        for b in (self.btn_set, self.btn_restore):
+            b.setEnabled(not busy and admin)
+            b.setToolTip(b.toolTip() if admin else "Нужны права администратора (перезапусти программу)")
+        for b in (self.btn_check, self.btn_refresh, self.btn_ucheck, self.btn_uinst):
+            b.setEnabled(not busy)
+
+    def ask_stop(self):
+        if not self.worker.busy():
+            return
+        if self.worker.blocking_close:
+            self.log("⚠ установку обновления не останавливаю — дождись конца.")
+            return
+        if QMessageBox.question(self, "Стоп", f"Остановить «{self.worker.name}»?") == QMessageBox.Yes:
+            self.worker.stop_flag.set()
+            self.log("⏹ останавливаю…")
+
+    # ── пресеты ──
+    def all_presets(self):
+        d = dict(BUILTIN_PRESETS)
+        for k, v in (self.cfg.get("custom_presets") or {}).items():
+            try:
+                d[k] = (v[0], v[1], v[2] if len(v) > 2 else "")
+            except Exception:
+                continue
+        return d
+
+    def fill_presets(self, select=None):
+        self.presets.blockSignals(True)
+        self.presets.clear()
+        custom = self.cfg.get("custom_presets") or {}
+        for name, (ip, _, _) in self.all_presets().items():
+            it = QListWidgetItem(f"{name}\n{ip}" + ("   · свой" if name in custom else ""))
+            it.setData(Qt.UserRole, name)
+            self.presets.addItem(it)
+        self.presets.blockSignals(False)
+        names = list(self.all_presets())
+        row = names.index(select) if select in names else 0
+        self.presets.setCurrentRow(row)
+        self.on_preset(row, keep_fields=bool(self.cfg.get("antenna_ip")))
+
+    def current_preset_name(self):
+        it = self.presets.currentItem()
+        return it.data(Qt.UserRole) if it else ""
+
+    def on_preset(self, row, keep_fields=False):
+        name = self.current_preset_name()
+        pr = self.all_presets().get(name)
+        if not pr:
+            return
+        ip, mask, creds = pr
+        self.l_creds.setText(f"Логин / пароль по умолчанию: {creds or '—'}")
+        if not keep_fields:
+            self.e_ant.setText(ip)
+            self.e_mask.setText(mask)
+            self.auto_my_ip()
+        self._params_edited()
+
+    def auto_my_ip(self):
+        try:
+            self.e_my.setText(host_ip_for(self.e_ant.text().strip(), self.e_mask.text().strip()))
+        except ValueError:
+            pass
+        self._params_edited()
+
+    def _params_edited(self, *_):
+        err = validate(self.e_ant.text().strip(), self.e_mask.text().strip(), self.e_my.text().strip())
+        bad = f"border-color: {P['err']};"
+        self.e_my.setStyleSheet(bad if err else "")
+        self.e_my.setToolTip(err or "Адрес ноутбука на время настройки — в той же подсети, что антенна")
+        self.update_tiles()
+
+    def add_preset(self):
+        name, ok = QInputDialog.getText(self, "Свой пресет", "Название антенны:")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        if name in BUILTIN_PRESETS:
+            QMessageBox.warning(self, "Свой пресет", "Такое имя уже есть среди встроенных.")
+            return
+        ip, mask = self.e_ant.text().strip(), self.e_mask.text().strip()
+        err = None
+        try:
+            ipaddress.IPv4Network(f"{ip}/{mask}", strict=False)
+            ipaddress.IPv4Address(ip)
+        except ValueError:
+            err = "Сначала впиши верные адрес антенны и маску в «Параметры»."
+        if err:
+            QMessageBox.warning(self, "Свой пресет", err)
+            return
+        creds, _ = QInputDialog.getText(self, "Свой пресет", "Логин / пароль (подсказка, можно пусто):")
+        self.cfg.setdefault("custom_presets", {})[name] = [ip, mask, (creds or "").strip()]
+        self.fill_presets(name)
+        self.log(f"✓ пресет «{name}» добавлен: {ip}")
+
+    def del_preset(self):
+        name = self.current_preset_name()
+        if name not in (self.cfg.get("custom_presets") or {}):
+            return
+        if QMessageBox.question(self, "Удалить пресет", f"Удалить пресет «{name}»?") != QMessageBox.Yes:
+            return
+        del self.cfg["custom_presets"][name]
+        self.cfg["antenna_ip"] = ""
+        self.fill_presets()
+        self.log(f"🗑 пресет «{name}» удалён")
+
+    # ── адаптеры ──
+    def refresh(self):
+        if not IS_WIN:
+            self.log("⚠ адаптеры читаются только в Windows.")
+            return
+
+        def job(w):
+            w.log("⏳ читаю сетевые адаптеры…")
+            data = list_adapters()
+            w.ui(lambda: self.set_adapters(data))
+        self.run_job("адаптеры", job)
+
+    def set_adapters(self, data):
+        want = self.cb_adapter.currentData() or self.cfg.get("adapter", "")
+        self.adapters = data
+        self.cb_adapter.blockSignals(True)
+        self.cb_adapter.clear()
+        for a in data:
+            state = "подключён" if a.get("Status") == "Up" else "нет кабеля" if a.get("Status") == "Disconnected" \
+                else (a.get("Status") or "?").lower()
+            kind = "Wi-Fi" if a["Wifi"] else "кабель"
+            self.cb_adapter.addItem(f"{a['Name']}  ·  {kind}, {state}", a["Name"])
+        self.cb_adapter.blockSignals(False)
+        idx = self.cb_adapter.findData(want)
+        self.cb_adapter.setCurrentIndex(idx if idx >= 0 else 0)
+        self.on_adapter()
+        self.log(f"✓ адаптеров: {len(data)}" if data else "⚠ физических адаптеров не найдено")
+
+    def adapter(self):
+        name = self.cb_adapter.currentData()
+        return next((a for a in self.adapters if a["Name"] == name), None)
+
+    def on_adapter(self, *_):
+        a = self.adapter()
+        if a:
+            dh = "DHCP" if a.get("Dhcp", "").lower() == "enabled" else "статический"
+            self.l_adapter.setText(f"{a.get('Desc', '')}\nСейчас: {a.get('IP') or 'нет адреса'}"
+                                   f"{'/' + str(a['Prefix']) if a.get('IP') else ''}, {dh}")
+        else:
+            self.l_adapter.setText("")
+        self.update_tiles()
+
+    def update_tiles(self):
+        a = self.adapter()
+        if a:
+            up = a.get("Status") == "Up"
+            self.t_adapter.set(a["Name"], ("Wi-Fi" if a["Wifi"] else "кабель") + (", подключён" if up else ", нет связи"),
+                               "ok" if up else "warn")
+            ip = a.get("IP") or "нет"
+            in_net = False
+            try:
+                net = ipaddress.IPv4Network(f"{self.e_ant.text().strip()}/{self.e_mask.text().strip()}", strict=False)
+                in_net = bool(a.get("IP")) and ipaddress.IPv4Address(a["IP"]) in net
+            except ValueError:
+                pass
+            self.t_myip.set(ip, "в подсети антенны" if in_net else "не в подсети антенны", "ok" if in_net else "warn")
+        else:
+            self.t_adapter.set("—", "F5 — прочитать адаптеры")
+            self.t_myip.set("—", "")
+        self.t_ant.set(self.e_ant.text().strip() or "—", self.current_preset_name())
+        r = self.last_check
+        if r is None:
+            self.t_resp.set("—", "F6 — проверить")
+        elif r["alive"]:
+            self.t_resp.set("отвечает", r.get("when", ""), "ok")
+        else:
+            self.t_resp.set("нет ответа", r.get("when", ""), "err")
+
+    # ── действия ──
+    def _need_admin(self):
+        if is_admin():
+            return False
+        if QMessageBox.question(self, "Права администратора",
+                                "Менять IP можно только с правами администратора.\nПерезапустить программу с правами?") \
+                == QMessageBox.Yes:
+            self.restart(admin=True)
+        return True
+
+    def set_static(self):
+        if self.worker.busy():
+            return
+        a = self.adapter()
+        ant, mask, me = self.e_ant.text().strip(), self.e_mask.text().strip(), self.e_my.text().strip()
+        if not a:
+            QMessageBox.warning(self, "Адаптер", "Выбери сетевой адаптер (F5 — обновить список).")
+            return
+        err = validate(ant, mask, me)
+        if err:
+            QMessageBox.warning(self, "Параметры", err)
+            return
+        if a["Wifi"] and QMessageBox.question(
+                self, "Wi-Fi", f"«{a['Name']}» — это Wi-Fi. Антенна обычно подключена кабелем, "
+                               "а на Wi-Fi пропадёт интернет. Всё равно ставить?") != QMessageBox.Yes:
+            return
+        if self._need_admin():
+            return
+        name = a["Name"]
+        timeout, retries, auto = self.f_timeout.value(), self.f_retries.value(), self.tg_auto.isChecked()
+        saved = dict(self.cfg.get("saved_net") or {})
+
+        def job(w):
+            if name not in saved:
+                w.log(f"⏳ запоминаю настройки «{name}»…")
+                snap = snapshot_adapter(name)
+                saved[name] = snap
+                w.ui(lambda: self._store_snapshot(name, snap))
+                w.log("✓ запомнил: " + ("DHCP" if snap["dhcp"] else f"{snap['ip']} / {snap['mask']}, шлюз "
+                                         f"{snap['gw'] or '—'}, DNS {', '.join(snap['dns']) or '—'}"))
+            else:
+                w.log(f"ℹ прежние настройки «{name}» уже запомнены — не перезаписываю.")
+            if ping(me, 1.0):
+                w.log(f"⚠ адрес {me} уже кто-то занимает в сети — возможен конфликт.")
+            ok, out = run_cmd(["netsh", "interface", "ipv4", "set", "address", f"name={name}",
+                               "static", me, mask])
+            if not ok:
+                w.log(f"✗ netsh: {out or 'ошибка'}")
+                w.ui(lambda: self.set_chip("● ошибка", "err"))
+                return
+            w.log(f"✓ на «{name}» стоит {me} / {mask}")
+            w.ui(lambda: self.set_chip("● IP задан", "ok"))
+            w.ui(self.refresh_quiet)
+            if auto:
+                self._check_loop(w, ant, timeout, retries)
+        self.run_job("ставлю IP", job)
+
+    def _store_snapshot(self, name, snap):
+        self.cfg.setdefault("saved_net", {})[name] = snap
+        self.save_if_changed()
+        self.update_saved_label()
+
+    def refresh_quiet(self):
+        """Перечитать адаптеры после текущей работы (без записи в журнал «читаю…»)."""
+        def later():
+            if self.worker.busy():
+                QTimer.singleShot(500, later)
+            else:
+                self.refresh()
+        QTimer.singleShot(500, later)
+
+    def _check_loop(self, w, ip, timeout, retries):
+        for i in range(retries + 1):
+            if w.stopped():
+                w.log("⏹ проверка остановлена")
+                return
+            res = check_antenna(ip, timeout)
+            if res["alive"] or i == retries:
+                w.ui(lambda r=res: self.show_check(ip, r))
+                return
+            w.log(f"… {ip} пока не отвечает, жду ({i + 1}/{retries})")
+            if w.sleep(2):
+                w.log("⏹ проверка остановлена")
+                return
 
     def check(self):
-        ip = self.current_antenna_ip()
-        self.log(f"Проверяю {ip} …")
-        self.set_chip("● проверка", self.color("accent"))
-        QApplication.processEvents()
-        code = check_http(ip)
-        if code is None:
-            self.set_chip("● нет ответа", self.color("err"))
-            self.log(f"{ip}: нет ответа. Проверь кабель, PoE и IP ноутбука.")
+        ip = self.e_ant.text().strip()
+        try:
+            ipaddress.IPv4Address(ip)
+        except ValueError:
+            QMessageBox.warning(self, "Проверка", "Неверный адрес антенны.")
+            return
+        timeout = self.f_timeout.value()
+
+        def job(w):
+            w.log(f"🔎 проверяю {ip}…")
+            self._check_loop(w, ip, timeout, 0)
+        self.run_job("проверка", job)
+
+    def show_check(self, ip, r):
+        r["when"] = time.strftime("%H:%M:%S")
+        r["ip"] = ip
+        self.last_check = r
+        marks = {"ping": (r["ping"], "есть" if r["ping"] else "нет"),
+                 "p80": (r["p80"], "открыт" if r["p80"] else "закрыт"),
+                 "p443": (r["p443"], "открыт" if r["p443"] else "закрыт")}
+        h = r.get("http")
+        if h:
+            code, loc = h
+            marks["http"] = (True, f"HTTP {code}" + (f" → {loc}" if loc else ""))
         else:
-            self.set_chip("● антенна отвечает", self.color("ok"))
-            self.log(f"{ip}: отвечает, HTTP {code}.")
+            marks["http"] = (False, "нет")
+        for k, (ok, text) in marks.items():
+            d, lab = self.res_rows[k]
+            d.set("ok" if ok else "err")
+            lab.setText(text)
+        if r["alive"]:
+            self.set_chip("● антенна отвечает", "ok")
+            self.log(f"✓ {ip} отвечает: пинг {marks['ping'][1]}, 80 {marks['p80'][1]}, 443 {marks['p443'][1]}"
+                     + (f", {marks['http'][1]}" if h else ""))
+            if not r["ping"]:
+                self.log("ℹ на пинг не отвечает, но порты открыты — это нормально для некоторых антенн.")
+        else:
+            self.set_chip("● нет ответа", "err")
+            self.log(f"✗ {ip}: нет ответа. Проверь кабель и PoE-блок, адаптер и IP ноутбука "
+                     "(должен быть в подсети антенны).")
+        self.update_tiles()
 
     def open_browser(self):
-        QDesktopServices.openUrl(QUrl(f"http://{self.current_antenna_ip()}"))
-        self.log(f"Открываю http://{self.current_antenna_ip()} …")
+        ip = self.e_ant.text().strip()
+        try:
+            ipaddress.IPv4Address(ip)
+        except ValueError:
+            QMessageBox.warning(self, "Браузер", "Неверный адрес антенны.")
+            return
+        r = self.last_check if self.last_check and self.last_check.get("ip") in (None, ip) else None
+        url = web_url(ip, r)
+        QDesktopServices.openUrl(QUrl(url))
+        self.log(f"🌐 открываю {url}")
+        if url.startswith("https"):
+            self.log("ℹ у антенны свой сертификат — браузер может предупредить, это ожидаемо.")
+
+    def restore(self):
+        if self.worker.busy():
+            return
+        a = self.adapter()
+        if not a:
+            QMessageBox.warning(self, "Адаптер", "Выбери сетевой адаптер.")
+            return
+        name = a["Name"]
+        snap = (self.cfg.get("saved_net") or {}).get(name)
+        what = ("DHCP (автоматически)" if not snap or snap.get("dhcp") or not snap.get("ip")
+                else f"{snap['ip']} / {snap['mask']}, шлюз {snap.get('gw') or '—'}")
+        extra = "" if snap else "\n\nПрежние настройки не запомнены — будет DHCP."
+        if QMessageBox.question(self, "Вернуть как было",
+                                f"Вернуть «{name}»: {what}?{extra}") != QMessageBox.Yes:
+            return
+        if self._need_admin():
+            return
+        cmds = restore_commands(name, snap or {"dhcp": True})
+
+        def job(w):
+            for c in cmds:
+                ok, out = run_cmd(c)
+                if not ok:
+                    w.log(f"✗ netsh: {out or 'ошибка'}")
+                    w.ui(lambda: self.set_chip("● ошибка", "err"))
+                    return
+            w.log(f"✓ «{name}» возвращён: {what}")
+            w.ui(lambda: self._forget(name))
+            w.ui(lambda: self.set_chip("● сеть возвращена", "ok"))
+            w.ui(self.refresh_quiet)
+        self.run_job("возвращаю сеть", job)
+
+    def _forget(self, name):
+        (self.cfg.get("saved_net") or {}).pop(name, None)
+        self.save_if_changed()
+        self.update_saved_label()
+
+    def forget_snapshots(self):
+        if not self.cfg.get("saved_net"):
+            return
+        if QMessageBox.question(self, "Забыть снимки",
+                                "Забыть прежние настройки всех адаптеров? Потом «Вернуть как было» поставит DHCP.") \
+                == QMessageBox.Yes:
+            self.cfg["saved_net"] = {}
+            self.update_saved_label()
+            self.log("🗑 снимки настроек забыты")
+
+    def update_saved_label(self):
+        s = self.cfg.get("saved_net") or {}
+        if not s:
+            self.l_saved.setText("Нет. Снимок делается сам перед первой сменой IP.")
+            return
+        lines = []
+        for n, v in s.items():
+            lines.append(f"{n}: " + ("DHCP" if v.get("dhcp") else
+                                     f"{v.get('ip')} / {v.get('mask')}, шлюз {v.get('gw') or '—'}, "
+                                     f"DNS {', '.join(v.get('dns') or []) or '—'}"))
+        self.l_saved.setText("\n".join(lines))
+
+    # ── обновление ──
+    def check_update(self, install=False, quiet=False):
+        if FROZEN:
+            if not quiet:
+                QMessageBox.information(self, "Обновление", "Это EXE-сборка: скачай новую сборку из release/ на GitHub.")
+            return
+        self._sync_cfg()
+        repo, branch, token = self.cfg["github_repo"], self.cfg["github_branch"], self.cfg["github_token"]
+        if "/" not in repo:
+            QMessageBox.warning(self, "Обновление", "Впиши репозиторий как владелец/имя.")
+            return
+
+        if quiet and self.worker.busy():
+            QTimer.singleShot(2000, lambda: self.check_update(install, quiet))
+            return
+
+        def job(w):
+            if not quiet:
+                w.log(f"🔎 смотрю версию на GitHub ({repo}, {branch})…")
+            try:
+                rv = remote_version(repo, branch, token)
+            except UpdateError as e:
+                if not quiet or e.permanent:
+                    w.log(f"✗ {e}")
+                return
+            newer = ver_tuple(rv) > ver_tuple(VERSION)
+            w.ui(lambda: self.l_ver.setText(f"Установлена: v{VERSION}   ·   на GitHub: v{rv}"
+                                            + ("   ·   есть новая" if newer else "   ·   последняя")))
+            if not newer:
+                if not quiet:
+                    w.log(f"✓ у тебя последняя версия (v{VERSION})")
+                return
+            w.log(f"⬆ на GitHub есть v{rv}")
+            if not install:
+                w.ui(lambda: self.set_status(f"есть обновление v{rv} — вкладка «Обновление»"))
+                return
+            w.blocking_close = True
+            n = install_update(repo, branch, token, APP_ROOT, VERSION, w.log, w.stopped)
+            w.log(f"✓ обновлено файлов: {n}. Нужен перезапуск.")
+            w.ui(lambda: self.offer_restart(rv))
+        self.run_job("обновление", job)
+
+    def offer_restart(self, rv):
+        if QMessageBox.question(self, "Обновление", f"Установлена v{rv}. Перезапустить программу?") \
+                == QMessageBox.Yes:
+            self.restart()
+
+    def restart(self, admin=False):
+        if self.worker.busy():
+            QMessageBox.information(self, "Перезапуск", "Дождись конца работы.")
+            return
+        self.save_now()
+        if admin and IS_WIN:
+            if not relaunch_as_admin():
+                self.log("⚠ права администратора не получены")
+                return
+        else:
+            if FROZEN:
+                QProcess.startDetached(sys.executable, ["--no-admin"])
+            else:
+                QProcess.startDetached(sys.executable, [os.path.abspath(__file__), "--no-admin"])
+        self._force_close = True
+        QApplication.instance().quit()
+
+    # ── закрытие ──
+    def closeEvent(self, e):
+        if getattr(self, "_force_close", False):
+            e.accept()
+            return
+        if self.worker.busy():
+            if self.worker.blocking_close:
+                QMessageBox.information(self, "Закрытие", "Идёт установка обновления — дождись конца.")
+                e.ignore()
+                return
+            if QMessageBox.question(self, "Закрытие", f"Идёт «{self.worker.name}». Остановить и закрыть?") \
+                    != QMessageBox.Yes:
+                e.ignore()
+                return
+            self.worker.stop_flag.set()
+            self._closing = True
+            self.set_chip("● останавливаю…", "warn")
+            e.ignore()
+            return
+        self.save_now()
+        e.accept()
+
+# ───────────────────────── selftest ─────────────────────────
+
+
+LEAK_PATTERNS = ("github_pat_", "ghp_", "gho_", "ghs_")
+
+
+def leak_scan(root):
+    hits = []
+    for p in Path(root).rglob("*"):
+        if not p.is_file() or p.name in ("config.json", "config.json.bak") or ".git" in p.parts \
+                or "_backup" in p.parts or p.suffix in (".zip", ".pyc"):
+            continue
+        try:
+            t = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        for pat in LEAK_PATTERNS:
+            i = t.find(pat)
+            while i >= 0:
+                tail = t[i + len(pat): i + len(pat) + 20]
+                if len(tail) >= 20 and all(ch.isalnum() or ch == "_" for ch in tail):
+                    hits.append(f"{p.name}: {pat}…")
+                i = t.find(pat, i + 1)
+    return hits
+
+
+def selftest():
+    res = []
+
+    def ok(name, cond):
+        res.append(("✓" if cond else "✗") + " " + name)
+        return cond
+    ok("host_ip /24", host_ip_for("192.168.10.1") == "192.168.10.50")
+    ok("host_ip антенна .50", host_ip_for("192.168.1.50") == "192.168.1.51")
+    ok("host_ip /16", host_ip_for("10.0.0.1", "255.255.0.0") == "10.0.0.50")
+    ok("host_ip /29", host_ip_for("192.168.1.1", "255.255.255.248") == "192.168.1.2")
+    ok("validate ok", validate("192.168.1.20", "255.255.255.0", "192.168.1.50") is None)
+    ok("validate чужая подсеть", validate("192.168.1.20", "255.255.255.0", "192.168.2.50") is not None)
+    ok("validate совпадает", validate("192.168.1.20", "255.255.255.0", "192.168.1.20") is not None)
+    ok("validate маска", validate("192.168.1.20", "255.0.255.0", "192.168.1.50") is not None)
+    ok("validate broadcast", validate("192.168.1.20", "255.255.255.0", "192.168.1.255") is not None)
+    ok("ver_tuple", ver_tuple("v0.10.1") > ver_tuple("0.9.9") and ver_tuple("1.0") == (1, 0, 0))
+    ok("decode cp866", decode_out("Ошибка".encode("cp866")) == "Ошибка")
+    ok("restore dhcp", restore_commands("Ethernet 2", {"dhcp": True})[0][-1] == "source=dhcp")
+    rc = restore_commands("E", {"dhcp": False, "ip": "10.0.0.5", "mask": "255.255.255.0",
+                                "gw": "10.0.0.1", "dns": ["1.1.1.1", "8.8.8.8"]})
+    ok("restore static", rc[0][-3:] == ["10.0.0.5", "255.255.255.0", "10.0.0.1"] and len(rc) == 3)
+    with tempfile.TemporaryDirectory() as d:
+        cp = Path(d) / "config.json"
+        save_config({"a": 1}, cp)
+        save_config({"a": 2}, cp)
+        cp.write_text("{битый", encoding="utf-8")
+        c, w = load_config(cp)
+        ok("config: битый → .bak", c.get("a") == 1 and w)
+        (Path(d) / "config.json.bak").write_text("{", encoding="utf-8")
+        c, w = load_config(cp)
+        ok("config: оба битые → не писать", not w)
+        src = Path(d) / "src"
+        for rel in ("antenna_setup.pyw", "VERSION", "release/x.zip", "modules/m.pyw", "config.json", "tools/t"):
+            (src / rel).parent.mkdir(parents=True, exist_ok=True)
+            (src / rel).write_text("x")
+        plan = {r.as_posix() for r in update_plan(src)}
+        ok("план обновления не трогает свои файлы", plan == {"antenna_setup.pyw", "VERSION"})
+    ok("утечек токенов нет", not leak_scan(APP_ROOT))
+    if not IS_WIN:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication(sys.argv)
+    ok("русский перевод Qt", install_ru(app))
+    app.setStyle("Fusion")
+    apply_theme(app, "dark")
+    f = _IntField(1, 15, 3, "с")
+    f.stepBy(20)
+    f.edit.setText("abc")
+    f._commit()
+    ok("_IntField: предел и откат", f.value() == 15 and f.edit.text() == "15 с")
+    cfg = dict(DEFAULT_CONFIG)
+    w = MainWindow(cfg, cfg_writable=False)
+    ok("окно создаётся", w.presets.count() == len(BUILTIN_PRESETS) and w.e_my.text() == "192.168.10.50")
+    w.set_theme("light")
+    w.set_theme("dark")
+    ok("смена темы", w.btn_theme.text() == "☀")
+    text = "\n".join(res)
+    fail = any(r.startswith("✗") for r in res)
+    text += f"\n\nselftest v{VERSION}: {'ОШИБКИ' if fail else 'всё в порядке'}"
+    print(text)
+    try:
+        (APP_ROOT / "selftest.txt").write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+    return 1 if fail else 0
+
+# ───────────────────────── запуск ─────────────────────────
+
+
+def install_ru(app):
+    """Русские кнопки стандартных диалогов (Да/Нет, Сохранить…)."""
+    path = QLibraryInfo.path(QLibraryInfo.TranslationsPath)
+    app._tr = []
+    for name in ("qtbase_ru", "qt_ru"):
+        t = QTranslator(app)
+        if t.load(name, path):
+            app.installTranslator(t)
+            app._tr.append(t)
+    return bool(app._tr)
 
 
 def main():
-    if sys.platform == "win32":
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
+    if IS_WIN:
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("AntennaSetup.App")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
         except Exception:
             pass
+    cfg, writable = load_config()
+    if IS_WIN and cfg.get("ask_admin", True) and "--no-admin" not in sys.argv and not is_admin():
+        if relaunch_as_admin():
+            sys.exit(0)
+    QApplication.setAttribute(Qt.AA_DontUseNativeDialogs, True)
     app = QApplication(sys.argv)
+    install_ru(app)
     app.setStyle("Fusion")
-    apply_theme(app, DARK)
-    win = Main()
+    app.setWindowIcon(app_icon())
+    apply_theme(app, cfg.get("theme", "dark"))
+    win = MainWindow(cfg, writable)
+    flt = AppFilter(win)
+    app.installEventFilter(flt)
+    win.set_theme(cfg.get("theme", "dark"))
     win.show()
+    if not is_admin():
+        win.log("⚠ нет прав администратора — смена IP недоступна (⋯ → Перезапуск или ответь «да» при запуске).")
+    win.set_busy(False)
+    QTimer.singleShot(200, win.refresh)
+    if cfg.get("check_updates", True):
+        QTimer.singleShot(3000, lambda: win.check_update(install=False, quiet=True))
     sys.exit(app.exec())
 
 
