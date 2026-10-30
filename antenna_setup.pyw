@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.5.3
+antenna_setup.pyw  v0.6.0
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,11 @@ antenna_setup.pyw  v0.5.3
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.6.0: «📶 Wi-Fi антенны» — как с телефона: программа ищет Wi-Fi вокруг, отмечает сеть самой антенны
+          (по её MAC из поиска по MAC, по марке BSSID и имени), подключает к ней Wi-Fi ноутбука (пароль —
+          во временном профиле), берёт адрес антенны из шлюза (например 192.168.10.1), проверяет;
+          «Вернуть как было» и выход возвращают домашний Wi-Fi. Причина: у антенны веб был только на её
+          Wi-Fi, а кабель — WAN с закрытым веб.
   v0.5.3: раздача адреса антенне — через Npcap (запросы ловим и ответы шлём прямо в кабель; раньше
           брандмауэр Windows не пропускал запросы к программе); поиск по MAC больше не останавливается
           через 10 с (главный порт антенны объявляется позже); адрес антенны в подсети Wi-Fi
@@ -100,7 +105,7 @@ antenna_setup.pyw  v0.5.3
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.5.3"
+VERSION = "0.6.0"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -213,7 +218,7 @@ from PySide6.QtGui import (QColor, QDesktopServices, QFont, QIcon,  # noqa: E402
                            QPixmap, QShortcut, QTextCursor)
 from PySide6.QtWidgets import (QAbstractButton, QApplication, QButtonGroup,  # noqa: E402
                                QComboBox, QFileDialog, QFrame, QGridLayout,
-                               QHBoxLayout, QLabel, QLineEdit,
+                               QHBoxLayout, QInputDialog, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QMenu, QMessageBox,
                                QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
                                QStackedWidget, QTextEdit, QVBoxLayout,
@@ -1244,6 +1249,91 @@ def sniff_l2(guid, seconds, on_frame, stopped=lambda: False):
         pc.pcap_close(h)
 
 
+# ── Wi-Fi антенны: найти её сеть и подключить к ней ноутбук (как телефон) ──
+ANT_SSID_HINTS = ("comfast", "cf-", "tp-link", "tplink", "pharos", "ubnt", "airos", "mikrotik", "cpe", "wisp")
+
+
+def wifi_scan():
+    """Wi-Fi вокруг: [{ssid, bssid, signal, auth, channel}] — по одной строке на BSSID."""
+    import re
+    run_cmd(["netsh", "wlan", "show", "networks", "mode=bssid"], timeout=20)   # первый вызов будит поиск
+    time.sleep(3)
+    ok, out = run_cmd(["netsh", "wlan", "show", "networks", "mode=bssid"], timeout=20)
+    nets, cur, auth = [], None, ""
+    for line in out.splitlines():
+        m = re.match(r"^SSID \d+\s*:\s*(.*)$", line.strip())
+        if m:
+            cur, auth = m.group(1).strip(), ""
+            continue
+        if cur is None:
+            continue
+        low = line.lower()
+        if ("authentication" in low or "подлинност" in low) and ":" in line:
+            auth = line.split(":", 1)[1].strip()
+            continue
+        m = re.match(r"^\s*BSSID \d+\s*:\s*([0-9a-fA-F:]{17})", line)
+        if m:
+            nets.append({"ssid": cur, "bssid": m.group(1).upper(), "signal": 0, "auth": auth, "channel": ""})
+            continue
+        if nets and nets[-1]["ssid"] == cur:
+            m = re.search(r":\s*(\d+)%", line)
+            if m:
+                nets[-1]["signal"] = int(m.group(1))
+            elif ("channel" in low or "канал" in low) and ":" in line:
+                nets[-1]["channel"] = line.split(":", 1)[1].strip()
+    return nets
+
+
+def wifi_is_open(auth):
+    a = (auth or "").lower()
+    return a.startswith("open") or "открыт" in a or a in ("", "none")
+
+
+def wifi_profile_xml(ssid, key=""):
+    from xml.sax.saxutils import escape
+    sec = ("<authEncryption><authentication>WPA2PSK</authentication><encryption>AES</encryption>"
+           "<useOneX>false</useOneX></authEncryption><sharedKey><keyType>passPhrase</keyType>"
+           f"<protected>false</protected><keyMaterial>{escape(key)}</keyMaterial></sharedKey>") if key else \
+        ("<authEncryption><authentication>open</authentication><encryption>none</encryption>"
+         "<useOneX>false</useOneX></authEncryption>")
+    return ('<?xml version="1.0"?><WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">'
+            f"<name>{escape(ssid)}</name><SSIDConfig><SSID><name>{escape(ssid)}</name></SSID></SSIDConfig>"
+            "<connectionType>ESS</connectionType><connectionMode>manual</connectionMode>"
+            f"<MSM><security>{sec}</security></MSM></WLANProfile>")
+
+
+def wifi_current_profile(iface):
+    ok, out = run_cmd(["netsh", "wlan", "show", "interfaces"], timeout=15)
+    name, prof = "", ""
+    for line in out.splitlines():
+        if ":" not in line:
+            continue
+        k, v = (x.strip() for x in line.split(":", 1))
+        kl = k.lower()
+        if kl in ("name", "имя"):
+            name = v
+        if kl in ("profile", "профиль") and (not iface or name == iface):
+            prof = v
+    return prof
+
+
+def wifi_connect(iface, ssid, key=""):
+    """Подключить Wi-Fi ноутбука к сети антенны. Профиль с паролем — временный файл, сразу удаляется."""
+    tmp = Path(tempfile.gettempdir()) / "antenna_wlan.xml"
+    try:
+        tmp.write_text(wifi_profile_xml(ssid, key), encoding="utf-8")
+        ok, out = run_cmd(["netsh", "wlan", "add", "profile", f"filename={tmp}", f"interface={iface}",
+                           "user=current"], timeout=20)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    if not ok:
+        return False, out
+    return run_cmd(["netsh", "wlan", "connect", f"name={ssid}", f"ssid={ssid}", f"interface={iface}"], timeout=20)
+
+
 DHCP_NET = "192.168.77"   # подсеть, которую программа раздаёт антенне по кабелю (ноутбук .1, антенна .2)
 
 
@@ -1497,7 +1587,7 @@ def relaunch_as_admin():
 
 
 # работы, которые только читают (сеть не меняют): «Стоп» бросает их сразу, поток доживает сам и молча
-ABANDONABLE = {"адаптеры", "поиск антенны", "проверка", "чтение настроек", "отправка журнала",
+ABANDONABLE = {"поиск Wi-Fi антенны", "адаптеры", "поиск антенны", "проверка", "чтение настроек", "отправка журнала",
                "маршрут через кабель", "поиск по MAC"}
 
 
@@ -2393,6 +2483,10 @@ class MainWindow(QWidget):
         self.btn_mac.setToolTip("Как Winbox: слушать кабель (Npcap) — антенна сама скажет свой IP и MAC в любой\n"
                                 "подсети. Ни одного запроса к её веб. Перезагрузите антенну, пока слушаем")
         self.btn_mac.clicked.connect(self.find_by_mac)
+        self.btn_wifi = QPushButton("📶 Wi-Fi антенны")
+        self.btn_wifi.setToolTip("Как с телефона: найти Wi-Fi самой антенны, подключить к нему ноутбук и зайти в её веб.\n"
+                                 "Пока подключены — домашнего интернета нет; «Вернуть как было» вернёт Wi-Fi")
+        self.btn_wifi.clicked.connect(self.antenna_wifi)
         self.btn_pc = QPushButton("🛠 Настроить ПК")
         self.btn_pc.setToolTip("Изолировать: интернет — только Wi-Fi, кабель (RJ45) — только антенны;\n"
                                "домашняя сеть Wi-Fi закрыта для поиска и проверок")
@@ -2400,8 +2494,9 @@ class MainWindow(QWidget):
         self.btn_find.setObjectName("")
         self.btn_find.setText("🔎 Поиск перебором")
         self.btn_find.setToolTip("Старый способ: перебор подсетей (меняет адрес кабеля). Лучше — «👂 Найти по MAC»")
-        for i, b in enumerate((self.btn_mac, self.btn_read, self.btn_set, self.btn_check, self.btn_open,
-                               self.btn_restore, self.btn_pc, self.btn_report, self.btn_stop, self.btn_find)):
+        for i, b in enumerate((self.btn_mac, self.btn_wifi, self.btn_read, self.btn_open, self.btn_check,
+                               self.btn_set, self.btn_restore, self.btn_pc, self.btn_report, self.btn_stop,
+                               self.btn_find)):
             bg.addWidget(b, i // 4, i % 4)       # 4 в ряд — ниже на экране ноутбука
         cl.addLayout(bg)
         res = QGridLayout()
@@ -2934,7 +3029,7 @@ class MainWindow(QWidget):
         for b in (self.btn_set, self.btn_restore):
             b.setToolTip(b.toolTip() if admin else "Нужны права администратора (перезапусти программу)")
         for b in (self.btn_find, self.btn_check, self.btn_refresh, self.btn_read, self.btn_report, self.btn_pc,
-                  self.btn_mac):
+                  self.btn_mac, self.btn_wifi):
             b.setEnabled(not busy)
 
     def ask_stop(self):
@@ -3345,6 +3440,11 @@ class MainWindow(QWidget):
             heard[ip] = f"MAC {mac}{' · ' + vend if vend else ''} · {how}{' · ' + what if what else ''}{clash}"
             if what.startswith("спрашивает "):
                 asks[ip] = what.split()[-1]
+        macs = list(self.cfg.get("ant_macs") or [])
+        for (mac, _ip) in seen:
+            if mac_vendor(mac) and mac not in macs:
+                macs.append(mac)
+        self.cfg["ant_macs"] = macs[-20:]
         if found:
             first = next(iter(found))
             self.show_found(found, "255.255.255.0", "", "кабеле (по MAC)", heard)
@@ -3405,6 +3505,114 @@ class MainWindow(QWidget):
                 w.ui(self.refresh_quiet)
             self.run_job("антенна в сети Wi-Fi", job)
         ask()
+
+    def antenna_wifi(self):
+        """Как с телефона: подключить ноутбук к Wi-Fi антенны и зайти в её веб."""
+        if not IS_WIN:
+            QMessageBox.information(self, "Wi-Fi антенны", "Работает только в Windows.")
+            return
+        wifi = next((x for x in self.adapters if x.get("Wifi")), None)
+        if not wifi:
+            QMessageBox.warning(self, "Wi-Fi антенны", "Wi-Fi-адаптер не найден (F5 — обновить список).")
+            return
+        known = list(self.cfg.get("ant_macs") or [])
+
+        def job(w):
+            w.log("📶 ищу Wi-Fi-сети вокруг…")
+            nets = wifi_scan()
+            w.ui(lambda: self._pick_antenna_wifi(wifi["Name"], nets, known))
+        self.run_job("поиск Wi-Fi антенны", job)
+
+    def _pick_antenna_wifi(self, iface, nets, known):
+        def score(n):
+            vend = mac_vendor(n["bssid"])
+            mine = any(same_device(n["bssid"], m) for m in known)
+            hint = any(h in n["ssid"].lower() for h in ANT_SSID_HINTS)
+            return (not mine, not (vend or hint), -n["signal"])
+        nets = sorted(nets, key=score)
+        if not nets:
+            self.log("✗ Wi-Fi-сетей не видно — включён ли Wi-Fi на ноутбуке?")
+            return
+        items = []
+        for n in nets:
+            vend = mac_vendor(n["bssid"])
+            star = "★ " if score(n)[:2] != (True, True) else ""
+            items.append(f"{star}{n['ssid'] or '(скрытая)'} · {n['signal']}% · {vend or 'BSSID ' + n['bssid']}"
+                         f" · {'открытая' if wifi_is_open(n['auth']) else n['auth'] or 'с паролем'}")
+        self.log("ℹ сети вокруг: " + "; ".join(items[:8]))
+        choice, ok = QInputDialog.getItem(self, "Wi-Fi антенны",
+                                          "Выберите сеть самой антенны (★ — похожа на антенну по MAC / имени):",
+                                          items, 0, False)
+        if not ok:
+            return
+        n = nets[items.index(choice)]
+        key = ""
+        if not wifi_is_open(n["auth"]):
+            key, ok = QInputDialog.getText(self, "Wi-Fi антенны", f"Пароль сети «{n['ssid']}»\n"
+                                           "(после сброса часто без пароля или на наклейке антенны):",
+                                           QLineEdit.Password)
+            if not ok:
+                return
+        if QMessageBox.question(self, "Wi-Fi антенны",
+                                f"Подключить Wi-Fi ноутбука к «{n['ssid']}»?\n\nПока подключены, домашнего "
+                                "интернета не будет. «↩ Вернуть как было» (и выход из программы) подключит "
+                                "домашний Wi-Fi обратно.") != QMessageBox.Yes:
+            return
+        if self._need_admin():
+            return
+        ssid = n["ssid"]
+
+        def job(w):
+            home = wifi_current_profile(iface)
+            if home and home != ssid:
+                w.ui(lambda: self.cfg.__setitem__("wifi_home", [iface, home]))
+                w.log(f"ℹ домашний Wi-Fi запомнил: «{home}»")
+            w.ui(lambda: self.cfg.__setitem__("wifi_ant", [iface, ssid]))
+            ok, out = wifi_connect(iface, ssid, key)
+            if not ok:
+                w.log(f"✗ не подключился к «{ssid}»: {out[:200]}")
+                return
+            w.log(f"⏳ подключаюсь к «{ssid}», жду адрес от антенны…")
+            got = None
+            for _ in range(20):
+                if w.sleep(1.5):
+                    return
+                data = list_adapters()
+                x = next((a for a in data if a["Name"] == iface), None)
+                if x and x.get("IP") and not x["IP"].startswith("169.254.") and x.get("Gw"):
+                    got = (data, x)
+                    break
+            if not got:
+                w.log("✗ адрес от антенны не пришёл (DHCP выключен?). Посмотрите адрес на телефоне "
+                      "и впишите вручную, или «Найти по MAC».")
+                return
+            data, x = got
+            ant, me = x["Gw"], x["IP"]
+            w.log(f"✓ ноутбук в сети антенны: {me}, антенна — {ant}")
+            w.ui(lambda: self.set_adapters(data))
+            w.ui(lambda: self.cb_adapter.setCurrentIndex(self.cb_adapter.findData(iface)))
+            w.ui(lambda: self.show_found({ant: []}, "255.255.255.0", me, f"Wi-Fi «{ssid}»",
+                                         {ant: f"шлюз Wi-Fi «{ssid}» — это антенна"}))
+            res = check_antenna(ant, 5, me)
+            w.ui(lambda: self.show_check(ant, res))
+            w.log("ℹ дальше «🌐 Открыть веб» или «📖 Прочитать настройки»")
+        self.run_job("подключение к Wi-Fi антенны", job)
+
+    def wifi_home_back(self, w=None):
+        """Вернуть Wi-Fi ноутбука в домашнюю сеть и убрать временный профиль антенны."""
+        ant, home = self.cfg.get("wifi_ant"), self.cfg.get("wifi_home")
+        log = w.log if w else self.log
+        if ant:
+            run_cmd(["netsh", "wlan", "disconnect", f"interface={ant[0]}"], timeout=15)
+            run_cmd(["netsh", "wlan", "delete", "profile", f"name={ant[1]}", f"interface={ant[0]}"], timeout=15)
+        if home:
+            ok, out = run_cmd(["netsh", "wlan", "connect", f"name={home[1]}", f"interface={home[0]}"], timeout=20)
+            log(f"✓ Wi-Fi снова в домашней сети «{home[1]}»" if ok else f"⚠ домашний Wi-Fi: {out[:150]}")
+        if w:
+            w.ui(lambda: (self.cfg.pop("wifi_ant", None), self.cfg.pop("wifi_home", None)))
+        else:
+            self.cfg.pop("wifi_ant", None)
+            self.cfg.pop("wifi_home", None)
 
     def enable_wifi_back(self, w=None):
         for n in list(self.cfg.get("wifi_off") or []):
@@ -3497,6 +3705,8 @@ class MainWindow(QWidget):
 
     def _remember_home(self):
         """Подсети адаптеров с интернетом (Wi-Fi со шлюзом) — «домашние»: туда программа не лезет никогда."""
+        if self.cfg.get("wifi_ant"):          # Wi-Fi сейчас подключён к антенне — это не дом
+            return
         sel = self.cb_adapter.currentData()
         home = list(self.cfg.get("home_nets") or [])
         for x in self.adapters:
@@ -3917,7 +4127,11 @@ class MainWindow(QWidget):
             return
         cmds = restore_commands(name, snap or {"dhcp": True})
 
+        wifi_ant = bool(self.cfg.get("wifi_ant"))
+
         def job(w):
+            if wifi_ant:
+                self.wifi_home_back(w)
             for c in cmds:
                 ok, out = run_cmd(c)
                 if not ok:
@@ -4192,6 +4406,8 @@ class MainWindow(QWidget):
                 self.unpin_all()
             if IS_WIN and self.cfg.get("wifi_off"):
                 self.enable_wifi_back()
+            if IS_WIN and self.cfg.get("wifi_ant"):
+                self.wifi_home_back()
             self.save_now()
             e.accept()
             return
@@ -4199,6 +4415,8 @@ class MainWindow(QWidget):
             self.unpin_all()
         if IS_WIN and self.cfg.get("wifi_off"):
             self.enable_wifi_back()
+        if IS_WIN and self.cfg.get("wifi_ant"):
+            self.wifi_home_back()
         self.save_now()
         e.accept()
 
@@ -4276,6 +4494,21 @@ def selftest():
     out, kind = dhcp_frame_reply(fr, "20:89:84:9d:c8:06", "192.168.77.1", "40:A5:EF:77:0F:61", "192.168.77.2")
     ok("DHCP через кабель: кадр-ответ", kind == "OFFER" and out[:6] == b"\xff" * 6 and out[12:14] == b"\x08\x00"
        and _csum(out[14:34]) == 0 and out[36:38] == b"\x00\x44")
+    _ns = ("SSID 1 : COMFAST_0F60\n    Тип сети                : Инфраструктура\n    Проверка подлинности    : Открытая\n"
+           "    Шифрование              : Нет\n    BSSID 1                 : 40:a5:ef:77:0f:60\n"
+           "         Сигнал             : 92%\n         Канал              : 6\n")
+    _orig = run_cmd
+    globals()["run_cmd"] = lambda *a, **k: (True, _ns)
+    _tsl = time.sleep
+    time.sleep = lambda *_a: None
+    try:
+        nets = wifi_scan()
+    finally:
+        globals()["run_cmd"] = _orig
+        time.sleep = _tsl
+    ok("Wi-Fi: сеть антенны из netsh", bool(nets) and nets[0]["ssid"] == "COMFAST_0F60" and nets[0]["signal"] == 92
+       and wifi_is_open(nets[0]["auth"]) and mac_vendor(nets[0]["bssid"]) == "Comfast")
+    ok("Wi-Fi: профиль с паролем", "<keyMaterial>a&amp;b</keyMaterial>" in wifi_profile_xml("X", "a&b"))
     ok("поиск находит узел", list(scan_subnet(ipaddress.IPv4Network("127.0.0.0/30"), ports=(port,))) == ["127.0.0.1"])
     srv.close()
     try:
