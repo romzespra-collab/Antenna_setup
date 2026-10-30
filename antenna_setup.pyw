@@ -9,7 +9,8 @@ antenna_setup.pyw  v0.2.1
 
 Журнал изменений:
   v0.2.1: в меню ⋯ пункт «Обновить программу с GitHub»; «Обновить» → «Обновить адаптеры»;
-          список пресетов — «Модели антенн», выбранная модель не заливается синим.
+          пресеты убраны: вместо них «🔎 Найти антенну» (F7) — поиск на кабеле в своей
+          подсети и в заводских (временный IP, потом сеть возвращается), список найденных.
   v0.2.0: исправлен вылет при запуске (не было log_menu); проверка в фоне,
           окно не зависает; редирект антенны на https больше не даёт
           «нет ответа»; пинг считается только по TTL=; маска пресета
@@ -110,19 +111,17 @@ from PySide6.QtGui import (QColor, QDesktopServices, QFont, QIcon,  # noqa: E402
                            QPixmap, QShortcut, QTextCursor)
 from PySide6.QtWidgets import (QAbstractButton, QApplication, QButtonGroup,  # noqa: E402
                                QComboBox, QFileDialog, QFrame, QGridLayout,
-                               QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+                               QHBoxLayout, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QMenu, QMessageBox,
                                QPlainTextEdit, QProgressBar, QPushButton,
                                QStackedWidget, QTextEdit, QVBoxLayout,
                                QWidget)
 
-# ───────────────────────── пресеты и тема ─────────────────────────
-# имя: (адрес антенны, маска, логин / пароль по умолчанию)
-BUILTIN_PRESETS = {
-    "Comfast CF-E314N": ("192.168.10.1", "255.255.255.0", "admin / admin"),
-    "TP-Link TL-WA5210G": ("192.168.1.254", "255.255.255.0", "admin / admin"),
-    "Ubiquiti NanoStation M5": ("192.168.1.20", "255.255.255.0", "ubnt / ubnt"),
-}
+# ───────────────────────── поиск и тема ─────────────────────────
+# заводские подсети антенн и роутеров — по ним ищем, если в своей подсети пусто
+SEARCH_SUBNETS = "192.168.1, 192.168.0, 192.168.10, 192.168.88, 192.168.2, 192.168.100, 192.168.20, 192.168.8"
+SEARCH_HOST = 247  # временный адрес ноутбука при поиске
+SEARCH_PORTS = (80, 443)
 MY_HOST_OFFSET = 50  # адрес ноутбука = номер сети + 50
 
 THEMES = {
@@ -141,7 +140,7 @@ PAGE_COLORS = {"antenna": ("#4f8cff", "#2f6fe4"), "settings": ("#b07cff", "#7c4a
 P = dict(THEMES["dark"])  # текущая палитра
 
 DEFAULT_CONFIG = {
-    "theme": "dark", "preset": "Comfast CF-E314N", "custom_presets": {},
+    "theme": "dark", "search_subnets": SEARCH_SUBNETS,
     "antenna_ip": "", "mask": "", "my_ip": "", "adapter": "",
     "check_timeout": 3, "check_retries": 6, "auto_check": True, "ask_admin": True,
     "check_updates": True, "github_repo": GITHUB_REPO, "github_branch": GITHUB_BRANCH,
@@ -356,9 +355,10 @@ def ping(ip, timeout_s=1.0):
     return ok and "ttl=" in out.lower()
 
 
-def tcp_open(ip, port, timeout=2.0):
+def tcp_open(ip, port, timeout=2.0, src=None):
     try:
-        with socket.create_connection((ip, port), timeout=timeout):
+        with socket.create_connection((ip, port), timeout=timeout,
+                                      source_address=(src, 0) if src else None):
             return True
     except OSError:
         return False
@@ -384,6 +384,41 @@ def check_antenna(ip, timeout=3.0):
         res["http"] = http_status(ip, timeout)
     res["alive"] = res["ping"] or res["p80"] or res["p443"]
     return res
+
+
+def parse_subnets(text):
+    """«192.168.1, 10.0.0» → [IPv4Network /24]. Кривое пропускаем."""
+    out = []
+    for part in str(text).replace(";", ",").split(","):
+        part = part.strip().rstrip(".")
+        if not part:
+            continue
+        if part.count(".") == 2:
+            part += ".0"
+        try:
+            net = ipaddress.IPv4Network(f"{part}/24", strict=False)
+        except ValueError:
+            continue
+        if net not in out:
+            out.append(net)
+    return out
+
+
+def scan_subnet(net, skip=(), src=None, ports=SEARCH_PORTS, timeout=0.5, stopped=lambda: False):
+    """Ищет в подсети узлы с открытыми портами (веб антенны). {ip: [порты]} по возрастанию адреса."""
+    from concurrent.futures import ThreadPoolExecutor
+    hosts = [str(h) for h in net.hosts() if str(h) not in skip]
+
+    def probe(ip):
+        if stopped():
+            return ip, []
+        return ip, [p for p in ports if tcp_open(ip, p, timeout, src)]
+    found = {}
+    with ThreadPoolExecutor(64) as ex:
+        for ip, opened in ex.map(probe, hosts):
+            if opened:
+                found[ip] = opened
+    return dict(sorted(found.items(), key=lambda kv: ipaddress.IPv4Address(kv[0])))
 
 
 def web_url(ip, res=None):
@@ -1255,12 +1290,14 @@ class MainWindow(QWidget):
 
         left = QVBoxLayout()
         left.setSpacing(10)
-        c, cl = _card("Модели антенн (пресеты)")
-        self.presets = QListWidget()
-        self.presets.setToolTip("Это список моделей с заводскими адресами, а не найденные антенны.\n"
-                                "Выбери свою модель. Правый клик — добавить свой пресет / удалить")
-        self.presets.currentRowChanged.connect(self.on_preset)
-        cl.addWidget(self.presets)
+        c, cl = _card("Найденные антенны")
+        self.found = QListWidget()
+        self.found.setToolTip("Что нашёл поиск на кабеле. Клик — выбрать. Правый клик — меню")
+        self.found.currentRowChanged.connect(self.on_found)
+        cl.addWidget(self.found, 1)
+        self.l_found = _lab("Пока пусто — нажми «🔎 Найти антенну».\nИли впиши адрес антенны ниже.", "hint")
+        self.l_found.setWordWrap(True)
+        cl.addWidget(self.l_found)
         c.setFixedWidth(300)
         left.addWidget(c, 1)
 
@@ -1278,8 +1315,6 @@ class MainWindow(QWidget):
         self.btn_auto.setStyleSheet("min-width: 44px; max-width: 44px;")
         self.btn_auto.setToolTip("Посчитать IP ноутбука по адресу антенны и маске")
         self.btn_auto.clicked.connect(self.auto_my_ip)
-        self.l_creds = _lab("", "hint")
-        self.l_creds.setTextInteractionFlags(Qt.TextSelectableByMouse)
         g.addWidget(_lab("Антенна"), 0, 0)
         g.addWidget(self.e_ant, 0, 1, 1, 2)
         g.addWidget(_lab("Маска"), 1, 0)
@@ -1287,7 +1322,6 @@ class MainWindow(QWidget):
         g.addWidget(_lab("Ноутбук"), 2, 0)
         g.addWidget(self.e_my, 2, 1)
         g.addWidget(self.btn_auto, 2, 2)
-        g.addWidget(self.l_creds, 3, 0, 1, 3)
         cl.addLayout(g)
         c.setFixedWidth(300)
         left.addWidget(c)
@@ -1315,11 +1349,14 @@ class MainWindow(QWidget):
 
         c, cl = _card("Действия")
         row = QHBoxLayout()
+        self.btn_find = QPushButton("🔎 Найти антенну")
+        self.btn_find.setObjectName("primary")
+        self.btn_find.setToolTip("Поиск антенны на выбранном адаптере: своя подсеть, потом заводские (F7)")
+        self.btn_find.clicked.connect(self.search)
         self.btn_set = QPushButton("⚡ Поставить IP")
-        self.btn_set.setObjectName("primary")
         self.btn_set.setToolTip("Запомнить текущие настройки адаптера и поставить статический IP (Ctrl+Enter)")
         self.btn_set.clicked.connect(self.set_static)
-        self.btn_check = QPushButton("🔎 Проверить")
+        self.btn_check = QPushButton("✔ Проверить")
         self.btn_check.setToolTip("Пинг, порты 80/443 и веб антенны (F6)")
         self.btn_check.clicked.connect(self.check)
         self.btn_open = QPushButton("🌐 Открыть веб")
@@ -1329,9 +1366,12 @@ class MainWindow(QWidget):
         self.btn_restore.setObjectName("danger")
         self.btn_restore.setToolTip("Вернуть адаптеру прежние настройки (или DHCP, если снимка нет)")
         self.btn_restore.clicked.connect(self.restore)
-        for b in (self.btn_set, self.btn_check, self.btn_open, self.btn_restore):
-            row.addWidget(b)
-        cl.addLayout(row)
+        bg = QGridLayout()
+        bg.setHorizontalSpacing(8)
+        bg.setVerticalSpacing(8)
+        for i, b in enumerate((self.btn_find, self.btn_set, self.btn_check, self.btn_open, self.btn_restore)):
+            bg.addWidget(b, i // 3, i % 3)
+        cl.addLayout(bg)
         res = QGridLayout()
         res.setHorizontalSpacing(8)
         self.res_rows = {}
@@ -1375,7 +1415,11 @@ class MainWindow(QWidget):
         self.tg_auto = Toggle()
         self.tg_admin = Toggle()
         self.tg_upd = Toggle()
-        rows = (("Таймаут проверки", self.f_timeout), ("Повторов после смены IP", self.f_retries),
+        self.e_subnets = QLineEdit()
+        self.e_subnets.setMinimumWidth(600)
+        self.e_subnets.setToolTip("Где искать антенну, если в своей подсети пусто. Через запятую, по /24")
+        self.e_subnets.textEdited.connect(self._sync_cfg)
+        rows = (("Подсети для поиска", self.e_subnets), ("Таймаут проверки", self.f_timeout), ("Повторов после смены IP", self.f_retries),
                 ("Проверять антенну сразу после смены IP", self.tg_auto),
                 ("Просить права администратора при запуске", self.tg_admin),
                 ("Проверять обновления при запуске", self.tg_upd))
@@ -1465,7 +1509,7 @@ class MainWindow(QWidget):
         return page
 
     def _shortcuts(self):
-        for key, fn in (("F5", self.refresh), ("F6", self.check), ("Ctrl+O", self.open_browser),
+        for key, fn in (("F5", self.refresh), ("F6", self.check), ("F7", self.search), ("Ctrl+O", self.open_browser),
                         ("Ctrl+Return", self.set_static), ("Ctrl+S", self.save_now),
                         ("Ctrl+T", self.toggle_theme), ("Esc", self.ask_stop)):
             QShortcut(QKeySequence(key), self, fn)
@@ -1525,6 +1569,7 @@ class MainWindow(QWidget):
     def main_menu(self):
         m = QMenu(self)
         m.addAction("🔄 Обновить адаптеры\tF5", self.refresh)
+        m.addAction("🔎 Найти антенну\tF7", self.search).setEnabled(not self.worker.busy())
         a = m.addAction("⬇ Обновить программу с GitHub…", self.update_from_menu)
         a.setEnabled(not self.worker.busy())
         m.addAction("💾 Сохранить\tCtrl+S", self.save_now)
@@ -1574,16 +1619,16 @@ class MainWindow(QWidget):
                     QLineEdit.Normal if w.echoMode() == QLineEdit.Password else QLineEdit.Password))
         elif not own:
             return False
-        elif w is self.presets or w.parent() is self.presets:
-            it = self.presets.itemAt(self.presets.viewport().mapFromGlobal(pos))
+        elif w is self.found or w.parent() is self.found:
+            it = self.found.itemAt(self.found.viewport().mapFromGlobal(pos))
             if it is not None:
-                self.presets.setCurrentItem(it)
-            m.addAction("➕ Добавить свой пресет…", self.add_preset)
-            name = self.current_preset_name()
-            a = m.addAction("🗑 Удалить пресет", self.del_preset)
-            a.setEnabled(name in self.cfg.get("custom_presets", {}))
+                self.found.setCurrentItem(it)
+            m.addAction("🔎 Найти антенну\tF7", self.search).setEnabled(not self.worker.busy())
             m.addSeparator()
-            m.addAction("Копировать адрес антенны", lambda: QApplication.clipboard().setText(self.e_ant.text()))
+            m.addAction("🌐 Открыть веб", self.open_browser).setEnabled(it is not None)
+            m.addAction("Копировать адрес", lambda: QApplication.clipboard().setText(self.e_ant.text())) \
+                .setEnabled(it is not None)
+            m.addAction("Очистить список", self.clear_found).setEnabled(self.found.count() > 0)
         elif w is self.cb_adapter:
             m.addAction("🔄 Обновить список\tF5", self.refresh)
             m.addAction("Копировать имя", lambda: QApplication.clipboard().setText(self.cb_adapter.currentText()))
@@ -1605,7 +1650,11 @@ class MainWindow(QWidget):
         self.e_repo.setText(c.get("github_repo") or GITHUB_REPO)
         self.e_branch.setText(c.get("github_branch") or GITHUB_BRANCH)
         self.e_token.setText(c.get("github_token", ""))
-        self.fill_presets(c.get("preset"))
+        c.pop("preset", None)
+        c.pop("custom_presets", None)
+        self.e_subnets.setText(c.get("search_subnets") or SEARCH_SUBNETS)
+        self.e_subnets.setCursorPosition(0)
+        self._found_from = ""
         if c.get("antenna_ip"):
             self.e_ant.setText(c["antenna_ip"])
             self.e_mask.setText(c.get("mask") or "255.255.255.0")
@@ -1642,7 +1691,7 @@ class MainWindow(QWidget):
         c["github_repo"] = self.e_repo.text().strip()
         c["github_branch"] = self.e_branch.text().strip() or GITHUB_BRANCH
         c["github_token"] = self.e_token.text().strip()
-        c["preset"] = self.current_preset_name()
+        c["search_subnets"] = self.e_subnets.text().strip() or SEARCH_SUBNETS
         c["antenna_ip"] = self.e_ant.text().strip()
         c["mask"] = self.e_mask.text().strip()
         c["my_ip"] = self.e_my.text().strip()
@@ -1798,7 +1847,7 @@ class MainWindow(QWidget):
         for b in (self.btn_set, self.btn_restore):
             b.setEnabled(not busy and admin)
             b.setToolTip(b.toolTip() if admin else "Нужны права администратора (перезапусти программу)")
-        for b in (self.btn_check, self.btn_refresh, self.btn_ucheck, self.btn_uinst):
+        for b in (self.btn_find, self.btn_check, self.btn_refresh, self.btn_ucheck, self.btn_uinst):
             b.setEnabled(not busy)
 
     def ask_stop(self):
@@ -1811,46 +1860,106 @@ class MainWindow(QWidget):
             self.worker.stop_flag.set()
             self.log("⏹ останавливаю…")
 
-    # ── пресеты ──
-    def all_presets(self):
-        d = dict(BUILTIN_PRESETS)
-        for k, v in (self.cfg.get("custom_presets") or {}).items():
-            try:
-                d[k] = (v[0], v[1], v[2] if len(v) > 2 else "")
-            except Exception:
-                continue
-        return d
-
-    def fill_presets(self, select=None):
-        self.presets.blockSignals(True)
-        self.presets.clear()
-        custom = self.cfg.get("custom_presets") or {}
-        for name, (ip, _, _) in self.all_presets().items():
-            it = QListWidgetItem(f"{name}\n{ip}" + ("   · свой" if name in custom else ""))
-            it.setData(Qt.UserRole, name)
-            self.presets.addItem(it)
-        self.presets.blockSignals(False)
-        names = list(self.all_presets())
-        row = names.index(select) if select in names else 0
-        self.presets.setCurrentRow(row)
-        self.on_preset(row, keep_fields=bool(self.cfg.get("antenna_ip")))
-
-    def current_preset_name(self):
-        it = self.presets.currentItem()
-        return it.data(Qt.UserRole) if it else ""
-
-    def on_preset(self, row, keep_fields=False):
-        name = self.current_preset_name()
-        pr = self.all_presets().get(name)
-        if not pr:
+    # ── поиск ──
+    def search(self):
+        if self.worker.busy():
             return
-        ip, mask, creds = pr
-        self.l_creds.setText(f"Логин / пароль по умолчанию: {creds or '—'}")
-        if not keep_fields:
-            self.e_ant.setText(ip)
-            self.e_mask.setText(mask)
-            self.auto_my_ip()
+        a = self.adapter()
+        if not a:
+            QMessageBox.warning(self, "Поиск", "Выбери сетевой адаптер, к которому подключена антенна (F5 — обновить список).")
+            return
+        if a["Wifi"] and QMessageBox.question(
+                self, "Wi-Fi", f"«{a['Name']}» — это Wi-Fi. Антенну ищут на кабеле. Всё равно искать?") \
+                != QMessageBox.Yes:
+            return
+        nets = parse_subnets(self.e_subnets.text())
+        name, cur, prefix = a["Name"], a.get("IP") or "", int(a.get("Prefix") or 24)
+        admin = is_admin()
+        saved = dict(self.cfg.get("saved_net") or {})
+        mask = "255.255.255.0"
+
+        def job(w):
+            if cur and not cur.startswith("169.254."):
+                own = ipaddress.IPv4Network(f"{cur}/{max(prefix, 24)}", strict=False)
+                w.log(f"🔎 ищу в своей подсети {own}…")
+                found = scan_subnet(own, {cur}, cur, stopped=w.stopped)
+                if found:
+                    m = str(own.netmask)
+                    w.ui(lambda: self.show_found(found, m, cur, str(own)))
+                    return
+            if w.stopped():
+                return
+            if not admin:
+                w.log("⚠ в своей подсети пусто. Чтобы искать в заводских подсетях, нужны права администратора "
+                      "(⋯ → Перезапуск).")
+                return
+            if name not in saved:
+                snap = snapshot_adapter(name)
+                saved[name] = snap
+                w.ui(lambda: self._store_snapshot(name, snap))
+                w.log("✓ запомнил прежние настройки адаптера")
+            for net in nets:
+                if w.stopped():
+                    break
+                if cur and ipaddress.IPv4Address(cur) in net:
+                    continue
+                me = str(net.network_address + SEARCH_HOST)
+                ok, out = run_cmd(["netsh", "interface", "ipv4", "set", "address", f"name={name}",
+                                   "static", me, mask])
+                if not ok:
+                    w.log(f"✗ netsh: {out or 'ошибка'}")
+                    break
+                w.log(f"🔎 ищу в {net} (ноутбук временно {me})…")
+                if w.sleep(3):
+                    break
+                found = scan_subnet(net, {me}, me, stopped=w.stopped)
+                if found:
+                    w.ui(lambda f=found, m=me, n=str(net): self.show_found(f, mask, m, n))
+                    w.log(f"ℹ ноутбук оставлен на {me}. Вернуть сеть — «↩ Вернуть как было».")
+                    w.ui(self.refresh_quiet)
+                    return
+            w.log("⏹ поиск остановлен" if w.stopped() else
+                  "✗ антенна не найдена. Проверь кабель и PoE-блок (антенна грузится до минуты), "
+                  "добавь её подсеть в «Настройки → Подсети для поиска».")
+            snap = saved.get(name) or {"dhcp": True}
+            for c in restore_commands(name, snap):
+                ok, out = run_cmd(c)
+                if not ok:
+                    w.log(f"✗ не вернул сеть: {out or 'ошибка'} — нажми «↩ Вернуть как было»")
+                    return
+            w.log("✓ сеть адаптера возвращена как была")
+            w.ui(lambda: self._forget(name))
+            w.ui(self.refresh_quiet)
+        self.run_job("поиск антенны", job)
+
+    def show_found(self, found, mask, my_ip, where=""):
+        self.found.blockSignals(True)
+        self.found.clear()
+        names = {80: "http", 443: "https"}
+        for ip, ports in found.items():
+            it = QListWidgetItem(f"{ip}\n{', '.join(names.get(p, str(p)) for p in ports)}")
+            it.setData(Qt.UserRole, ip)
+            self.found.addItem(it)
+        self.found.blockSignals(False)
+        self.l_found.setVisible(not found)
+        self._found_from = where
+        self.e_mask.setText(mask)
+        self.e_my.setText(my_ip)
+        self.found.setCurrentRow(0)
+        self.log(f"✓ найдено в {where}: " + ", ".join(found) if found else "✗ ничего не найдено")
+        self.set_chip(f"● найдено: {len(found)}", "ok")
+
+    def on_found(self, row):
+        it = self.found.item(row) if row >= 0 else None
+        if it is None:
+            return
+        self.e_ant.setText(it.data(Qt.UserRole))
+        self.last_check = None
         self._params_edited()
+
+    def clear_found(self):
+        self.found.clear()
+        self.l_found.setVisible(True)
 
     def auto_my_ip(self):
         try:
@@ -1865,40 +1974,6 @@ class MainWindow(QWidget):
         self.e_my.setStyleSheet(bad if err else "")
         self.e_my.setToolTip(err or "Адрес ноутбука на время настройки — в той же подсети, что антенна")
         self.update_tiles()
-
-    def add_preset(self):
-        name, ok = QInputDialog.getText(self, "Свой пресет", "Название антенны:")
-        name = (name or "").strip()
-        if not ok or not name:
-            return
-        if name in BUILTIN_PRESETS:
-            QMessageBox.warning(self, "Свой пресет", "Такое имя уже есть среди встроенных.")
-            return
-        ip, mask = self.e_ant.text().strip(), self.e_mask.text().strip()
-        err = None
-        try:
-            ipaddress.IPv4Network(f"{ip}/{mask}", strict=False)
-            ipaddress.IPv4Address(ip)
-        except ValueError:
-            err = "Сначала впиши верные адрес антенны и маску в «Параметры»."
-        if err:
-            QMessageBox.warning(self, "Свой пресет", err)
-            return
-        creds, _ = QInputDialog.getText(self, "Свой пресет", "Логин / пароль (подсказка, можно пусто):")
-        self.cfg.setdefault("custom_presets", {})[name] = [ip, mask, (creds or "").strip()]
-        self.fill_presets(name)
-        self.log(f"✓ пресет «{name}» добавлен: {ip}")
-
-    def del_preset(self):
-        name = self.current_preset_name()
-        if name not in (self.cfg.get("custom_presets") or {}):
-            return
-        if QMessageBox.question(self, "Удалить пресет", f"Удалить пресет «{name}»?") != QMessageBox.Yes:
-            return
-        del self.cfg["custom_presets"][name]
-        self.cfg["antenna_ip"] = ""
-        self.fill_presets()
-        self.log(f"🗑 пресет «{name}» удалён")
 
     # ── адаптеры ──
     def refresh(self):
@@ -1959,7 +2034,10 @@ class MainWindow(QWidget):
         else:
             self.t_adapter.set("—", "F5 — прочитать адаптеры")
             self.t_myip.set("—", "")
-        self.t_ant.set(self.e_ant.text().strip() or "—", self.current_preset_name())
+        ant = self.e_ant.text().strip()
+        self.t_ant.set(ant or "—", "найдена поиском" if ant and self.found.count() and
+                       any(self.found.item(i).data(Qt.UserRole) == ant for i in range(self.found.count()))
+                       else ("введена вручную" if ant else "F7 — найти"))
         r = self.last_check
         if r is None:
             self.t_resp.set("—", "F6 — проверить")
@@ -2300,6 +2378,14 @@ def selftest():
     ok("validate совпадает", validate("192.168.1.20", "255.255.255.0", "192.168.1.20") is not None)
     ok("validate маска", validate("192.168.1.20", "255.0.255.0", "192.168.1.50") is not None)
     ok("validate broadcast", validate("192.168.1.20", "255.255.255.0", "192.168.1.255") is not None)
+    ok("подсети поиска", [str(n) for n in parse_subnets("192.168.1, 10.0.0.5; кривое, 192.168.1")]
+       == ["192.168.1.0/24", "10.0.0.0/24"])
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    port = srv.getsockname()[1]
+    ok("поиск находит узел", list(scan_subnet(ipaddress.IPv4Network("127.0.0.0/30"), ports=(port,))) == ["127.0.0.1"])
+    srv.close()
     ok("ver_tuple", ver_tuple("v0.10.1") > ver_tuple("0.9.9") and ver_tuple("1.0") == (1, 0, 0))
     ok("decode cp866", decode_out("Ошибка".encode("cp866")) == "Ошибка")
     ok("restore dhcp", restore_commands("Ethernet 2", {"dhcp": True})[0][-1] == "source=dhcp")
@@ -2336,7 +2422,10 @@ def selftest():
     ok("_IntField: предел и откат", f.value() == 15 and f.edit.text() == "15 с")
     cfg = dict(DEFAULT_CONFIG)
     w = MainWindow(cfg, cfg_writable=False)
-    ok("окно создаётся", w.presets.count() == len(BUILTIN_PRESETS) and w.e_my.text() == "192.168.10.50")
+    ok("окно создаётся", w.found.count() == 0 and w.e_ant.text() == "")
+    w.show_found({"192.168.1.20": [80, 443]}, "255.255.255.0", "192.168.1.247", "192.168.1.0/24")
+    ok("найденная антенна подставляется", w.e_ant.text() == "192.168.1.20" and w.e_my.text() == "192.168.1.247"
+       and validate(w.e_ant.text(), w.e_mask.text(), w.e_my.text()) is None)
     w.set_theme("light")
     w.set_theme("dark")
     ok("смена темы", w.btn_theme.text() == "☀")
