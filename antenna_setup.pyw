@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.3.7
+antenna_setup.pyw  v0.3.8
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,9 @@ antenna_setup.pyw  v0.3.7
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.3.8: «📤 Отправить журнал» (Настройки, ⋯, правый клик по журналу): журнал, адаптеры, найденное —
+          файлом в приватный репозиторий antenna_reports (токен только на запись туда); после 5xx /
+          обрыва повторно не шлёт, сначала проверяет, дошёл ли.
   v0.3.7: кнопка «⏹ Стоп» в «Действиях»; «↩ Вернуть как было» работает и во время поиска —
           останавливает его и возвращает сеть адаптера.
   v0.3.6: свой временный адрес поиска (x.x.x.247, статический) больше не принимается за «свою сеть»
@@ -49,11 +52,12 @@ antenna_setup.pyw  v0.3.7
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.3.7"
+VERSION = "0.3.8"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
 GITHUB_BRANCH = "main"
+REPORT_REPO = "romzespra-collab/antenna_reports"   # приватный, сюда кнопка «📤 Отправить журнал»
 
 import base64
 import ctypes
@@ -72,6 +76,9 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -159,7 +166,7 @@ from PySide6.QtWidgets import (QAbstractButton, QApplication, QButtonGroup,  # n
                                QComboBox, QFileDialog, QFrame, QGridLayout,
                                QHBoxLayout, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QMenu, QMessageBox,
-                               QPlainTextEdit, QProgressBar, QPushButton,
+                               QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
                                QStackedWidget, QTextEdit, QVBoxLayout,
                                QWidget)
 
@@ -193,6 +200,7 @@ DEFAULT_CONFIG = {
     "check_timeout": 3, "check_retries": 6, "auto_check": True, "ask_admin": True,
     "upd_token": "", "upd_auto": True, "upd_branch": GITHUB_BRANCH, "upd_every_h": 12,
     "saved_net": {}, "geometry": "", "page": 0,
+    "report_repo": REPORT_REPO, "report_token": "",
 }
 
 # ───────────────────────── конфиг (атомарно, с .bak) ─────────────────────────
@@ -632,6 +640,53 @@ def web_url(ip, res=None):
         return f"https://{ip}/"
     return f"http://{ip}/"
 
+# ───────────────────────── отчёт на GitHub ─────────────────────────
+
+
+class ReportError(Exception):
+    pass
+
+
+def _gh_report_req(url, token, data=None, method="GET"):
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Accept": "application/vnd.github+json", "User-Agent": "antenna_setup/" + VERSION,
+        "X-GitHub-Api-Version": "2022-11-28", "Authorization": "Bearer " + token.strip(),
+        "Content-Type": "application/json"})
+    return urllib.request.urlopen(req, timeout=30)   # проверка сертификата — по умолчанию, включена
+
+
+def upload_report(repo, token, path, text):
+    """Положить отчёт в приватный репозиторий (PUT contents). -> ссылка на файл.
+    После 5xx / обрыва повторно НЕ шлём: сначала смотрим, не дошёл ли файл."""
+    if "/" not in repo or not token.strip():
+        raise ReportError("впиши репозиторий для отчётов и токен (Настройки → Отчёт для Claude)")
+    url = f"https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(path)}"
+    body = json.dumps({"message": f"отчёт {path}",
+                       "content": base64.b64encode(text.encode("utf-8")).decode()}).encode()
+    try:
+        with _gh_report_req(url, token, body, "PUT") as r:
+            return json.loads(r.read().decode("utf-8")).get("content", {}).get("html_url", url)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise ReportError("GitHub не принял токен (401) — проверь, что вставлен целиком и не истёк")
+        if e.code == 403:
+            raise ReportError("нет права записи (403): токену нужно Contents: Read and write на " + repo)
+        if e.code == 404:
+            raise ReportError(f"репозиторий {repo} не найден, или токен его не видит (404)")
+        if e.code == 422:
+            raise ReportError("такой файл уже есть — нажми ещё раз через секунду")
+        if e.code < 500:
+            raise ReportError(f"GitHub ответил {e.code}")
+        err = f"GitHub ответил {e.code}"
+    except (urllib.error.URLError, OSError) as e:
+        err = f"нет связи с GitHub ({getattr(e, 'reason', e)})"
+    try:                                   # дошёл ли, несмотря на ошибку?
+        with _gh_report_req(url, token):
+            return url
+    except Exception:
+        raise ReportError(err + " — отчёт не дошёл, попробуй ещё раз позже")
+
+
 # ───────────────────────── права администратора ─────────────────────────
 
 
@@ -761,6 +816,7 @@ def _qss(p):
     QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 4px; color: {p['muted']}; }}
     QCheckBox, QRadioButton {{ color: {p['text']}; background: transparent; }}
     QWidget#setinner {{ background: {p['bg']}; }}
+    QScrollArea#pageScroll {{ background: {p['bg']}; border: none; }}
     QGroupBox QPushButton {{ padding: 5px 8px; min-width: 0; }}
     QPushButton {{ background: {p['panel2']}; color: {p['text']}; border: 1px solid {p['line']};
         border-radius: 7px; padding: 6px 12px; min-width: 80px; }}
@@ -1561,6 +1617,35 @@ class MainWindow(QWidget):
         cl.addLayout(row)
         lay.addWidget(c)
 
+        c, cl = _card("Отчёт для Claude (GitHub)")
+        g2 = QGridLayout()
+        g2.setHorizontalSpacing(10)
+        self.e_rep_repo = QLineEdit()
+        self.e_rep_repo.setPlaceholderText("владелец/репозиторий (приватный)")
+        self.e_rep_token = QLineEdit()
+        self.e_rep_token.setEchoMode(QLineEdit.Password)
+        self.e_rep_token.setPlaceholderText("github_pat_… — только Contents: Read and write на этот репозиторий")
+        self.e_rep_token.setToolTip("Хранится только в config.json рядом с программой. Правый клик — показать")
+        g2.addWidget(_lab("Репозиторий"), 0, 0)
+        g2.addWidget(self.e_rep_repo, 0, 1)
+        g2.addWidget(_lab("Токен"), 1, 0)
+        g2.addWidget(self.e_rep_token, 1, 1)
+        cl.addLayout(g2)
+        row = QHBoxLayout()
+        b = QPushButton("📤 Отправить журнал")
+        b.setObjectName("primary")
+        b.setToolTip("Журнал, адаптеры и найденное — в приватный репозиторий; Claude прочитает оттуда")
+        b.clicked.connect(self.send_report)
+        row.addWidget(b)
+        row.addStretch()
+        cl.addLayout(row)
+        cl.addWidget(_lab("Токен: GitHub → Settings → Developer settings → Fine-grained tokens → "
+                          "Only select repositories: этот репозиторий → Permissions: Contents — Read and write.",
+                          "hint"))
+        for e in (self.e_rep_repo, self.e_rep_token):
+            e.textEdited.connect(self._sync_cfg)
+        lay.addWidget(c)
+
         c, cl = _card("Оформление")
         row = QHBoxLayout()
         b1 = QPushButton("☾ Тёмная")
@@ -1580,7 +1665,12 @@ class MainWindow(QWidget):
             w.valueChanged.connect(self._sync_cfg)
         for w in (self.tg_auto, self.tg_admin):
             w.toggled.connect(self._sync_cfg)
-        return page
+        sc = QScrollArea()             # карточек больше, чем влезает по высоте — прокрутка
+        sc.setObjectName("pageScroll")
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QFrame.NoFrame)
+        sc.setWidget(page)
+        return sc
 
     def _page_update(self):
         """Вкладка «Обновление» — общий модуль gh_update (как в SmartMon)."""
@@ -1685,6 +1775,7 @@ class MainWindow(QWidget):
         m.addAction("🔎 Найти антенну\tF7", self.search).setEnabled(not self.worker.busy())
         m.addAction("⬇ Обновить программу с GitHub…", self.update_from_menu)
         m.addAction("💾 Сохранить\tCtrl+S", self.save_now)
+        m.addAction("📤 Отправить журнал (для Claude)", self.send_report)
         m.addAction("🎨 Тема\tCtrl+T", self.toggle_theme)
         m.addSeparator()
         m.addAction("📂 Папка программы", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(APP_ROOT))))
@@ -1714,6 +1805,7 @@ class MainWindow(QWidget):
             if w is self.logv:
                 m.addSeparator()
                 m.addAction("Сохранить в файл…", self.save_log)
+                m.addAction("📤 Отправить журнал на GitHub", self.send_report)
                 m.addAction("Очистить", w.clear)
         elif isinstance(w, QLineEdit):
             has = w.hasSelectedText()
@@ -1726,6 +1818,9 @@ class MainWindow(QWidget):
             m.addAction("Удалить", w.del_).setEnabled(has and not ro)
             m.addSeparator()
             m.addAction("Выделить всё", w.selectAll)
+            if pw or w is getattr(self, "e_rep_token", None):
+                m.addAction("Показать / скрыть", lambda: w.setEchoMode(
+                    QLineEdit.Normal if w.echoMode() != QLineEdit.Normal else QLineEdit.Password))
         elif not own:
             return False
         elif w is self.found or w.parent() is self.found:
@@ -1762,6 +1857,8 @@ class MainWindow(QWidget):
         if c.get("search_subnets") in OLD_SUBNETS:
             c["search_subnets"] = SEARCH_SUBNETS
         self.e_subnets.setText(c.get("search_subnets") or SEARCH_SUBNETS)
+        self.e_rep_repo.setText(c.get("report_repo") or REPORT_REPO)
+        self.e_rep_token.setText(c.get("report_token") or "")
         self.e_subnets.setCursorPosition(0)
         self._found_from = ""
         if c.get("antenna_ip"):
@@ -1797,6 +1894,8 @@ class MainWindow(QWidget):
         c["auto_check"] = self.tg_auto.isChecked()
         c["ask_admin"] = self.tg_admin.isChecked()
         c["search_subnets"] = self.e_subnets.text().strip() or SEARCH_SUBNETS
+        c["report_repo"] = self.e_rep_repo.text().strip() or REPORT_REPO
+        c["report_token"] = self.e_rep_token.text().strip()
         c["antenna_ip"] = self.e_ant.text().strip()
         c["mask"] = self.e_mask.text().strip()
         c["my_ip"] = self.e_my.text().strip()
@@ -2550,6 +2649,49 @@ class MainWindow(QWidget):
                                      f"{v.get('ip')} / {v.get('mask')}, шлюз {v.get('gw') or '—'}, "
                                      f"DNS {', '.join(v.get('dns') or []) or '—'}"))
         self.l_saved.setText("\n".join(lines))
+
+    # ── отчёт ──
+    def build_report(self):
+        lines = [f"antenna_setup v{VERSION} · {time.strftime('%Y-%m-%d %H:%M:%S')} · "
+                 f"{'администратор' if is_admin() else 'без прав админа'} · Python {sys.version.split()[0]}",
+                 "", "АДАПТЕРЫ:"]
+        sel = self.cb_adapter.currentData()
+        for a in self.adapters:
+            lines.append(f"{'→' if a['Name'] == sel else ' '} {a['Name']} · {a.get('Desc', '')} · {a.get('Status')} · "
+                         f"{'Wi-Fi' if a.get('Wifi') else 'кабель'} · IP {a.get('IP') or '—'}/{a.get('Prefix') or ''} · "
+                         f"DHCP {a.get('Dhcp') or '?'} · шлюз {a.get('Gw') or '—'} · DHCP-сервер {a.get('DhcpSrv') or '—'}")
+        lines += ["", "ПАРАМЕТРЫ: антенна " + (self.e_ant.text() or "—") + " · маска " + (self.e_mask.text() or "—")
+                  + " · ноутбук " + (self.e_my.text() or "—"),
+                  "НАЙДЕНО: " + ("; ".join(self.found.item(i).text().replace("\n", " ")
+                                          for i in range(self.found.count())) or "—"),
+                  "СНИМКИ СЕТИ: " + json.dumps(self.cfg.get("saved_net") or {}, ensure_ascii=False),
+                  "ПОДСЕТИ ПОИСКА: " + self.e_subnets.text(), "", "ЖУРНАЛ:", self.logv.toPlainText()]
+        return "\n".join(lines)
+
+    def send_report(self):
+        self._sync_cfg()
+        repo, token = self.cfg.get("report_repo") or REPORT_REPO, self.cfg.get("report_token") or ""
+        if not token:
+            self.set_page(1)
+            QMessageBox.information(self, "Отчёт", "Впиши токен в «Настройки → Отчёт для Claude» "
+                                                  "(подсказка, как получить, — там же).")
+            return
+        text = self.build_report()
+        host = "".join(ch for ch in os.environ.get("COMPUTERNAME", "pc") if ch.isalnum() or ch in "-_")[:30] or "pc"
+        path = f"reports/{time.strftime('%Y-%m-%d_%H-%M-%S')}_{host}.txt"
+
+        def job(w):
+            w.log("📤 отправляю журнал на GitHub…")
+            try:
+                upload_report(repo, token, path, text)
+            except ReportError as e:
+                w.log(f"✗ отчёт: {e}")
+                return
+            w.log(f"✓ журнал отправлен: {path} — скажи Claude «отчёт отправлен»")
+        if self.worker.busy():
+            QMessageBox.information(self, "Отчёт", f"Сейчас идёт «{self.worker.name}» — дождись конца или «⏹ Стоп».")
+            return
+        self.run_job("отправка журнала", job)
 
     # ── обновление ──
     def update_from_menu(self):
