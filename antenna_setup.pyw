@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.4.0
+antenna_setup.pyw  v0.4.1
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,9 @@ antenna_setup.pyw  v0.4.0
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.4.1: интернет — только через Wi-Fi, кабель — для антенн: кабелю низкий приоритет маршрутов
+          (метрика 500, настройка «Интернет только через Wi-Fi», по умолчанию вкл; «Вернуть как было»
+          возвращает); «Отправить журнал» подключается к GitHub с адреса Wi-Fi.
   v0.4.0: «📖 Прочитать настройки» — программа сама входит в веб антенны (TP-Link старый веб,
           Ubiquiti airOS, MikroTik REST; логин/пароль в «Параметрах», пусто — заводские) и
           показывает модель, прошивку, режим, адреса, SSID, сигнал; прочитанное — и в отчёт.
@@ -58,7 +61,7 @@ antenna_setup.pyw  v0.4.0
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -75,6 +78,7 @@ import json
 import os
 import queue
 import shutil
+import ssl
 import socket
 import subprocess
 import sys
@@ -206,6 +210,7 @@ DEFAULT_CONFIG = {
     "check_timeout": 3, "check_retries": 6, "auto_check": True, "ask_admin": True,
     "upd_token": "", "upd_auto": True, "upd_branch": GITHUB_BRANCH, "upd_every_h": 12,
     "saved_net": {}, "geometry": "", "page": 0,
+    "wifi_internet": True, "metric_orig": {},
     "report_repo": REPORT_REPO, "report_token": "", "ant_user": "", "ant_pass": "", "pinned_routes": [],
 }
 
@@ -472,6 +477,26 @@ def http_get(ip, path, src=None, headers=None, method="GET", body=None, timeout=
         return r.status, hd, r.read(limit)
     finally:
         c.close()
+
+
+def get_metric(name):
+    """-> (автоматическая, метрика) IPv4-интерфейса или None."""
+    ok, out = run_ps(f"Get-NetIPInterface -InterfaceAlias {ps_str(name)} -AddressFamily IPv4 -EA Stop|"
+                     "select @{n='a';e={[string]$_.AutomaticMetric}},InterfaceMetric|ConvertTo-Json -Compress", 20)
+    try:
+        d = json.loads(out) if ok else None
+        return (d["a"].lower() == "enabled", int(d["InterfaceMetric"])) if d else None
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def set_metric(name, metric=None):
+    """metric=None — вернуть автоматическую метрику Windows."""
+    cmd = "-AutomaticMetric Enabled" if metric is None else f"-AutomaticMetric Disabled -InterfaceMetric {int(metric)}"
+    return run_ps(f"Set-NetIPInterface -InterfaceAlias {ps_str(name)} -AddressFamily IPv4 {cmd} -EA Stop", 20)
+
+
+CABLE_METRIC = 500   # у кабеля с антенной — низкий приоритет: интернет Windows ведёт через Wi-Fi
 
 
 def pin_route(name, ip):
@@ -821,44 +846,84 @@ class ReportError(Exception):
     pass
 
 
-def _gh_report_req(url, token, data=None, method="GET"):
-    req = urllib.request.Request(url, data=data, method=method, headers={
-        "Accept": "application/vnd.github+json", "User-Agent": "antenna_setup/" + VERSION,
-        "X-GitHub-Api-Version": "2022-11-28", "Authorization": "Bearer " + token.strip(),
-        "Content-Type": "application/json"})
-    return urllib.request.urlopen(req, timeout=30)   # проверка сертификата — по умолчанию, включена
+class _Resp:
+    def __init__(self, status, data):
+        self.status, self._data = status, data
+
+    def read(self):
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
 
 
-def upload_report(repo, token, path, text):
+def _gh_report_req(url, token, data=None, method="GET", src=None):
+    """Запрос к GitHub. src — адрес адаптера с интернетом (Wi-Fi): соединение уходит только через него,
+    кабель с антенной не участвует. Сертификат проверяется всегда."""
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "antenna_setup/" + VERSION,
+               "X-GitHub-Api-Version": "2022-11-28", "Authorization": "Bearer " + token.strip(),
+               "Content-Type": "application/json"}
+    if not src:
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        return urllib.request.urlopen(req, timeout=30)
+    u = urllib.parse.urlsplit(url)
+    c = http.client.HTTPSConnection(u.hostname, 443, timeout=30, context=ssl.create_default_context(),
+                                    source_address=(src, 0))
+    try:
+        c.request(method, u.path + (("?" + u.query) if u.query else ""), body=data, headers=headers)
+        r = c.getresponse()
+        body = r.read()
+        if r.status >= 400:
+            raise urllib.error.HTTPError(url, r.status, r.reason, r.headers, None)
+        return _Resp(r.status, body)
+    finally:
+        c.close()
+
+
+def upload_report(repo, token, path, text, src=None):
     """Положить отчёт в приватный репозиторий (PUT contents). -> ссылка на файл.
-    После 5xx / обрыва повторно НЕ шлём: сначала смотрим, не дошёл ли файл."""
+    src — адрес Wi-Fi. После 5xx / обрыва вслепую НЕ повторяем: сначала смотрим, не дошёл ли файл;
+    не дошёл и слали с адреса Wi-Fi — одна попытка обычным путём."""
     if "/" not in repo or not token.strip():
         raise ReportError("впиши репозиторий для отчётов и токен (Настройки → Отчёт для Claude)")
     url = f"https://api.github.com/repos/{repo}/contents/{urllib.parse.quote(path)}"
     body = json.dumps({"message": f"отчёт {path}",
                        "content": base64.b64encode(text.encode("utf-8")).decode()}).encode()
-    try:
-        with _gh_report_req(url, token, body, "PUT") as r:
-            return json.loads(r.read().decode("utf-8")).get("content", {}).get("html_url", url)
-    except urllib.error.HTTPError as e:
-        if e.code == 401:
-            raise ReportError("GitHub не принял токен (401) — проверь, что вставлен целиком и не истёк")
-        if e.code == 403:
-            raise ReportError("нет права записи (403): токену нужно Contents: Read and write на " + repo)
-        if e.code == 404:
-            raise ReportError(f"репозиторий {repo} не найден, или токен его не видит (404)")
-        if e.code == 422:
-            raise ReportError("такой файл уже есть — нажми ещё раз через секунду")
-        if e.code < 500:
-            raise ReportError(f"GitHub ответил {e.code}")
-        err = f"GitHub ответил {e.code}"
-    except (urllib.error.URLError, OSError) as e:
-        err = f"нет связи с GitHub ({getattr(e, 'reason', e)})"
-    try:                                   # дошёл ли, несмотря на ошибку?
-        with _gh_report_req(url, token):
+
+    def exists():
+        for s_ in ([src, None] if src else [None]):
+            try:
+                with _gh_report_req(url, token, src=s_):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    err = ""
+    for s_ in ([src, None] if src else [None]):
+        try:
+            with _gh_report_req(url, token, body, "PUT", s_) as r:
+                return json.loads(r.read().decode("utf-8")).get("content", {}).get("html_url", url)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                raise ReportError("GitHub не принял токен (401) — проверь, что вставлен целиком и не истёк")
+            if e.code == 403:
+                raise ReportError("нет права записи (403): токену нужно Contents: Read and write на " + repo)
+            if e.code == 404:
+                raise ReportError(f"репозиторий {repo} не найден, или токен его не видит (404)")
+            if e.code == 422:
+                raise ReportError("такой файл уже есть — нажми ещё раз через секунду")
+            if e.code < 500:
+                raise ReportError(f"GitHub ответил {e.code}")
+            err = f"GitHub ответил {e.code}"
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+            err = f"нет связи с GitHub ({getattr(e, 'reason', e)})"
+        if exists():                       # дошёл, несмотря на ошибку
             return url
-    except Exception:
-        raise ReportError(err + " — отчёт не дошёл, попробуй ещё раз позже")
+    raise ReportError(err + " — отчёт не дошёл, попробуй ещё раз позже")
 
 
 # ───────────────────────── права администратора ─────────────────────────
@@ -1781,16 +1846,23 @@ class MainWindow(QWidget):
         self.f_retries.setToolTip("После смены IP Windows нужно несколько секунд — столько раз повторить проверку")
         self.tg_auto = Toggle()
         self.tg_admin = Toggle()
+        self.tg_wifi = Toggle()
+        self.tg_wifi.setToolTip("Кабелю с антенной — низкий приоритет маршрутов (метрика 500): интернет, обновления "
+                                "и отчёты идут через Wi-Fi. «Вернуть как было» возвращает как было")
         self.e_subnets = QLineEdit()
-        self.e_subnets.setMinimumWidth(600)
+        self.e_subnets.setMinimumWidth(360)
         self.e_subnets.setToolTip("Где искать антенну, если в своей подсети пусто. Через запятую, по /24")
         self.e_subnets.textEdited.connect(self._sync_cfg)
         rows = (("Подсети для поиска", self.e_subnets), ("Таймаут проверки", self.f_timeout), ("Повторов после смены IP", self.f_retries),
                 ("Проверять антенну сразу после смены IP", self.tg_auto),
-                ("Просить права администратора при запуске", self.tg_admin))
+                ("Просить права администратора при запуске", self.tg_admin),
+                ("Интернет только через Wi-Fi (кабель — для антенн)", self.tg_wifi))
         for i, (t, w) in enumerate(rows):
             g.addWidget(_lab(t), i, 0)
-            g.addWidget(w, i, 1, Qt.AlignLeft)
+            if w is self.e_subnets:
+                g.addWidget(w, i, 1, 1, 2)      # поле подсетей тянется, но не распирает страницу
+            else:
+                g.addWidget(w, i, 1, Qt.AlignLeft)
         g.setColumnStretch(2, 1)
         cl.addLayout(g)
         lay.addWidget(c)
@@ -1855,7 +1927,7 @@ class MainWindow(QWidget):
         lay.addStretch()
         for w in (self.f_timeout, self.f_retries):
             w.valueChanged.connect(self._sync_cfg)
-        for w in (self.tg_auto, self.tg_admin):
+        for w in (self.tg_auto, self.tg_admin, self.tg_wifi):
             w.toggled.connect(self._sync_cfg)
         sc = QScrollArea()             # карточек больше, чем влезает по высоте — прокрутка
         sc.setObjectName("pageScroll")
@@ -2044,6 +2116,7 @@ class MainWindow(QWidget):
         self.f_retries.setValue(c.get("check_retries", 6))
         self.tg_auto.setChecked(bool(c.get("auto_check", True)))
         self.tg_admin.setChecked(bool(c.get("ask_admin", True)))
+        self.tg_wifi.setChecked(bool(c.get("wifi_internet", True)))
         c.pop("preset", None)
         c.pop("custom_presets", None)
         if c.get("search_subnets") in OLD_SUBNETS:
@@ -2087,6 +2160,7 @@ class MainWindow(QWidget):
         c["check_retries"] = self.f_retries.value()
         c["auto_check"] = self.tg_auto.isChecked()
         c["ask_admin"] = self.tg_admin.isChecked()
+        c["wifi_internet"] = self.tg_wifi.isChecked()
         c["search_subnets"] = self.e_subnets.text().strip() or SEARCH_SUBNETS
         c["report_repo"] = self.e_rep_repo.text().strip() or REPORT_REPO
         c["report_token"] = self.e_rep_token.text().strip()
@@ -2375,6 +2449,7 @@ class MainWindow(QWidget):
 
         def job2(w):
             """Этап 2 — только с согласия: временно ставить адреса в других подсетях."""
+            self._cable_low_priority(w, name)
             if name not in saved:
                 snap = snapshot_adapter(name)
                 saved[name] = snap
@@ -2659,6 +2734,7 @@ class MainWindow(QWidget):
         saved = dict(self.cfg.get("saved_net") or {})
 
         def job(w):
+            self._cable_low_priority(w, name)
             if name not in saved:
                 w.log(f"⏳ запоминаю настройки «{name}»…")
                 snap = snapshot_adapter(name)
@@ -2736,6 +2812,40 @@ class MainWindow(QWidget):
             w.ui(lambda: self.cfg.setdefault("pinned_routes", []).append(key))
         else:
             w.log(f"⚠ маршрут через кабель не поставился: {out[:200]}")
+
+    def internet_src(self):
+        """Адрес адаптера с интернетом (не выбранный кабель; со шлюзом; Wi-Fi — первым) или None."""
+        sel = self.cb_adapter.currentData()
+        best = None
+        for x in self.adapters:
+            if x["Name"] == sel or not x.get("IP") or not x.get("Gw") or x.get("Status") != "Up" \
+                    or x["IP"].startswith("169.254."):
+                continue
+            if best is None or (x.get("Wifi") and not best.get("Wifi")):
+                best = x
+        return best["IP"] if best else None
+
+    def _cable_low_priority(self, w, name):
+        """Кабелю с антенной — метрика 500: интернет Windows ведёт через Wi-Fi (антенне это не мешает)."""
+        if not (IS_WIN and is_admin() and self.cfg.get("wifi_internet", True)):
+            return
+        cur = get_metric(name)
+        if cur is None or (not cur[0] and cur[1] == CABLE_METRIC):
+            return
+        ok, out = set_metric(name, CABLE_METRIC)
+        if ok:
+            w.ui(lambda: self.cfg.setdefault("metric_orig", {}).setdefault(name, [cur[0], cur[1]]))
+            w.log(f"✓ у «{name}» низкий приоритет маршрутов — интернет идёт через Wi-Fi")
+        else:
+            w.log(f"⚠ приоритет «{name}» не поменялся: {out[:200]}")
+
+    def _restore_metric(self, w, name):
+        orig = (self.cfg.get("metric_orig") or {}).get(name)
+        if not orig or not IS_WIN:
+            return
+        set_metric(name, None if orig[0] else orig[1])
+        w.ui(lambda: (self.cfg.get("metric_orig") or {}).pop(name, None))
+        w.log(f"✓ приоритет маршрутов «{name}» — как был")
 
     def unpin_all(self, name=None):
         left = []
@@ -2878,6 +2988,7 @@ class MainWindow(QWidget):
                     unpin_route(n, rip)
             w.ui(lambda: self.cfg.__setitem__("pinned_routes", [k for k in (self.cfg.get("pinned_routes") or [])
                                                                  if k[0] != name]))
+            self._restore_metric(w, name)
             w.log(f"✓ «{name}» возвращён: {what}")
             w.ui(lambda: self._forget(name))
             w.ui(lambda: self.set_chip("● сеть возвращена", "ok"))
@@ -2951,7 +3062,9 @@ class MainWindow(QWidget):
                                           for i in range(self.found.count())) or "—"),
                   "СНИМКИ СЕТИ: " + json.dumps(self.cfg.get("saved_net") or {}, ensure_ascii=False),
                   "ПОДСЕТИ ПОИСКА: " + self.e_subnets.text(),
-                  "МАРШРУТЫ ЧЕРЕЗ КАБЕЛЬ: " + json.dumps(self.cfg.get("pinned_routes") or [], ensure_ascii=False)]
+                  "МАРШРУТЫ ЧЕРЕЗ КАБЕЛЬ: " + json.dumps(self.cfg.get("pinned_routes") or [], ensure_ascii=False),
+                  "ИНТЕРНЕТ ЧЕРЕЗ: " + (self.internet_src() or "—") + " · прежние метрики: "
+                  + json.dumps(self.cfg.get("metric_orig") or {}, ensure_ascii=False)]
         rd = getattr(self, "last_read", None)
         if rd:
             lines += ["", f"НАСТРОЙКИ АНТЕННЫ {rd['ip']} ({rd['time']}):"] + rd["lines"] + ["", "СЫРЫЕ ДАННЫЕ:"]
@@ -2976,10 +3089,15 @@ class MainWindow(QWidget):
         host = "".join(ch for ch in os.environ.get("COMPUTERNAME", "pc") if ch.isalnum() or ch in "-_")[:30] or "pc"
         path = f"reports/{time.strftime('%Y-%m-%d_%H-%M-%S')}_{host}.txt"
 
+        src = self.internet_src()
+        cable = self.cb_adapter.currentData()
+
         def job(w):
-            w.log("📤 отправляю журнал на GitHub…")
+            if cable:
+                self._cable_low_priority(w, cable)
+            w.log("📤 отправляю журнал на GitHub" + (f" через {src}" if src else "") + "…")
             try:
-                upload_report(repo, token, path, text)
+                upload_report(repo, token, path, text, src)
             except ReportError as e:
                 w.log(f"✗ отчёт: {e}")
                 return
@@ -3006,7 +3124,11 @@ class MainWindow(QWidget):
         token = self.cfg.get("upd_token") or ""
         self.set_page(2)
 
+        cable = self.cb_adapter.currentData()
+
         def job(w):
+            if cable:
+                self._cable_low_priority(w, cable)
             w.log(f"🔎 смотрю версию на GitHub ({t.owner}/{t.repo}, {t.branch})…")
             rel, new = gh_update.check(t, token)
             if rel is None:
