@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.2.0
+antenna_setup.pyw  v0.2.1
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,8 @@ antenna_setup.pyw  v0.2.0
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.2.1: в меню ⋯ пункт «Обновить программу с GitHub»; «Обновить» → «Обновить адаптеры»;
+          список пресетов — «Модели антенн», выбранная модель не заливается синим.
   v0.2.0: исправлен вылет при запуске (не было log_menu); проверка в фоне,
           окно не зависает; редирект антенны на https больше не даёт
           «нет ответа»; пинг считается только по TTL=; маска пресета
@@ -20,7 +22,7 @@ antenna_setup.pyw  v0.2.0
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -583,6 +585,11 @@ class Worker:
 # ───────────────────────── тема: QSS + палитра ─────────────────────────
 
 
+def _rgba(hexc, alpha):
+    c = QColor(hexc)
+    return f"rgba({c.red()},{c.green()},{c.blue()},{alpha})"
+
+
 def _qss(p):
     return f"""
     * {{ font-family: "Segoe UI"; font-size: 10pt; }}
@@ -620,7 +627,8 @@ def _qss(p):
         border-radius: 7px; padding: 4px; outline: none; }}
     QListWidget::item {{ padding: 6px 8px; border-radius: 6px; }}
     QListWidget::item:hover {{ background: {p['panel']}; }}
-    QListWidget::item:selected {{ background: {p['accent']}; color: #ffffff; }}
+    QListWidget::item:selected {{ background: {_rgba(p['accent'], 40)}; color: {p['text']};
+        border-left: 3px solid {p['accent']}; }}
     QPushButton {{ background: {p['panel2']}; color: {p['text']}; border: 1px solid {p['line']};
         border-radius: 7px; padding: 6px 12px; min-width: 80px; }}
     QPushButton:hover {{ border-color: {p['accent']}; }}
@@ -1247,9 +1255,10 @@ class MainWindow(QWidget):
 
         left = QVBoxLayout()
         left.setSpacing(10)
-        c, cl = _card("Антенны")
+        c, cl = _card("Модели антенн (пресеты)")
         self.presets = QListWidget()
-        self.presets.setToolTip("Пресеты. Правый клик — добавить свой / удалить")
+        self.presets.setToolTip("Это список моделей с заводскими адресами, а не найденные антенны.\n"
+                                "Выбери свою модель. Правый клик — добавить свой пресет / удалить")
         self.presets.currentRowChanged.connect(self.on_preset)
         cl.addWidget(self.presets)
         c.setFixedWidth(300)
@@ -1515,7 +1524,9 @@ class MainWindow(QWidget):
     # ── меню ──
     def main_menu(self):
         m = QMenu(self)
-        m.addAction("🔄 Обновить\tF5", self.refresh)
+        m.addAction("🔄 Обновить адаптеры\tF5", self.refresh)
+        a = m.addAction("⬇ Обновить программу с GitHub…", self.update_from_menu)
+        a.setEnabled(not self.worker.busy())
         m.addAction("💾 Сохранить\tCtrl+S", self.save_now)
         m.addAction("🎨 Тема\tCtrl+T", self.toggle_theme)
         m.addSeparator()
@@ -2200,6 +2211,10 @@ class MainWindow(QWidget):
             w.ui(lambda: self.offer_restart(rv))
         self.run_job("обновление", job)
 
+    def update_from_menu(self):
+        self.set_page(2)
+        self.check_update(install=True)
+
     def offer_restart(self, rv):
         if QMessageBox.question(self, "Обновление", f"Установлена v{rv}. Перезапустить программу?") \
                 == QMessageBox.Yes:
@@ -2325,6 +2340,7 @@ def selftest():
     w.set_theme("light")
     w.set_theme("dark")
     ok("смена темы", w.btn_theme.text() == "☀")
+    ok("меню ⋯: обновление с GitHub", any("GitHub" in a.text() for a in w.main_menu().actions()))
     text = "\n".join(res)
     fail = any(r.startswith("✗") for r in res)
     text += f"\n\nselftest v{VERSION}: {'ОШИБКИ' if fail else 'всё в порядке'}"

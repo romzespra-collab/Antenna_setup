@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-rem setup.bat  v0.2.0 — Python + PySide6 и запуск
+rem setup.bat  v0.2.1 — Python + PySide6 и запуск
 cd /d "%~dp0"
 title Настройка антенны - установка
 
