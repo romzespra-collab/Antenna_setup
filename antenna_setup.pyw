@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.4.5
+antenna_setup.pyw  v0.4.6
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,8 @@ antenna_setup.pyw  v0.4.5
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.4.6: антенна молчит программе — диагностика другими средствами Windows (curl.exe, PowerShell),
+          антивирус и прокси — в журнал и отчёт с выводом «режет антивирус» / «молчит всем».
   v0.4.5: «🛠 Настроить ПК» — изоляция: интернет только Wi-Fi (кабелю низкий приоритет и без шлюза),
           кабель RJ45 только для антенн; домашняя сеть Wi-Fi запоминается и закрыта для поиска,
           проверки, чтения и маршрутов через кабель. Чтение настроек по https: сертификат антенны
@@ -73,7 +75,7 @@ antenna_setup.pyw  v0.4.5
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.4.5"
+VERSION = "0.4.6"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -702,6 +704,36 @@ def raw_probe(ip, src=None, timeout=HTTP_TIMEOUT):
     return f"соединение {t_conn:.1f} с, первый ответ через {first:.1f} с, {len(data)} байт", data
 
 
+def external_diag(ip, src=None):
+    """Антенна молчит программе — спросить её curl.exe и PowerShell, записать антивирус и прокси.
+    -> (сырые данные для отчёта, вывод для человека)."""
+    out = {}
+    args = ["curl.exe", "-s", "-i", "--max-time", "15"] + (["--interface", src] if src else []) + [f"http://{ip}/"]
+    ok, txt = run_cmd(args, timeout=25)
+    out["curl"] = (txt or "(пусто)")[:3000]
+    curl_ok = ok and txt.startswith("HTTP/")
+    ok2, txt2 = run_ps(
+        f"try{{$r=Invoke-WebRequest -UseBasicParsing -TimeoutSec 15 -Uri 'http://{ip}/';"
+        "'код '+$r.StatusCode;($r.Headers|Out-String);$r.Content.Substring(0,[Math]::Min(1500,$r.Content.Length))}"
+        "catch{'ошибка: '+$_.Exception.Message;if($_.Exception.Response){'код '+[int]$_.Exception.Response.StatusCode}}",
+        30)
+    out["powershell"] = (txt2 or "(пусто)")[:3000]
+    ps_ok = "код " in (txt2 or "")
+    _ok, av = run_ps("Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntivirusProduct -EA SilentlyContinue|"
+                     "%{$_.displayName}", 20)
+    _ok, px = run_cmd(["netsh", "winhttp", "show", "proxy"], timeout=10)
+    out["антивирус"] = av or "—"
+    out["прокси"] = px or "—"
+    avs = ", ".join(x.strip() for x in (av or "").splitlines() if x.strip()) or "не определён"
+    if curl_ok or ps_ok:
+        verdict = (f"curl / PowerShell страницу ПОЛУЧИЛИ, а программа — нет: её, скорее всего, держит антивирус "
+                   f"({avs}). Добавьте папку Python и программы в исключения антивируса.")
+    else:
+        verdict = (f"curl и PowerShell тоже не получили страницу — антенна молчит всем (антивирус: {avs}). "
+                   "Перезапустите антенну (выдернуть PoE на 10 с) и попробуйте снова.")
+    return out, verdict
+
+
 def read_antenna(ip, src=None, user="", pw="", log=print, tls=None):
     """Определить, что за антенна, и прочитать её настройки через её веб (80, или 443 с tls).
     -> (строки для человека, сырые данные для отчёта). Пароль в отчёт не попадает."""
@@ -726,7 +758,7 @@ def _read_antenna(ip, src, user, pw, log, tls):
             if tls:
                 raw[f"https{'@' + s_ if s_ else ''}"] = str(e)
                 continue
-            note, data = raw_probe(ip, s_)
+            note, data = raw_probe(ip, s_, 8.0)
             log(f"… диагностика: {note}")
             raw[f"probe{'@' + s_ if s_ else ''}"] = note + "\n" + data[:3000].decode("latin-1")
     if st is None and tls:
@@ -735,6 +767,12 @@ def _read_antenna(ip, src, user, pw, log, tls):
             return [f"✗ {ip}: сертификат https не тот, что запомнен — антенну подменили или сбросили. "
                     "Не доверяйте, пока не выясните."], raw
         return [f"✗ {ip}: https не ответил ({err[:150]})"], raw
+    if st is None and IS_WIN:
+        log("… проверяю другими средствами Windows (curl, PowerShell) и что за антивирус…")
+        diag, verdict = external_diag(ip, src)
+        raw.update(diag)
+        log(f"… {verdict}")
+        return [f"✗ {ip}: программе веб не ответил. {verdict}"], raw
     if st is None:
         return [f"✗ {ip}: веб не ответил — до логина не дошло. Закрой вкладку антенны в браузере "
                 "(её веб держит одно соединение) и нажми ещё раз."], raw
