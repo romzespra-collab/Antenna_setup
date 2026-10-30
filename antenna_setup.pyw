@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.3.4
+antenna_setup.pyw  v0.3.5
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +8,8 @@ antenna_setup.pyw  v0.3.4
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.3.5: перед поиском адаптеры перечитываются (адрес мог прийти после запуска — раньше поиск
+          говорил «нет адреса»); автоадрес Windows 169.254.x.x показывается и объясняется.
   v0.3.4: плитка «Адаптер ▾» вверху — клик / правый клик: выбрать адаптер (поиск и смена IP —
           только на нём); перебор подсетей пропускает подсети других адаптеров — Wi-Fi с интернетом
           не ломается.
@@ -43,7 +45,7 @@ antenna_setup.pyw  v0.3.4
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.3.4"
+VERSION = "0.3.5"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -283,8 +285,9 @@ def list_adapters():
     """Физические адаптеры: [{Name, Desc, Status, Media, IP, Prefix, Dhcp}]. Проводные — первыми."""
     script = (
         "$r=foreach($a in Get-NetAdapter -Physical){"
-        "$ip=Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -EA SilentlyContinue|"
-        "?{$_.PrefixOrigin -ne 'WellKnown'}|select -First 1;"
+        "$all=@(Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -EA SilentlyContinue);"
+        "$ip=$all|?{$_.PrefixOrigin -ne 'WellKnown'}|select -First 1;"
+        "if(-not $ip){$ip=$all|select -First 1};"
         "$if=Get-NetIPInterface -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -EA SilentlyContinue;"
         "$c=Get-CimInstance Win32_NetworkAdapterConfiguration -Filter \"InterfaceIndex=$($a.ifIndex)\" -EA SilentlyContinue;"
         "[pscustomobject]@{Name=$a.Name;Desc=$a.InterfaceDescription;Status=[string]$a.Status;"
@@ -1955,6 +1958,28 @@ class MainWindow(QWidget):
 
     # ── поиск ──
     def search(self):
+        """Сначала перечитать адаптеры (адрес мог прийти после запуска), потом искать."""
+        if self.worker.busy():
+            return
+        if not IS_WIN:
+            self._search_now()
+            return
+
+        def job(w):
+            w.log("⏳ перечитываю адаптеры…")
+            data = list_adapters()
+            w.ui(lambda: self.set_adapters(data))
+
+        def start():
+            if self.worker.busy():
+                QTimer.singleShot(200, start)
+            else:
+                self._drain()          # свежие адаптеры из очереди — до поиска
+                self._search_now()
+        if self.run_job("адаптеры", job):
+            QTimer.singleShot(300, start)
+
+    def _search_now(self):
         if self.worker.busy():
             return
         a = self.adapter()
@@ -1992,6 +2017,9 @@ class MainWindow(QWidget):
         def job(w):
             """Этап 1 — только своя сеть, сеть адаптера НЕ меняется."""
             dh = "DHCP" if dhcp else "статический"
+            if cur.startswith("169.254."):
+                w.log(f"ℹ у «{name}» автоадрес Windows {cur}: в кабеле никто не раздаёт адреса (DHCP) — "
+                      "это не полученный адрес")
             w.log(f"ℹ «{name}»: {cur or 'нет адреса'}{'/' + str(prefix) if cur else ''}, {dh}, "
                   f"шлюз {a.get('Gw') or '—'}, DHCP-сервер {a.get('DhcpSrv') or '—'}")
             if usable:
@@ -2032,7 +2060,7 @@ class MainWindow(QWidget):
                 self._log_heard(w, heard)
             if w.stopped():
                 return
-            w.ui(lambda: self._offer_other_subnets(name, bool(usable), dict(heard), job2))
+            w.ui(lambda: self._offer_other_subnets(name, cur, dict(heard), job2))
 
         def job2(w):
             """Этап 2 — только с согласия: временно ставить адреса в других подсетях."""
@@ -2114,14 +2142,20 @@ class MainWindow(QWidget):
             w.ui(self.refresh_quiet)
         self.run_job("поиск антенны", job)
 
-    def _offer_other_subnets(self, name, had_ip, heard, job2):
+    def _offer_other_subnets(self, name, cur, heard, job2):
         """После этапа 1: спросить, можно ли временно менять сеть адаптера."""
         def ask():
             if self.worker.busy():
                 QTimer.singleShot(300, ask)
                 return
             hint = ("\n\nВ кабеле слышны: " + ", ".join(heard) + " — начну с их подсетей.") if heard else ""
-            why = "В своей сети антенну не нашёл." if had_ip else "У адаптера нет своего адреса."
+            if cur.startswith("169.254."):
+                why = (f"У «{name}» автоадрес Windows {cur} — так бывает, когда в кабеле никто не раздаёт "
+                       "адреса (DHCP). Значит, у антенны свой постоянный адрес в другой подсети.")
+            elif cur:
+                why = f"В своей сети ({cur}) антенну не нашёл."
+            else:
+                why = f"У «{name}» нет IPv4-адреса."
             if QMessageBox.question(self, "Поиск", f"{why}\n\nПеребрать другие подсети? Адрес «{name}» "
                                     f"будет временно меняться; не найду — верну как было.{hint}") \
                     == QMessageBox.Yes:
@@ -2235,6 +2269,9 @@ class MainWindow(QWidget):
         a = self.adapter()
         if a:
             dh = "DHCP" if a.get("Dhcp", "").lower() == "enabled" else "статический"
+            apipa = (a.get("IP") or "").startswith("169.254.")
+            if apipa:
+                dh += " — автоадрес Windows, DHCP не ответил"
             self.l_adapter.setText(f"{a.get('Desc', '')}\nСейчас: {a.get('IP') or 'нет адреса'}"
                                    f"{'/' + str(a['Prefix']) if a.get('IP') else ''}, {dh}"
                                    f"{', шлюз ' + a['Gw'] if a.get('Gw') else ''}"
