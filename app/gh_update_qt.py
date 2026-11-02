@@ -20,6 +20,14 @@
   on_quit — закрыть программу ПОЛНОСТЬЮ (новая копия уже запущена)
   page.box.available(str) — нашлась новая версия (пометить вкладку и т.п.)
 
+★ gh_update 1.3.3: restart_ask=False — после установки перезапуск сам через
+3 с, без вопроса (Smart_BMS); глазик токена — theme.add_password_eye
+программы, если он есть; после установки исходников target.current = новая
+версия (авто-проверка не предложит ту же версию ещё раз).
+
+★ gh_update 1.3.2: can_install=() -> "" | причина — запрет «Обновить», пока программа
+работает (UpdatePage / UpdateBox); box.busy() — идёт установка, окно не закрывать.
+
 ★ gh_update 1.3.1: UpdateBox.apply_theme — кнопка «Проверять автоматически»
 перекрашивается при смене схемы; «готово» — таймер анимации останавливается.
 
@@ -113,6 +121,12 @@ def _theme():
 
 def _add_eye(ed):
     """Глазик «показать/скрыть» в поле токена."""
+    try:                                               # ★ 1.3.3: свой глазик программы
+        from . import theme
+        theme.add_password_eye(ed)
+        return
+    except Exception:                                  # noqa: BLE001
+        pass
     from PySide6.QtWidgets import QToolButton
     b = QToolButton(ed)
     b.setText("👁")
@@ -138,12 +152,14 @@ class UpdateBox(QGroupBox):
     phase = Signal(str, object)
 
     def __init__(self, target, cfg_get, cfg_set, on_quit=None, log=None,
-                 parent=None):
+                 parent=None, can_install=None, restart_ask=True):
         super().__init__("🔑 Доступ к GitHub", parent)
         self.t = target
         self._get, self._set = cfg_get, cfg_set
         self._quit = on_quit
         self._log = log or (lambda *_a: None)
+        self.can_install = can_install         # ★ 1.3.2 (из 1.2.2): () -> "" | причина «нельзя сейчас»
+        self.restart_ask = restart_ask         # ★ 1.3.3: False — перезапуск сам через 3 с
         self._rel = None
         self._busy = False
         self._last_err = ""
@@ -422,8 +438,16 @@ class UpdateBox(QGroupBox):
         self.available.emit(rel.version)
 
     # ---------- скачивание и установка ----------
+    def busy(self):
+        """★ 1.3.2 (из 1.2.2): идёт скачивание / установка — окно не закрывать."""
+        return self._busy
+
     def update_now(self):
         if self._busy or self._rel is None:
+            return
+        why = self.can_install() if self.can_install else ""
+        if why:                                # ★ 1.3.2: например, идёт заливка — старое ядро + новые файлы
+            QMessageBox.information(self, "Обновление", why)
             return
         t, token = self._target()
         rel = self._rel
@@ -505,8 +529,13 @@ class UpdateBox(QGroupBox):
                          "программа закроется, новая версия откроется сама.",
                          "#3fbf6f")
         else:
-            self._status("✓ " + text + ". Нужен перезапуск.", "#3fbf6f")
+            self.t.current = self._rel.version     # ★ 1.3.3: авто-проверка не предложит ту же версию
+            self._status("✓ " + text + (". Нужен перезапуск." if self.restart_ask
+                                         else ". Перезапуск через 3 с…"), "#3fbf6f")
         self.phase.emit("done", {"ver": self._rel.version, "exe": exe})
+        if not self.restart_ask:                   # ★ 1.3.3: обновили — перезапускаем сами
+            QTimer.singleShot(3000, self.restart)
+            return
         if exe:
             msg = ("Скачана версия %s (exe).\nЧтобы поставить её, программа "
                    "закроется, а через несколько секунд откроется уже новая."
@@ -859,13 +888,15 @@ class UpdatePage(QWidget):
     «Что нового»."""
 
     def __init__(self, target, cfg_get, cfg_set, on_quit=None, log=None,
-                 parent=None):
+                 parent=None, can_install=None, restart_ask=True):
         super().__init__(parent)
         self.setObjectName("setinner")
         h = QHBoxLayout(self)
         h.setContentsMargins(14, 10, 14, 10)
         h.setSpacing(12)
-        self.box = UpdateBox(target, cfg_get, cfg_set, on_quit, log)
+        self.box = UpdateBox(target, cfg_get, cfg_set, on_quit, log,
+                             can_install=can_install,
+                             restart_ask=restart_ask)
         self.box.setFixedWidth(400)
         h.addWidget(self.box, 0, Qt.AlignTop)
         right = QVBoxLayout()
