@@ -34,6 +34,22 @@
 wait_previous(sys.argv) — ждёт, пока старая завершится (иначе защита от
 второго запуска приняла бы её за «уже запущено»).
 
+1.3.3: собраны доработки из всех проектов — обрыв при чтении ответа GitHub —
+понятная ошибка; из backup/ стираются только папки v<цифры>; при сбое замены
+не остаётся *.upd, а не вернувшиеся старые файлы называются в ошибке (из
+PionerFM 1.2.1); own — маски своих файлов пользователя рядом с кодом
+(WinHub: functions/fn_*.py): ставятся, но при чистке не стираются; старое из
+MANIFEST сверяется без учёта регистра, MANIFEST из архива не ставится (из
+WinHub 1.2.1). gh_update_qt: restart_ask=False — перезапуск сам через 3 с
+(Smart_BMS); поле токена с «глазом» (theme.add_password_eye, если есть);
+после установки current = новая версия (авто-проверка не предложит её снова).
+
+1.3.2: объединены две ветки модуля — 1.3.1 (SmartMon: обновление собранного
+exe) и 1.2.1 / 1.2.2 (mega_fan_gui): user_dirs — свои папки пользователя
+(modules/, tools/) при первом обновлении не чистятся; gh_update_qt —
+can_install (программа запрещает «Обновить», пока идёт работа) и busy()
+(идёт установка — окно не закрывать).
+
 1.3.1: прежняя сборка exe (.gh_update_old) стирается и при обычном запуске
 (раньше — только при запуске с --after-update); токен отвергнут (401 / 403)
 посреди закачки — так и сказано сразу, а не «скачалась не целиком».
@@ -91,7 +107,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass, field
 
-VERSION = "1.3.1"
+VERSION = "1.3.3"
 API = "https://api.github.com"
 TIMEOUT = 30
 
@@ -155,6 +171,8 @@ class UpdateTarget:
     version_files: tuple = ()     # где ещё искать VERSION = "…" в архиве
     where: str = "Настройки → 🔄 Обновление"   # где вкладка (для инструкции)
     removed: list = field(default_factory=list)  # ★ 1.2.0: что стёрла install()
+    user_dirs: tuple = ()         # ★ 1.2.1/1.3.2: свои файлы пользователя (modules/ …) — без списка не чистить
+    own: tuple = ()               # ★ 1.3.3 (из WinHub 1.2.1): маски своих файлов — ставим, но не стираем
 
 
 @dataclass
@@ -241,6 +259,8 @@ def latest(t, token):
         if e.code in (403, 404):
             raise UpdateError(diagnose(t, token, folder), e.code) from e
         raise
+    except (OSError, ValueError, http.client.HTTPException) as e:    # ★ 1.3.3: обрыв при чтении ответа
+        raise UpdateError("ответ GitHub не дочитан: %s" % e) from e
     if not isinstance(items, list):
         raise UpdateError("GitHub вернул не список файлов папки release")
     pat = re.compile(r"^%s_v?(\d+(?:\.\d+)*)\.zip$" % re.escape(t.name), re.I)
@@ -332,6 +352,8 @@ def latest_exe(t, token):
         if e.code in (403, 404):
             raise UpdateError(diagnose(t, token), e.code) from e
         raise
+    except (OSError, ValueError, http.client.HTTPException) as e:    # ★ 1.3.3: обрыв при чтении ответа
+        raise UpdateError("ответ GitHub не дочитан: %s" % e) from e
     if not isinstance(items, list):
         raise UpdateError("GitHub вернул не список выпусков (Releases)")
     pat = re.compile(r"^%s_exe_v?(\d+(?:\.\d+)*)\.zip$" % re.escape(t.name),
@@ -752,7 +774,7 @@ def whats_new(t, token, upto=None, limit=6000):
     try:
         with _open(url, token, accept="application/vnd.github.raw") as r:
             text = r.read().decode("utf-8", errors="replace")
-    except UpdateError:
+    except (UpdateError, OSError, http.client.HTTPException):    # ★ 1.3.3: журнал — не повод для ошибки
         return ""
     return changelog_since(text, t.current, upto, limit)
 
@@ -886,19 +908,21 @@ def _keep_dir(name):
     return name.lower() in KEEP_DIRS
 
 
-def stale_files(app_dir, new_files, keep=KEEP_DEFAULT):
+def stale_files(app_dir, new_files, keep=KEEP_DEFAULT, user_dirs=()):
     """★ 1.2.0: старые файлы кода, которых нет в новой версии -> список
     путей (относительно app_dir, через «/»). Только когда списка MANIFEST
     ещё нет. Смотрим только папки, которые есть в архиве (app/, tests/ …):
     корень (свои скрипты рядом с программой), папки данных (KEEP_DIRS) и
     виртуальные окружения (pyvenv.cfg) — мимо."""
+    mine = set(d.strip("/\\").replace("\\", "/").lower() for d in user_dirs)
     app_dir = os.path.abspath(app_dir)
     new = set(f.replace("\\", "/") for f in new_files)
+    new_nc = set(os.path.normcase(f) for f in new)
     out = []
     tops = sorted(set(f.split("/", 1)[0] for f in new if "/" in f))
     for top in tops:
         root = os.path.join(app_dir, top)
-        if _keep_dir(top) or not os.path.isdir(root):
+        if _keep_dir(top) or top.lower() in mine or not os.path.isdir(root):
             continue
         for dp, dns, fns in os.walk(root):
             if "pyvenv.cfg" in fns:
@@ -908,7 +932,7 @@ def stale_files(app_dir, new_files, keep=KEEP_DEFAULT):
             for fn in fns:
                 rel = os.path.relpath(os.path.join(dp, fn),
                                       app_dir).replace(os.sep, "/")
-                if rel in new or _kept(rel, keep):
+                if rel in new or os.path.normcase(rel) in new_nc or _kept(rel, keep):
                     continue
                 if os.path.splitext(fn)[1].lower() in CODE_EXT:
                     out.append(rel)
@@ -933,14 +957,20 @@ def write_manifest(app_dir, files):
     os.replace(tmp, os.path.join(app_dir, MANIFEST))
 
 
-def _drop_stale(app_dir, files, installed, keep, log):
+_UNREAD = object()
+
+
+def _drop_stale(app_dir, files, installed, keep, log, user_dirs=(), prev=_UNREAD):
     """Стереть старое -> список стёртого. Затем — новый список MANIFEST."""
-    prev = read_manifest(app_dir)
+    if prev is _UNREAD:                       # ★ 1.3.3: prev — свой список, прочитан до установки
+        prev = read_manifest(app_dir)
     new = set(f.replace("\\", "/") for f in files)
     if prev is None:
-        cand = stale_files(app_dir, files, keep)
+        cand = stale_files(app_dir, files, keep, user_dirs)
     else:
-        cand = sorted(r for r in prev - new if not _kept(r, keep))
+        new_nc = set(os.path.normcase(r) for r in new)
+        cand = sorted(r for r in prev - new
+                      if os.path.normcase(r) not in new_nc and not _kept(r, keep))
     removed, dirs = [], set()
     for rel in cand:
         try:
@@ -987,7 +1017,7 @@ def drop_old_backup(app_dir, log=None):
         return False
     try:
         items = os.listdir(b)
-        if any(not (x.lower().startswith("v")
+        if any(not (re.fullmatch(r"v\d+(?:\.\d+)*", x, re.I)      # ★ 1.3.3: только v<цифры>
                     and os.path.isdir(os.path.join(b, x))) for x in items):
             return False
         shutil.rmtree(b)
@@ -1083,7 +1113,10 @@ def install(t, zip_path, rel_version, log=None):
         # ★ 1.2.0: копия заменяемого — только на случай отката, во временной
         # папке (не в папке программы), после установки удаляется
         bdir = tempfile.mkdtemp(prefix=t.name + "_old_")
-        todo = [f for f in files if not _kept(f, t.keep)]
+        # ★ 1.3.3: MANIFEST из архива не ставится (он — для модуля 1.2.0);
+        # свой список читаем до установки
+        prev = read_manifest(app_dir)
+        todo = [f for f in files if not _kept(f, t.keep) and f != MANIFEST]
         replaced = []
         try:
             for rel in todo:
@@ -1099,6 +1132,11 @@ def install(t, zip_path, rel_version, log=None):
                 replaced.append(rel)
         except Exception as exc:                       # noqa: BLE001
             log("обновление: ошибка (%s) — возвращаю старые файлы" % exc)
+            try:
+                os.remove(tmp)                         # ★ 1.3.3: недокопированный *.upd не оставлять
+            except (OSError, NameError):
+                pass
+            failed = []
             for rel in replaced:
                 b = os.path.join(bdir, rel)
                 dst = os.path.join(app_dir, rel)
@@ -1108,12 +1146,16 @@ def install(t, zip_path, rel_version, log=None):
                     else:
                         os.remove(dst)
                 except OSError:
-                    pass
+                    failed.append(rel)
+            if failed:
+                raise UpdateError("не удалось заменить файлы (%s), и не вернулись "
+                                  "старые: %s" % (exc, ", ".join(failed))) from exc
             raise UpdateError("не удалось заменить файлы (%s) — оставлена "
                               "прежняя версия" % exc) from exc
         # ★ 1.2.0: то, что ставили в прошлый раз и чего в новой версии нет,
         # — стереть (без списка — старый код по stale_files)
-        removed = _drop_stale(app_dir, files, todo, t.keep, log)
+        removed = _drop_stale(app_dir, files, todo,
+                              tuple(t.keep) + tuple(t.own), log, t.user_dirs, prev)
         drop_old_backup(app_dir, log)
         t.removed = removed
         code = [r for r in removed if not r.endswith((".pyc", ".pyo"))]
