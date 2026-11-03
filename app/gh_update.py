@@ -29,10 +29,19 @@
     копия вне папки программы; папки backup/ больше нет — старая
     удаляется).
 
+Обновляется только программа на Python (исходники). Собранный exe не
+обновляется (★ 1.4.0): GitHub exe не собирает, Releases не нужны.
+
 Перезапуск: restart() запускает программу заново с ключом
 --after-update <pid> и закрывает текущую. Новая копия в самом начале зовёт
 wait_previous(sys.argv) — ждёт, пока старая завершится (иначе защита от
 второго запуска приняла бы её за «уже запущено»).
+
+1.4.0: убрано обновление собранного exe — только Python. Нет больше
+check_exe / latest_exe / download_exe / stage_exe / launch_swap /
+swap_failed / finish_exe_update и помощника .gh_update_swap.bat; GitHub
+Actions exe не собирает (build_exe.yml удалён), GitHub Releases не нужны.
+check() у собранного exe — понятная ошибка вместо обновления.
 
 1.3.3: собраны доработки из всех проектов — обрыв при чтении ответа GitHub —
 понятная ошибка; из backup/ стираются только папки v<цифры>; при сбое замены
@@ -85,9 +94,6 @@ app/version.py, version.py, VERSION и главного файла); where — �
 программе вкладка (для инструкции); работает и как пакет (app/), и как
 отдельные файлы рядом с главным .pyw.
 
-Собранный .exe обновляется готовой сборкой из GitHub Releases (1.3.0, см.
-выше): exe не перезаписать, пока он работает, поэтому подмену делает
-помощник после выхода программы.
 """
 import fnmatch
 import hashlib
@@ -107,7 +113,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass, field
 
-VERSION = "1.3.3"
+VERSION = "1.4.0"
 API = "https://api.github.com"
 TIMEOUT = 30
 
@@ -134,16 +140,6 @@ KEEP_DIRS = frozenset((
     "dist", "venv", ".venv", "env", "site-packages", "lib", "scripts",
     "node_modules", "downloads", "download", ".gh_update_new",
     ".gh_update_old"))
-
-# ★ 1.3.0: обновление собранного exe (папки и файлы в папке exe)
-EXE_NEW = ".gh_update_new"         # распакованная новая сборка
-EXE_OLD = ".gh_update_old"         # прежняя сборка (стирается после запуска новой)
-EXE_READY = ".gh_update_ready"     # метка «распаковано целиком» (внутри EXE_NEW)
-EXE_SWAP = ".gh_update_swap.bat"   # помощник подмены
-EXE_FAILED = ".gh_update_failed.txt"   # подмена не удалась — причина
-EXE_DL = ".gh_update_dl.part"      # недокачанный архив сборки
-EXE_VERSION = "exe_version.txt"    # номер версии внутри сборки (пишет GitHub)
-EXE_MERGE = ("vendor",)            # папки сборки, которые дополняются, а не меняются
 
 
 class UpdateError(Exception):
@@ -182,9 +178,7 @@ class Release:
     sha: str                      # git blob sha1 (сверка после скачивания)
     size: int
     url: str = ""                 # download_url (raw.githubusercontent.com)
-    kind: str = "src"             # ★ 1.3.0: src — архив исходников, exe — сборка
-                                  # из Releases, wait — версия есть, exe ещё нет
-    sha256: str = ""              # ★ 1.3.0: sha256 сборки (digest из Releases)
+    kind: str = "src"             # всегда src — архив исходников (★ 1.4.0: exe нет)
 
 
 # ---------------- версии ----------------
@@ -316,450 +310,23 @@ def diagnose(t, token, folder="release"):
 
 def check(t, token):
     """-> (Release, есть_новее). Release=None — архивов в release/ нет.
-    ★ 1.3.0: собранный exe — сборка из Releases (check_exe)."""
+    ★ 1.4.0: обновляется только Python; собранный exe — не обновляется."""
     if is_frozen():
-        return check_exe(t, token)
+        raise UpdateError("собранный exe не обновляется — обновление только "
+                          "для программы на Python (запуск .pyw)")
     rel = latest(t, token)
     return rel, bool(rel and newer(rel.version, t.current))
 
 
-# ---------------- собранный exe (★ 1.3.0) ----------------
+# ---------------- как запущена программа ----------------
 
 def run_kind():
-    """Как запущена программа: "exe" (собранная PyInstaller) или "python"."""
-    return "exe" if is_frozen() else "python"
+    """★ 1.4.0: обновляется только Python (исходники) — всегда "python"."""
+    return "python"
 
 
 def run_kind_text():
-    return ("собранный exe — обновляется готовой сборкой с GitHub"
-            if is_frozen() else
-            "Python (исходники) — обновляется архивом исходников")
-
-
-def exe_name(t):
-    """Имя exe программы: SmartMon.pyw -> SmartMon.exe."""
-    return os.path.splitext(os.path.basename(t.main_file))[0] + ".exe"
-
-
-def latest_exe(t, token):
-    """Последняя сборка <имя>_exe_vX.Y.Z.zip в GitHub Releases -> Release
-    (kind="exe") или None."""
-    url = "%s/repos/%s/%s/releases?per_page=50" % (API, t.owner, t.repo)
-    try:
-        with _open(url, token) as r:
-            items = json.loads(r.read().decode("utf-8"))
-    except UpdateError as e:
-        if e.code in (403, 404):
-            raise UpdateError(diagnose(t, token), e.code) from e
-        raise
-    except (OSError, ValueError, http.client.HTTPException) as e:    # ★ 1.3.3: обрыв при чтении ответа
-        raise UpdateError("ответ GitHub не дочитан: %s" % e) from e
-    if not isinstance(items, list):
-        raise UpdateError("GitHub вернул не список выпусков (Releases)")
-    pat = re.compile(r"^%s_exe_v?(\d+(?:\.\d+)*)\.zip$" % re.escape(t.name),
-                     re.I)
-    best = None
-    for it in items:
-        if not isinstance(it, dict) or it.get("draft"):
-            continue
-        for a in it.get("assets") or ():
-            m = pat.match(str(a.get("name") or ""))
-            if not m or (a.get("state") or "uploaded") != "uploaded":
-                continue
-            dg = str(a.get("digest") or "")
-            rel = Release(m.group(1), a["name"], "", int(a.get("size") or 0),
-                          a.get("url") or "", kind="exe",
-                          sha256=dg[7:].lower() if dg.lower().startswith(
-                              "sha256:") else "")
-            if best is None or newer(rel.version, best.version):
-                best = rel
-    return best
-
-
-def check_exe(t, token):
-    """-> (Release, есть_новее) для собранного exe. Есть сборка новее —
-    она. Нет, а в release/ версия новее — Release(kind="wait"): GitHub её
-    ещё собирает (или сборка не удалась)."""
-    exe = latest_exe(t, token)
-    if exe is not None and newer(exe.version, t.current):
-        return exe, True
-    try:
-        src = latest(t, token)
-    except UpdateError:
-        if exe is None:
-            raise
-        src = None
-    if src is not None and newer(src.version, t.current):
-        return Release(src.version, src.path, "", src.size, kind="wait"), False
-    return (exe or src), False
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *_a, **_k):
-        return None                    # 302 -> HTTPError, адрес берём сами
-
-
-def _asset_link(api_url, token):
-    """Ссылка на файл сборки. GitHub отвечает 302 на временный адрес
-    хранилища — туда идём БЕЗ токена (с чужим токеном хранилище отказывает).
-    -> (ссылка, нужен_ли_токен)."""
-    op = urllib.request.build_opener(
-        _NoRedirect, urllib.request.HTTPSHandler(context=_ctx()))
-    req = _req(api_url, token, accept="application/octet-stream")
-    try:
-        r = op.open(req, timeout=TIMEOUT)
-    except urllib.error.HTTPError as e:
-        loc = e.headers.get("Location") if e.headers else None
-        if e.code in (301, 302, 303, 307, 308) and loc:
-            return loc, False
-        if e.code == 401:
-            raise UpdateError("токен GitHub не подошёл (401)", 401) from e
-        if e.code in (403, 404):
-            raise UpdateError("GitHub не отдал сборку exe (%s): у токена нет "
-                              "права Contents: Read на этот репозиторий"
-                              % e.code, e.code) from e
-        raise UpdateError("GitHub ответил %s" % e.code, e.code) from e
-    except (urllib.error.URLError, OSError) as e:
-        raise UpdateError("нет связи с GitHub (%s)"
-                          % getattr(e, "reason", e)) from e
-    r.close()
-    return api_url, True
-
-
-def _fetch_file(url, token, fh, total, progress):
-    """Одна попытка: дописать url в открытый файл с его конца (Range).
-    -> (total, прибавилось байт)."""
-    got0 = fh.tell()
-    hdr = {"Range": "bytes=%d-" % got0} if got0 else None
-    with _open(url, token, accept="application/octet-stream", timeout=120,
-               headers=hdr) as r:
-        st = int(getattr(r, "status", 0) or getattr(r, "code", 0) or 200)
-        if got0 and st != 206:                 # Range не понят — с начала
-            fh.seek(0)
-            fh.truncate()
-            got0 = 0
-        if not total:
-            n = int(r.headers.get("Content-Length") or 0)
-            total = n + got0 if n else 0
-        try:
-            while True:
-                chunk = r.read(262144)
-                if not chunk:
-                    break
-                fh.write(chunk)
-                if progress:
-                    progress(fh.tell(), total)
-        except (OSError, ValueError, http.client.HTTPException):
-            pass                               # обрыв — докачаем
-    fh.flush()
-    return total, fh.tell() - got0
-
-
-def _writable_dir(app_dir):
-    try:
-        test = os.path.join(app_dir, ".gh_update_write_test")
-        with open(test, "w") as fh:
-            fh.write("1")
-        os.remove(test)
-        return True
-    except OSError:
-        return False
-
-
-def download_exe(t, token, rel, progress=None):
-    """Скачать сборку exe в папку программы (там же её и ставить — тот же
-    диск), докачка с места обрыва, сверка размера и sha256. -> путь."""
-    app_dir = os.path.abspath(t.app_dir)
-    if not _writable_dir(app_dir):
-        raise UpdateError("в папку программы нельзя писать (%s) — запустите "
-                          "программу от имени администратора или перенесите "
-                          "папку туда, где можно писать (например, на диск D:)"
-                          % app_dir)
-    part = os.path.join(app_dir, EXE_DL)
-    tag = part + ".ver"
-    try:                                       # недокачанное другой версии — заново
-        with open(tag, encoding="utf-8") as fh:
-            same = fh.read().strip() == rel.path
-    except OSError:
-        same = False
-    if not same:
-        for x in (part, tag):
-            try:
-                os.remove(x)
-            except OSError:
-                pass
-        with open(tag, "w", encoding="utf-8") as fh:
-            fh.write(rel.path)
-    total = rel.size or 0
-    last = None
-    idle = 0
-    with open(part, "ab") as fh:
-        for _ in range(DL_TRIES * 2):
-            if total and fh.tell() >= total:
-                break
-            add = 0
-            try:
-                link, need_token = _asset_link(rel.url, token)   # ссылка живёт минуты
-                total, add = _fetch_file(link, token if need_token else "",
-                                         fh, total, progress)
-            except UpdateError as e:
-                last = e
-                # ★ 1.3.1: токен отвергнут — сразу (с недокачанным куском
-                # раньше 4 круга и «скачалась не целиком, нажмите ещё раз»)
-                if e.code in (401, 403) or (e.code == 404 and fh.tell() == 0):
-                    raise
-            except (OSError, ValueError, http.client.HTTPException) as e:
-                last = UpdateError("нет связи с GitHub (%s)" % e)
-            if total and fh.tell() >= total:
-                break
-            idle = 0 if add > 0 else idle + 1
-            if idle >= 4:
-                break
-            time.sleep(1.0)
-        got = fh.tell()
-    if rel.size and got != rel.size:
-        if got > rel.size:
-            os.remove(part)
-        if not got and last is not None:
-            raise last
-        raise UpdateError("сборка exe скачалась не целиком (%d из %d байт) — "
-                          "нажмите «Обновить» ещё раз, докачается с места "
-                          "обрыва" % (got, rel.size))
-    if rel.sha256:
-        h = hashlib.sha256()
-        with open(part, "rb") as fh:
-            for chunk in iter(lambda: fh.read(1048576), b""):
-                h.update(chunk)
-        if h.hexdigest() != rel.sha256:
-            os.remove(part)
-            raise UpdateError("контрольная сумма сборки exe не совпала — "
-                              "скачивание испорчено, обновление отменено")
-    return part
-
-
-def staged_exe(t):
-    """Версия сборки, уже распакованной в .gh_update_new и готовой к
-    подмене, или "" (нет / распакована не целиком)."""
-    try:
-        with open(os.path.join(os.path.abspath(t.app_dir), EXE_NEW,
-                               EXE_READY), encoding="utf-8") as fh:
-            return fh.read().strip()
-    except OSError:
-        return ""
-
-
-_SAFE_ITEM = re.compile(r"^[A-Za-z0-9_.\- ]+$")
-
-
-def stage_exe(t, zip_path, rel_version, log=None):
-    """Распаковать сборку в .gh_update_new и проверить, что это та
-    программа и та версия. -> список верхних файлов и папок сборки."""
-    log = log or (lambda *_a: None)
-    app_dir = os.path.abspath(t.app_dir)
-    new = os.path.join(app_dir, EXE_NEW)
-    shutil.rmtree(new, ignore_errors=True)
-    try:
-        os.makedirs(new)
-        with zipfile.ZipFile(zip_path) as z:
-            bad = z.testzip()
-            if bad:
-                raise UpdateError("архив сборки повреждён: %s" % bad)
-            names = [n for n in z.namelist() if not n.endswith("/")]
-            tops = set(n.split("/", 1)[0] for n in names)
-            strip = 0
-            if len(tops) == 1 and all("/" in n for n in names):
-                strip = len(tops.pop()) + 1        # папка <имя>/ внутри архива
-            for n in names:
-                rel = n[strip:]
-                if not rel:
-                    continue
-                dst = _safe(new, rel)
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                with z.open(n) as src, open(dst, "wb") as out:
-                    shutil.copyfileobj(src, out, 1048576)
-        exe = exe_name(t)
-        if not os.path.isfile(os.path.join(new, exe)):
-            raise UpdateError("в сборке нет %s — это не та программа" % exe)
-        try:
-            with open(os.path.join(new, EXE_VERSION), encoding="utf-8") as fh:
-                found = fh.read().strip()
-        except OSError:
-            found = ""
-        if found and vtuple(found) != vtuple(rel_version):
-            raise UpdateError("внутри сборки версия %s, а не %s — обновление "
-                              "отменено" % (found, rel_version))
-        items = sorted(os.listdir(new))
-        odd = [x for x in items if not _SAFE_ITEM.match(x)]
-        if odd:
-            raise UpdateError("в сборке странные имена: %s" % ", ".join(odd))
-        with open(os.path.join(new, EXE_READY), "w", encoding="utf-8") as fh:
-            fh.write(str(rel_version))
-    except UpdateError:
-        shutil.rmtree(new, ignore_errors=True)
-        raise
-    except (OSError, zipfile.BadZipFile) as exc:
-        shutil.rmtree(new, ignore_errors=True)
-        raise UpdateError("сборку не распаковать (%s)" % exc) from exc
-    finally:
-        for x in (zip_path, zip_path + ".ver"):
-            try:
-                os.remove(x)
-            except OSError:
-                pass
-    log("обновление: сборка exe %s распакована (%s)"
-        % (rel_version, ", ".join(items)))
-    return items
-
-
-def swap_script(items, exe, pid, merge=EXE_MERGE):
-    """Текст .gh_update_swap.bat (только ASCII, CRLF). Ждёт выхода
-    программы (pid), убирает старое в .gh_update_old, ставит новое, запускает
-    новую версию; на любом сбое возвращает старое и запускает его."""
-    pid = int(pid)
-    for x in list(items) + [exe]:
-        if not _SAFE_ITEM.match(x):
-            raise UpdateError("странное имя для подмены: %s" % x)
-    merge_l = set(m.lower() for m in merge)
-    swap = [x for x in items if x != EXE_READY
-            and x.lower() not in merge_l]
-    mrg = [x for x in items if x.lower() in merge_l]
-    L = []
-    a = L.append
-    a("@echo off")
-    a("rem gh_update %s: exe update helper (deletes itself)" % VERSION)
-    a("setlocal EnableExtensions EnableDelayedExpansion")
-    a('cd /d "%~dp0"')
-    a("if not exist logs mkdir logs")
-    a('set "L=logs\\gh_update_swap.log"')
-    a('>>"%%L%%" echo [%%date%% %%time%%] update: wait for pid %d' % pid)
-    a("set /a N=0")
-    a(":waitmain")
-    a('tasklist /FI "PID eq %d" /NH 2>nul | find " %d " >nul' % (pid, pid))
-    a("if errorlevel 1 goto mainok")
-    a("set /a N+=1")
-    a("if !N! GEQ 90 (")
-    a('  >>"%L%" echo still running after 90 s - taskkill')
-    a("  taskkill /F /PID %d >nul 2>&1" % pid)
-    a("  ping -n 3 127.0.0.1 >nul")
-    a("  goto mainok")
-    a(")")
-    a("ping -n 2 127.0.0.1 >nul")
-    a("goto waitmain")
-    a(":mainok")
-    a('if exist "%s" rmdir /s /q "%s"' % (EXE_OLD, EXE_OLD))
-    a('if exist "%s" del /f /q "%s"' % (EXE_OLD, EXE_OLD))
-    a('mkdir "%s"' % EXE_OLD)
-    a('if exist "%s" del /f /q "%s"' % (EXE_FAILED, EXE_FAILED))
-    a('set "WHY="')
-    # 1) старое — в .gh_update_old (повторы: файлы держат дочерние процессы)
-    for i, x in enumerate(swap):
-        a("set /a T=0")
-        a(":old%d" % i)
-        a('if not exist "%s" goto oldok%d' % (x, i))
-        a('move /y "%s" "%s\\%s" >nul 2>&1' % (x, EXE_OLD, x))
-        a('if not exist "%s" goto oldok%d' % (x, i))
-        a("set /a T+=1")
-        a('if !T! GEQ 60 (set "WHY=busy: %s" & goto rollback)' % x)
-        a("ping -n 2 127.0.0.1 >nul")
-        a("goto old%d" % i)
-        a(":oldok%d" % i)
-    # 2) новое — на место (повторы: антивирус может держать новый exe)
-    for i, x in enumerate(swap):
-        a("set /a T=0")
-        a(":new%d" % i)
-        a('move /y "%s\\%s" "%s" >nul 2>&1' % (EXE_NEW, x, x))
-        a('if exist "%s" goto newok%d' % (x, i))
-        a("set /a T+=1")
-        a('if !T! GEQ 15 (set "WHY=move: %s" & goto rollback)' % x)
-        a("ping -n 2 127.0.0.1 >nul")
-        a("goto new%d" % i)
-        a(":newok%d" % i)
-    # 3) папки, которые дополняются (vendor): свои файлы пользователя целы
-    for x in mrg:
-        a('xcopy "%s\\%s" "%s\\" /E /I /Y /Q >nul 2>&1' % (EXE_NEW, x, x))
-        a('if errorlevel 1 >>"%%L%%" echo warning: %s not merged' % x)
-    a('>>"%L%" echo [%date% %time%] update: ok')
-    a('rmdir /s /q "%s" >nul 2>&1' % EXE_NEW)
-    a('start "" "%s" --after-update %d' % (exe, pid))
-    a("goto end")
-    a(":rollback")
-    a('>>"%L%" echo [%date% %time%] update FAILED: !WHY! - rollback')
-    for x in swap:
-        a('if exist "%s\\%s" (' % (EXE_OLD, x))
-        a('  if exist "%s\\" (rmdir /s /q "%s") else if exist "%s" del /f /q "%s"'
-          % (x, x, x, x))
-        a('  move /y "%s\\%s" "%s" >nul 2>&1' % (EXE_OLD, x, x))
-        a(")")
-    a('>"%s" echo !WHY!' % EXE_FAILED)
-    a('rmdir /s /q "%s" >nul 2>&1' % EXE_NEW)
-    a('start "" "%s"' % exe)
-    a(":end")
-    a('(goto) 2>nul & del /f /q "%~f0"')
-    return "\r\n".join(L) + "\r\n"
-
-
-def launch_swap(t, pid=None, log=None):
-    """Запустить подмену сборки. Программу после этого закрыть ПОЛНОСТЬЮ
-    (дело вызывающего): помощник ждёт её выхода. -> путь к помощнику."""
-    log = log or (lambda *_a: None)
-    if os.name != "nt":
-        raise UpdateError("подмена exe — только в Windows")
-    app_dir = os.path.abspath(t.app_dir)
-    new = os.path.join(app_dir, EXE_NEW)
-    if not staged_exe(t):
-        raise UpdateError("новая сборка не распакована — нажмите «Обновить»")
-    items = sorted(x for x in os.listdir(new) if x != EXE_READY)
-    text = swap_script(items, exe_name(t), pid or os.getpid())
-    bat = os.path.join(app_dir, EXE_SWAP)
-    with open(bat, "w", encoding="ascii", newline="") as fh:
-        fh.write(text)
-    base = 0x08000000 | 0x00000200       # CREATE_NO_WINDOW | NEW_PROCESS_GROUP
-    last = None
-    # BREAKAWAY_FROM_JOB: помощник не должен умереть вместе с программой
-    for flags in (base | 0x01000000, base):
-        try:
-            subprocess.Popen(["cmd.exe", "/d", "/c", bat], cwd=app_dir,
-                             creationflags=flags, close_fds=True)
-            log("обновление: помощник подмены exe запущен — программа "
-                "закрывается, новая версия откроется сама")
-            return bat
-        except OSError as exc:
-            last = exc
-    raise UpdateError("помощник подмены не запустился (%s)" % last)
-
-
-def swap_failed(app_dir):
-    """Прошлая подмена exe не удалась -> причина (файл стирается) или ""."""
-    p = os.path.join(os.path.abspath(app_dir), EXE_FAILED)
-    try:
-        with open(p, encoding="utf-8", errors="replace") as fh:
-            why = fh.read().strip()
-        os.remove(p)
-    except OSError:
-        return ""
-    if why.startswith("busy:"):
-        return ("файлы программы заняты (%s) — закройте все её окна и "
-                "попробуйте ещё раз" % why[5:].strip())
-    return why or "причина не записана (logs\\gh_update_swap.log)"
-
-
-def finish_exe_update(app_dir=None, delay=60.0):
-    """После подмены: прежняя сборка (.gh_update_old) стирается, когда новая
-    проработала delay секунд (вылетит сразу — старая останется, её можно
-    вернуть руками)."""
-    if not is_frozen():
-        return False
-    app_dir = os.path.abspath(app_dir or os.path.dirname(sys.executable))
-    old = os.path.join(app_dir, EXE_OLD)
-    if not os.path.isdir(old):
-        return False
-
-    def work():
-        time.sleep(delay)
-        shutil.rmtree(old, ignore_errors=True)
-    import threading
-    threading.Thread(target=work, daemon=True, name="gh-exe-old").start()
-    return True
+    return "Python (исходники) — обновляется архивом исходников"
 
 
 def whats_new(t, token, upto=None, limit=6000):
@@ -1212,13 +779,6 @@ def wait_previous(argv=None, timeout=20.0):
     подождать, пока старая копия завершится. -> True, если ждали."""
     argv = sys.argv if argv is None else argv
     if "--after-update" not in argv:
-        # ★ 1.3.1: прежняя сборка exe стирается и при обычном запуске —
-        # раньше только при запуске с --after-update: закрыли новую раньше
-        # чем через минуту — сотни МБ лежали до следующего обновления
-        try:
-            finish_exe_update()
-        except Exception:                      # noqa: BLE001
-            pass
         return False
     try:
         pid = int(argv[argv.index("--after-update") + 1])
@@ -1227,10 +787,6 @@ def wait_previous(argv=None, timeout=20.0):
     end = time.monotonic() + timeout
     while time.monotonic() < end and _alive(pid):
         time.sleep(0.25)
-    try:                                       # ★ 1.3.0: после подмены exe
-        finish_exe_update()
-    except Exception:                          # noqa: BLE001
-        pass
     return True
 
 

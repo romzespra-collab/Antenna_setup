@@ -20,6 +20,9 @@
   on_quit — закрыть программу ПОЛНОСТЬЮ (новая копия уже запущена)
   page.box.available(str) — нашлась новая версия (пометить вкладку и т.п.)
 
+★ gh_update 1.4.0: только Python — обновления собранного exe больше нет
+(нет сборок в GitHub Releases, «GitHub собирает exe», подмены exe помощником).
+
 ★ gh_update 1.3.3: restart_ask=False — после установки перезапуск сам через
 3 с, без вопроса (Smart_BMS); глазик токена — theme.add_password_eye
 программы, если он есть; после установки исходников target.current = новая
@@ -30,12 +33,6 @@
 
 ★ gh_update 1.3.1: UpdateBox.apply_theme — кнопка «Проверять автоматически»
 перекрашивается при смене схемы; «готово» — таймер анимации останавливается.
-
-★ gh_update 1.3.0: вкладка сама знает, как запущена программа
-(gh_update.run_kind): из исходников — архив исходников, как раньше; собранный
-exe — готовая сборка из GitHub Releases, ставит её помощник после закрытия
-программы (gh_update.launch_swap); сборки ещё нет — «GitHub собирает exe»,
-проверка повторится сама через 10 минут.
 
 Цвета. Если в проекте нет модуля theme (ACCENT/TEXT/TEXT_DIM/BG_PANEL/
 BORDER), задать свои: gh_update_qt.set_colors(lambda: {"accent": …,
@@ -71,7 +68,6 @@ except ImportError:                     # … или файлы рядом с г
 
 AUTO_FIRST_MS = 30_000                 # первая автопроверка — через 30 с
 AUTO_EVERY_H = 12                      # дальше — раз в 12 часов (по умолчанию)
-WAIT_EXE_MS = 10 * 60 * 1000           # exe ещё собирается — проверить снова через 10 мин
 # выбор «Каждые»: (часов, подпись)
 EVERY_CHOICES = ((1, "1 ч"), (3, "3 ч"), (6, "6 ч"), (12, "12 ч"),
                  (24, "24 ч"), (72, "3 дня"), (168, "неделю"))
@@ -176,8 +172,7 @@ class UpdateBox(QGroupBox):
         self.setToolTip(
             "Обновление из приватного репозитория %s/%s.\n"
             "Программа запущена: %s.\n"
-            "Из исходников берётся архив из папки release нужной ветки, "
-            "собранный exe — готовая сборка из GitHub Releases.\nТокен "
+            "Берётся архив исходников из папки release нужной ветки.\nТокен "
             "GitHub — fine-grained, только этот репозиторий, Contents: "
             "Read-only. Хранится только в настройках программы."
             % (target.owner, target.repo, gh_update.run_kind_text()))
@@ -249,8 +244,7 @@ class UpdateBox(QGroupBox):
         self.bar.setRange(0, 1000)
         self.bar.hide()
         v.addWidget(self.bar)
-        self.lbl = QLabel("установлена версия %s · %s"
-                          % (target.current, self._kind_short()))
+        self.lbl = QLabel("установлена версия %s · Python" % target.current)
         self.lbl.setWordWrap(True)
         self.lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
         v.addWidget(self.lbl)
@@ -261,20 +255,6 @@ class UpdateBox(QGroupBox):
         self._timer.timeout.connect(self._auto_tick)
         if self.ch_auto.isChecked():
             self._timer.start(AUTO_FIRST_MS)
-        # ★ 1.3.0: прошлая подмена exe не удалась — сказать почему
-        try:
-            why = gh_update.swap_failed(target.app_dir)
-        except Exception:                              # noqa: BLE001
-            why = ""
-        if why:
-            self._log("обновление: подмена exe не удалась — %s" % why)
-            self._status("прошлое обновление не встало: %s. Оставлена "
-                         "прежняя версия %s" % (why, target.current),
-                         "#e05555")
-
-    @staticmethod
-    def _kind_short():
-        return "exe" if gh_update.is_frozen() else "Python"
 
     # ---------- инструкция ----------
     def show_help(self):
@@ -399,26 +379,9 @@ class UpdateBox(QGroupBox):
             self.phase.emit("error", {"text": err})
             return
         if rel is None:
-            if gh_update.is_frozen():
-                self._status("на GitHub нет ни сборок exe (%s_exe_v*.zip в "
-                             "Releases), ни архивов в release/" % self.t.name,
-                             "#e0a030")
-                self.phase.emit("error", {"text": "на GitHub нет сборок exe"})
-                return
             self._status("в release/ нет архивов %s_v*.zip" % self.t.name,
                          "#e0a030")
             self.phase.emit("error", {"text": "в release/ нет архивов"})
-            return
-        if rel.kind == "wait":                 # ★ 1.3.0: exe ещё собирается
-            self.btn_update.hide()
-            self._status("есть версия %s, а exe для неё GitHub ещё собирает "
-                         "(обычно 15–25 мин). Проверю ещё раз через 10 мин"
-                         % rel.version, "#e0a030")
-            self.phase.emit("building", {"ver": rel.version})
-            self._log("обновление: версия %s есть, exe ещё собирается"
-                      % rel.version)
-            if self.ch_auto.isChecked():
-                self._timer.start(WAIT_EXE_MS)
             return
         if not new:
             self.btn_update.hide()
@@ -428,9 +391,8 @@ class UpdateBox(QGroupBox):
         self._rel = rel
         self.btn_update.setText("⬇ Обновить до %s" % rel.version)
         self.btn_update.show()
-        self._status("доступна версия %s (%s, %s МБ), у вас %s"
-                     % (rel.version, "сборка exe" if rel.kind == "exe"
-                        else "исходники", _mb(rel.size), self.t.current),
+        self._status("доступна версия %s (исходники, %s МБ), у вас %s"
+                     % (rel.version, _mb(rel.size), self.t.current),
                      "#4aa3ff")
         self._log("обновление: доступна версия %s" % rel.version)
         self.phase.emit("available", {"ver": rel.version, "size": rel.size,
@@ -451,11 +413,6 @@ class UpdateBox(QGroupBox):
             return
         t, token = self._target()
         rel = self._rel
-        exe = gh_update.is_frozen()
-        if exe and rel.kind != "exe":
-            self._status("для exe нужна сборка с GitHub — нажмите «Проверить "
-                         "сейчас»", "#e0a030")
-            return
         self._busy = True
         self.btn_check.setEnabled(False)
         self.btn_update.setEnabled(False)
@@ -468,20 +425,6 @@ class UpdateBox(QGroupBox):
 
         def work():
             try:
-                if exe:                        # ★ 1.3.0: сборка exe
-                    if gh_update.staged_exe(t) == rel.version:
-                        self._sig.done.emit(True, "сборка exe %s уже скачана"
-                                            % rel.version)
-                        return
-                    path = gh_update.download_exe(
-                        t, token, rel,
-                        progress=lambda got, tot: self._sig.progress.emit(
-                            got, tot))
-                    self._sig.progress.emit(-1, 0)
-                    gh_update.stage_exe(t, path, rel.version, log=self._log)
-                    self._sig.done.emit(True, "скачана сборка exe %s"
-                                        % rel.version)
-                    return
                 path = gh_update.download(
                     t, token, rel,
                     progress=lambda got, tot: self._sig.progress.emit(got, tot))
@@ -521,46 +464,29 @@ class UpdateBox(QGroupBox):
         self.btn_update.hide()
         self.btn_restart.show()
         self.bar.setFormat("готово ✓")
-        exe = gh_update.is_frozen()
-        if exe:
-            self.btn_restart.setText("↻ Установить %s и перезапустить"
-                                     % self._rel.version)
-            self._status("✓ " + text + ". Ставится при перезапуске: "
-                         "программа закроется, новая версия откроется сама.",
-                         "#3fbf6f")
-        else:
-            self.t.current = self._rel.version     # ★ 1.3.3: авто-проверка не предложит ту же версию
-            self._status("✓ " + text + (". Нужен перезапуск." if self.restart_ask
-                                         else ". Перезапуск через 3 с…"), "#3fbf6f")
-        self.phase.emit("done", {"ver": self._rel.version, "exe": exe})
+        self.t.current = self._rel.version         # ★ 1.3.3: авто-проверка не предложит ту же версию
+        self._status("✓ " + text + (". Нужен перезапуск." if self.restart_ask
+                                     else ". Перезапуск через 3 с…"), "#3fbf6f")
+        self.phase.emit("done", {"ver": self._rel.version})
         if not self.restart_ask:                   # ★ 1.3.3: обновили — перезапускаем сами
             QTimer.singleShot(3000, self.restart)
             return
-        if exe:
-            msg = ("Скачана версия %s (exe).\nЧтобы поставить её, программа "
-                   "закроется, а через несколько секунд откроется уже новая."
-                   "\nНастройки, список устройств и записи не трогаются."
-                   "\n\nПерезапустить сейчас?" % self._rel.version)
-        else:
-            msg = ("Программа обновлена до %s.\nПерезапустить сейчас?"
-                   % self._rel.version)
+        msg = ("Программа обновлена до %s.\nПерезапустить сейчас?"
+               % self._rel.version)
         ans = QMessageBox.question(self, "Обновление", msg)
         if ans == QMessageBox.Yes:
             self.restart()
 
     def restart(self):
         try:
-            if gh_update.is_frozen() and gh_update.staged_exe(self.t):
-                gh_update.launch_swap(self.t, log=self._log)   # ★ 1.3.0
-            else:
-                # ★ 5.16.85: из отдельного апдейтера (update.pyw) — запустить
-                # саму программу, а не апдейтер снова
-                main = os.path.abspath(os.path.join(self.t.app_dir,
-                                                    self.t.main_file))
-                own = os.path.abspath(sys.argv[0] or "")
-                gh_update.restart(
-                    None if os.path.normcase(own) == os.path.normcase(main)
-                    else [main])
+            # ★ 5.16.85: из отдельного апдейтера (update.pyw) — запустить
+            # саму программу, а не апдейтер снова
+            main = os.path.abspath(os.path.join(self.t.app_dir,
+                                                self.t.main_file))
+            own = os.path.abspath(sys.argv[0] or "")
+            gh_update.restart(
+                None if os.path.normcase(own) == os.path.normcase(main)
+                else [main])
         except Exception as exc:                       # noqa: BLE001
             self._status("не удалось перезапустить: %s — закройте и "
                          "откройте программу сами" % exc, "#e05555")
@@ -600,8 +526,7 @@ class UpdateAnim(QWidget):
         if ph != self.ph:
             self.t0 = time.monotonic()
         self.ph, self.d = ph, d
-        if ph in ("checking", "available", "download", "install", "done",
-                  "building"):
+        if ph in ("checking", "available", "download", "install", "done"):
             self._tm.start()
         else:
             self._tm.stop()
@@ -684,8 +609,6 @@ class UpdateAnim(QWidget):
             self._ring(p, QPointF(cx_r, cy - 6), frac, acc, brd)
         elif ph == "install":
             self._gear(p, QPointF(cx_r, cy - 6), t, acc)
-        elif ph == "building":                     # ★ 1.3.0: GitHub собирает exe
-            self._gear(p, QPointF(cx_l + 40, cy - 30), t, QColor("#e0a030"))
         elif ph == "done":
             self._check(p, QPointF(cx_r, cy - 6), ok, min(1.0, t / 0.6))
         elif ph == "uptodate":
@@ -696,8 +619,7 @@ class UpdateAnim(QWidget):
             p.drawLine(mid + QPointF(-7, -7), mid + QPointF(7, 7))
             p.drawLine(mid + QPointF(-7, 7), mid + QPointF(7, -7))
         # ---- значок новой версии над облаком ----
-        if ph in ("available", "download", "install", "building") \
-                and d.get("ver"):
+        if ph in ("available", "download", "install") and d.get("ver"):
             pulse = 0.5 + 0.5 * math.sin(t * 4) if ph == "available" else 1
             self._font(p, 9, True)
             lab = "НОВАЯ %s" % d["ver"]
@@ -716,8 +638,7 @@ class UpdateAnim(QWidget):
         p.drawText(QRectF(cx_l - 115, cy + 46, 230, 16), Qt.AlignCenter,
                    self.repo or "репозиторий GitHub")
         p.drawText(QRectF(cx_r - 115, cy + 46, 230, 16), Qt.AlignCenter,
-                   "этот компьютер · %s · %s" % (
-                       self.cur, "exe" if gh_update.is_frozen() else "Python"))
+                   "этот компьютер · %s · Python" % self.cur)
         big, small, col = self._caption()
         self._font(p, 12, True)
         p.setPen(col or txt)
@@ -745,20 +666,9 @@ class UpdateAnim(QWidget):
             return ("Скачиваю %s — %d%%" % (d.get("ver"), pc),
                     "%s из %s МБ%s" % (_mb(got), _mb(tot), spd), None)
         if ph == "install":
-            if gh_update.is_frozen():
-                return ("Распаковываю сборку %s…" % d.get("ver"),
-                        "рядом с программой, в папку .gh_update_new", None)
             return ("Устанавливаю %s…" % d.get("ver"),
                     "старый код стираю, настройки не трогаю", None)
-        if ph == "building":
-            return ("Версия %s есть, exe ещё собирается" % d.get("ver"),
-                    "GitHub собирает exe 15–25 минут — проверю ещё раз сам",
-                    QColor("#e0a030"))
         if ph == "done":
-            if d.get("exe"):
-                return ("Готово: скачана %s" % d.get("ver"),
-                        "ставится при перезапуске — программа закроется и "
-                        "откроется новая", QColor("#3fbf6f"))
             return ("Готово: установлена %s" % d.get("ver"),
                     "нужен перезапуск программы", QColor("#3fbf6f"))
         if ph == "uptodate":
@@ -766,8 +676,7 @@ class UpdateAnim(QWidget):
                     "проверено в %s" % d.get("at", ""), QColor("#3fbf6f"))
         if ph == "error":
             return "Не получилось", str(d.get("text", ""))[:240], QColor("#e05555")
-        return ("Установлена версия %s (%s)" % (
-                    self.cur, "exe" if gh_update.is_frozen() else "Python"),
+        return ("Установлена версия %s (Python)" % self.cur,
                 "впишите токен и нажмите «Проверить сейчас»", None)
 
     @staticmethod
