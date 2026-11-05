@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """gh_update_qt — вкладка «Обновление с GitHub» для настроек (PySide6).
 
 ОБЩИЙ для всех наших приложений, работает поверх gh_update:
@@ -20,6 +19,7 @@
   on_quit — закрыть программу ПОЛНОСТЬЮ (новая копия уже запущена)
   page.box.available(str) — нашлась новая версия (пометить вкладку и т.п.)
 
+★ gh_update 1.4.1: Python 3.12+, строки на f-строках.
 ★ gh_update 1.4.0: только Python — обновления собранного exe больше нет
 (нет сборок в GitHub Releases, «GitHub собирает exe», подмены exe помощником).
 
@@ -80,7 +80,7 @@ class _Sig(QObject):
 
 
 def _mb(n):
-    return "%.1f" % (n / 1048576.0)
+    return f"{n / 1048576.0:.1f}"
 
 
 _COLORS = None                         # () -> dict, см. set_colors
@@ -170,12 +170,11 @@ class UpdateBox(QGroupBox):
         v.setContentsMargins(10, 6, 10, 8)
         v.setSpacing(6)
         self.setToolTip(
-            "Обновление из приватного репозитория %s/%s.\n"
-            "Программа запущена: %s.\n"
+            f"Обновление из приватного репозитория {target.owner}/{target.repo}.\n"
+            f"Программа запущена: {gh_update.run_kind_text()}.\n"
             "Берётся архив исходников из папки release нужной ветки.\nТокен "
             "GitHub — fine-grained, только этот репозиторий, Contents: "
-            "Read-only. Хранится только в настройках программы."
-            % (target.owner, target.repo, gh_update.run_kind_text()))
+            "Read-only. Хранится только в настройках программы.")
         row = QHBoxLayout()
         row.addWidget(QLabel("Токен:"))
         self.ed_token = QLineEdit(cfg.get("token") or "")
@@ -244,7 +243,7 @@ class UpdateBox(QGroupBox):
         self.bar.setRange(0, 1000)
         self.bar.hide()
         v.addWidget(self.bar)
-        self.lbl = QLabel("установлена версия %s · Python" % target.current)
+        self.lbl = QLabel(f"установлена версия {target.current} · Python")
         self.lbl.setWordWrap(True)
         self.lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
         v.addWidget(self.lbl)
@@ -294,14 +293,13 @@ class UpdateBox(QGroupBox):
         try:
             self._set(self._cfg())
         except Exception as exc:                       # noqa: BLE001
-            self._log("обновление: настройки не сохранены: %s" % exc)
+            self._log(f"обновление: настройки не сохранены: {exc}")
 
     def _auto_look(self):
         on = self.ch_auto.isChecked()
         self.ch_auto.setToolTip(
-            "Через 30 с после запуска и дальше каждые %s (выбор «Каждые»). "
-            "Ставит только по вашей кнопке.\nНажать — включить / выключить."
-            % self.cb_every.currentText())
+            f"Через 30 с после запуска и дальше каждые {self.cb_every.currentText()} (выбор «Каждые»). "
+            "Ставит только по вашей кнопке.\nНажать — включить / выключить.")
         self.ch_auto.setText(("✓ " if on else "✗ ") + "Проверять автоматически")
         th = _theme()
         off = (getattr(th, "BG_PANEL", "") or "#3a3f46",
@@ -331,7 +329,7 @@ class UpdateBox(QGroupBox):
             self._timer.start(self._every_h() * 3600 * 1000)
 
     def _status(self, text, color=""):
-        self.lbl.setStyleSheet("color:%s;" % color if color else "")
+        self.lbl.setStyleSheet(f"color:{color};" if color else "")
         self.lbl.setText(text)
 
     def _target(self):
@@ -352,7 +350,7 @@ class UpdateBox(QGroupBox):
             return
         self._busy = True
         self.btn_check.setEnabled(False)
-        self._status("проверяю %s/%s (%s)…" % (t.owner, t.repo, t.branch))
+        self._status(f"проверяю {t.owner}/{t.repo} ({t.branch})…")
         self.phase.emit("checking", {})
 
         def work():
@@ -372,29 +370,28 @@ class UpdateBox(QGroupBox):
         self.last_check = time.strftime("%H:%M")
         self._last_err = err
         if err:
-            self._log("обновление: %s" % err)
+            self._log(f"обновление: {err}")
             self._status("ошибка: " + err + (" — см. «?»" if any(
                 c in err for c in ("401", "403", "404", "токен")) else ""),
                 "#e05555")
             self.phase.emit("error", {"text": err})
             return
         if rel is None:
-            self._status("в release/ нет архивов %s_v*.zip" % self.t.name,
+            self._status(f"в release/ нет архивов {self.t.name}_v*.zip",
                          "#e0a030")
             self.phase.emit("error", {"text": "в release/ нет архивов"})
             return
         if not new:
             self.btn_update.hide()
-            self._status("✓ последняя версия (%s)" % self.t.current, "#3fbf6f")
+            self._status(f"✓ последняя версия ({self.t.current})", "#3fbf6f")
             self.phase.emit("uptodate", {"at": self.last_check})
             return
         self._rel = rel
-        self.btn_update.setText("⬇ Обновить до %s" % rel.version)
+        self.btn_update.setText(f"⬇ Обновить до {rel.version}")
         self.btn_update.show()
-        self._status("доступна версия %s (исходники, %s МБ), у вас %s"
-                     % (rel.version, _mb(rel.size), self.t.current),
+        self._status(f"доступна версия {rel.version} (исходники, {_mb(rel.size)} МБ), у вас {self.t.current}",
                      "#4aa3ff")
-        self._log("обновление: доступна версия %s" % rel.version)
+        self._log(f"обновление: доступна версия {rel.version}")
         self.phase.emit("available", {"ver": rel.version, "size": rel.size,
                                       "new": wn})
         self.available.emit(rel.version)
@@ -419,7 +416,7 @@ class UpdateBox(QGroupBox):
         self.bar.setValue(0)
         self.bar.setFormat("скачиваю…")
         self.bar.show()
-        self._status("скачиваю %s…" % rel.path)
+        self._status(f"скачиваю {rel.path}…")
         self.phase.emit("download", {"got": 0, "total": rel.size,
                                      "ver": rel.version})
 
@@ -430,8 +427,7 @@ class UpdateBox(QGroupBox):
                     progress=lambda got, tot: self._sig.progress.emit(got, tot))
                 self._sig.progress.emit(-1, 0)          # «устанавливаю»
                 n = gh_update.install(t, path, rel.version, log=self._log)
-                self._sig.done.emit(True, "обновлено до %s (файлов: %d)"
-                                    % (rel.version, len(n)))
+                self._sig.done.emit(True, f"обновлено до {rel.version} (файлов: {len(n)})")
             except Exception as exc:                   # noqa: BLE001
                 self._sig.done.emit(False, str(exc))
         threading.Thread(target=work, daemon=True, name="gh-update").start()
@@ -444,10 +440,9 @@ class UpdateBox(QGroupBox):
             return
         if total > 0:
             self.bar.setValue(min(1000, got * 1000 // total))
-            self.bar.setFormat("%s из %s МБ — %d%%"
-                               % (_mb(got), _mb(total), got * 100 // total))
+            self.bar.setFormat(f"{_mb(got)} из {_mb(total)} МБ — {got * 100 // total}%")
         else:
-            self.bar.setFormat("%s МБ" % _mb(got))
+            self.bar.setFormat(f"{_mb(got)} МБ")
         self.phase.emit("download", {"got": got, "total": total,
                                      "ver": self._rel.version})
 
@@ -455,7 +450,7 @@ class UpdateBox(QGroupBox):
         self._busy = False
         self.btn_check.setEnabled(True)
         self.btn_update.setEnabled(True)
-        self._log("обновление: %s" % text)
+        self._log(f"обновление: {text}")
         if not ok:
             self.bar.hide()
             self._status("ошибка: " + text, "#e05555")
@@ -471,8 +466,7 @@ class UpdateBox(QGroupBox):
         if not self.restart_ask:                   # ★ 1.3.3: обновили — перезапускаем сами
             QTimer.singleShot(3000, self.restart)
             return
-        msg = ("Программа обновлена до %s.\nПерезапустить сейчас?"
-               % self._rel.version)
+        msg = (f"Программа обновлена до {self._rel.version}.\nПерезапустить сейчас?")
         ans = QMessageBox.question(self, "Обновление", msg)
         if ans == QMessageBox.Yes:
             self.restart()
@@ -488,8 +482,8 @@ class UpdateBox(QGroupBox):
                 None if os.path.normcase(own) == os.path.normcase(main)
                 else [main])
         except Exception as exc:                       # noqa: BLE001
-            self._status("не удалось перезапустить: %s — закройте и "
-                         "откройте программу сами" % exc, "#e05555")
+            self._status(f"не удалось перезапустить: {exc} — закройте и "
+                         "откройте программу сами", "#e05555")
             return
         if self._quit:
             QTimer.singleShot(0, self._quit)
@@ -622,7 +616,7 @@ class UpdateAnim(QWidget):
         if ph in ("available", "download", "install") and d.get("ver"):
             pulse = 0.5 + 0.5 * math.sin(t * 4) if ph == "available" else 1
             self._font(p, 9, True)
-            lab = "НОВАЯ %s" % d["ver"]
+            lab = f"НОВАЯ {d['ver']}"
             bw = p.fontMetrics().horizontalAdvance(lab) + 22
             r = QRectF(cx_l - bw / 2, cy - 74, bw, 22)
             c = QColor(acc)
@@ -638,7 +632,7 @@ class UpdateAnim(QWidget):
         p.drawText(QRectF(cx_l - 115, cy + 46, 230, 16), Qt.AlignCenter,
                    self.repo or "репозиторий GitHub")
         p.drawText(QRectF(cx_r - 115, cy + 46, 230, 16), Qt.AlignCenter,
-                   "этот компьютер · %s · Python" % self.cur)
+                   f"этот компьютер · {self.cur} · Python")
         big, small, col = self._caption()
         self._font(p, 12, True)
         p.setPen(col or txt)
@@ -654,29 +648,29 @@ class UpdateAnim(QWidget):
         if ph == "checking":
             return "Проверяю, есть ли новая версия…", "спрашиваю GitHub", None
         if ph == "available":
-            return ("Доступна новая версия %s" % d.get("ver"),
-                    "размер %s МБ · у вас %s · нажмите «Обновить до %s»"
-                    % (_mb(d.get("size") or 0), self.cur, d.get("ver")),
+            return (f"Доступна новая версия {d.get('ver')}",
+                    f"размер {_mb(d.get('size') or 0)} МБ · у вас {self.cur} · "
+                    f"нажмите «Обновить до {d.get('ver')}»",
                     QColor("#4aa3ff"))
         if ph == "download":
             tot = int(d.get("total") or 0)
             got = int(d.get("got") or 0)
             pc = (got * 100 // tot) if tot else 0
-            spd = (" · %s МБ/с" % _mb(self._speed)) if self._speed > 0 else ""
-            return ("Скачиваю %s — %d%%" % (d.get("ver"), pc),
-                    "%s из %s МБ%s" % (_mb(got), _mb(tot), spd), None)
+            spd = (f" · {_mb(self._speed)} МБ/с") if self._speed > 0 else ""
+            return (f"Скачиваю {d.get('ver')} — {pc}%",
+                    f"{_mb(got)} из {_mb(tot)} МБ{spd}", None)
         if ph == "install":
-            return ("Устанавливаю %s…" % d.get("ver"),
+            return (f"Устанавливаю {d.get('ver')}…",
                     "старый код стираю, настройки не трогаю", None)
         if ph == "done":
-            return ("Готово: установлена %s" % d.get("ver"),
+            return (f"Готово: установлена {d.get('ver')}",
                     "нужен перезапуск программы", QColor("#3fbf6f"))
         if ph == "uptodate":
-            return ("У вас последняя версия %s" % self.cur,
-                    "проверено в %s" % d.get("at", ""), QColor("#3fbf6f"))
+            return (f"У вас последняя версия {self.cur}",
+                    f"проверено в {d.get('at', '')}", QColor("#3fbf6f"))
         if ph == "error":
             return "Не получилось", str(d.get("text", ""))[:240], QColor("#e05555")
-        return ("Установлена версия %s (Python)" % self.cur,
+        return (f"Установлена версия {self.cur} (Python)",
                 "впишите токен и нажмите «Проверить сейчас»", None)
 
     @staticmethod
@@ -699,8 +693,7 @@ class UpdateAnim(QWidget):
         """Значок GitHub цветом color, по центру (cx, cy). -> False, если нарисовать нечем (нет QtSvg)."""
         if QSvgRenderer is None:
             return False
-        svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path fill="%s" d="%s"/></svg>'
-               % (QColor(color).name(), self.GITHUB_MARK))
+        svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path fill="{QColor(color).name()}" d="{self.GITHUB_MARK}"/></svg>')
         r = QSvgRenderer(QByteArray(svg.encode("ascii")))
         if not r.isValid():
             return False
@@ -759,7 +752,7 @@ class UpdateAnim(QWidget):
         p.drawArc(r, 90 * 16, -int(360 * 16 * frac))
         self._font(p, 8, True)
         p.setPen(QColor("#ffffff"))
-        p.drawText(r, Qt.AlignCenter, "%d%%" % int(frac * 100))
+        p.drawText(r, Qt.AlignCenter, f"{int(frac * 100)}%")
 
     def _gear(self, p, c, t, acc):
         p.save()
@@ -810,7 +803,7 @@ class UpdatePage(QWidget):
         h.addWidget(self.box, 0, Qt.AlignTop)
         right = QVBoxLayout()
         right.setSpacing(8)
-        self.anim = UpdateAnim(target.current, "%s/%s" % (target.owner, target.repo))
+        self.anim = UpdateAnim(target.current, f"{target.owner}/{target.repo}")
         right.addWidget(self.anim)
         self.gb_new = QGroupBox("📝 Что нового")
         gv = QVBoxLayout(self.gb_new)
@@ -828,6 +821,6 @@ class UpdatePage(QWidget):
         self.anim.set_phase(ph, d)
         if ph == "available":
             ver = d.get("ver")
-            self.gb_new.setTitle("📝 Что нового в %s" % ver)
+            self.gb_new.setTitle(f"📝 Что нового в {ver}")
             self.txt_new.setPlainText(d.get("new") or
-                                      "(в CHANGELOG нет раздела про %s)" % ver)
+                                      f"(в CHANGELOG нет раздела про {ver})")

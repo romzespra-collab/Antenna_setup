@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """gh_update_help — окно «Как получить токен GitHub» (общее, PySide6).
 
 Пошаговая инструкция с картинками. Картинки — схемы страниц GitHub,
@@ -358,8 +357,8 @@ class _Mock(QWidget):
 
 
 def _steps(owner, repo, app_name, target=None):
-    full = "%s/%s" % (owner, repo)
-    nm = "%s_update" % app_name
+    full = f"{owner}/{repo}"
+    nm = f"{app_name}_update"
     where = getattr(target, "where", "") or "Настройки → 🔄 Обновление"
     new_url = "github.com/settings/personal-access-tokens/new"
     return [
@@ -377,14 +376,14 @@ def _steps(owner, repo, app_name, target=None):
               "Never used • ⚠ This token has no expiration date"),
          ], url="github.com/settings/personal-access-tokens")),
         ("Имя и срок действия",
-         "<b>Token name</b> — любое, например <b>%s</b>. Description — можно "
-         "пусто.<br><b>Resource owner</b> — <b>%s</b> (уже стоит).<br>"
+         f"<b>Token name</b> — любое, например <b>{nm}</b>. Description — можно "
+         f"пусто.<br><b>Resource owner</b> — <b>{owner}</b> (уже стоит).<br>"
          "<b>Expiration</b> — <b>No expiration</b> (бессрочно) или свой срок "
-         "(истечёт — сделать новый)." % (nm, owner),
+         "(истечёт — сделать новый).",
          _Mock("New fine-grained personal access token", [
              ("label", "Token name *", 0),
              ("input", nm, 1),
-             ("note", "✔ '%s' is available." % nm, 0, _GREEN),
+             ("note", f"✔ '{nm}' is available.", 0, _GREEN),
              ("label", "Resource owner", 0),
              ("dropdown", "👤 " + owner, 2, 200),
              ("label", "Expiration", 0),
@@ -394,8 +393,8 @@ def _steps(owner, repo, app_name, target=None):
          "⚠ По умолчанию отмечено <b>Public repositories</b> — с ним токен "
          "<b>НЕ видит</b> приватный репозиторий (программа скажет «токен не "
          "видит репозиторий»).<br>Отметьте <b>Only select repositories</b> → "
-         "<b>Select repositories</b> → <b>%s</b>. Ниже должна появиться "
-         "строка с 🔒 и «Selected 1 repository»." % full,
+         f"<b>Select repositories</b> → <b>{full}</b>. Ниже должна появиться "
+         "строка с 🔒 и «Selected 1 repository».",
          _Mock("Repository access", [
              ("radio", "Public repositories   ← по умолчанию, НЕ ТО", 0, False),
              ("radio", "All repositories", 0, False),
@@ -435,12 +434,12 @@ def _steps(owner, repo, app_name, target=None):
              ("token", "", 2),
          ], url="github.com/settings/personal-access-tokens")),
         ("Вставить в программу и проверить",
-         "<b>%s</b> → поле <b>Токен</b> → вставить "
+         f"<b>{where}</b> → поле <b>Токен</b> → вставить "
          "(Ctrl+V, старый текст удалить) → <b>«🔍 Проверить сейчас»</b>.<br>"
          "Получилось: «✓ последняя версия» или «доступна версия X» → "
          "<b>«⬇ Обновить до X»</b>. Один токен подходит всем программам "
-         "этого репозитория." % where,
-         _Mock("%s → %s" % (app_name, where), [
+         "этого репозитория.",
+         _Mock(f"{app_name} → {where}", [
              ("app", "", 1),
          ], url="(это окно программы)")),
         ("Если ошибка — что сделать",
@@ -450,7 +449,7 @@ def _steps(owner, repo, app_name, target=None):
          "<b>Edit</b> → исправить → <b>Update</b> (в программе менять не надо).",
          _Mock("Сообщение программы → что делать", [
              ("pair", "токен не видит репозиторий", 0,
-              "шаг 3: Only select repositories → %s" % repo),
+              f"шаг 3: Only select repositories → {repo}"),
              ("pair", "у токена нет права читать файлы", 0,
               "шаг 4: Contents → Read-only"),
              ("pair", "токен GitHub недействителен", 0,
@@ -484,34 +483,32 @@ def _layout_step(owner, repo, t):
     nv = ".".join(ver.split(".")[:-1] + [str(int(ver.split(".")[-1]) + 1)]) \
         if ver.split(".")[-1].isdigit() else ver
     C, D, G = "#0969da", _DIM, _GREEN
-    tree = [("%s/%s     (приватный, ветка %s)" % (owner, repo, branch), C, 1)]
+    tree = [(f"{owner}/{repo}     (приватный, ветка {branch})", C, 1)]
     if src:
-        tree += [("├─ %s/          ← исходники программы" % src, None, 0),
-                 ("│   ├─ %s" % main, None, 0),
-                 ("│   ├─ CHANGELOG.txt     ← «Что нового»: разделы «%s:»" % nv, None, 4),
-                 ("│   └─ %s    VERSION = \"%s\"" % (vf, nv), None, 0)]
+        tree += [(f"├─ {src}/          ← исходники программы", None, 0),
+                 (f"│   ├─ {main}", None, 0),
+                 (f"│   ├─ CHANGELOG.txt     ← «Что нового»: разделы «{nv}:»", None, 4),
+                 (f"│   └─ {vf}    VERSION = \"{nv}\"", None, 0)]
     tree += [("└─ release/                 ← ровно так, в корне репозитория", G, 2),
-             ("    └─ %s_v%s.zip     ← берётся самый новый номер" % (name, nv), G, 3),
-             ("        └─ %s/  %s" % (name, main if vf == main else main + ", " + vf),
+             (f"    └─ {name}_v{nv}.zip     ← берётся самый новый номер", G, 3),
+             (f"        └─ {name}/  {main if vf == main else main + ', ' + vf}",
               D, 0)]
     return (
         "Где должен лежать проект на GitHub",
         "Программа берёт обновление из <b>release/</b> в корне репозитория "
-        "<b>%s/%s</b>, ветка <b>%s</b>. Архив — <b>%s_vX.Y.Z.zip</b> (номер "
-        "только цифрами). Внутри — папка <b>%s/</b> с <b>%s</b> и "
-        "номером версии в <b>%s</b>; он должен совпадать с номером в имени "
-        "архива, иначе установка отменится. Старые архивы можно удалять." % (
-            owner, repo, branch, name, name, main, vf),
+        f"<b>{owner}/{repo}</b>, ветка <b>{branch}</b>. Архив — <b>{name}_vX.Y.Z.zip</b> (номер "
+        f"только цифрами). Внутри — папка <b>{name}/</b> с <b>{main}</b> и "
+        f"номером версии в <b>{vf}</b>; он должен совпадать с номером в имени "
+        "архива, иначе установка отменится. Старые архивы можно удалять.",
         _Mock("Репозиторий на GitHub", [
             ("code", "", 0, tree),
             ("note", "Собрать архив (из корня репозитория):", 0),
-            ("code", "", 0, [("git archive --format=zip --prefix=%s/ \\" % name,
+            ("code", "", 0, [(f"git archive --format=zip --prefix={name}/ \\",
                               None, 0),
-                             ("    -o release/%s_v%s.zip HEAD:%s"
-                              % (name, nv, src or "."), None, 0)]),
+                             (f"    -o release/{name}_v{nv}.zip HEAD:{src or '.'}", None, 0)]),
             ("note", "Несколько программ в одном репозитории — у каждой свой "
                      "префикс архива, токен один.", 0),
-        ], url="github.com/%s/%s/tree/%s" % (owner, repo, branch), h=372))
+        ], url=f"github.com/{owner}/{repo}/tree/{branch}", h=372))
 
 
 # по тексту ошибки программы — какой шаг инструкции открыть сразу
@@ -592,9 +589,9 @@ class TokenHelpDialog(QDialog):
         i = max(0, min(len(self.steps) - 1, self.stack.currentIndex() + d))
         self.stack.setCurrentIndex(i)
         title, text, _m = self.steps[i]
-        self.lbl_head.setText("Шаг %d. %s" % (i + 1, title))
+        self.lbl_head.setText(f"Шаг {i + 1}. {title}")
         self.lbl_text.setText(text)
-        self.lbl_n.setText(" %d / %d " % (i + 1, len(self.steps)))
+        self.lbl_n.setText(f" {i + 1} / {len(self.steps)} ")
         self.btn_prev.setEnabled(i > 0)
         last = i == len(self.steps) - 1
         self.btn_next.setText("Готово ✓" if last else "Далее ▶")
