@@ -19,7 +19,7 @@
   on_quit — закрыть программу ПОЛНОСТЬЮ (новая копия уже запущена)
   page.box.available(str) — нашлась новая версия (пометить вкладку и т.п.)
 
-★ gh_update 1.4.1: Python 3.12+, строки на f-строках.
+★ gh_update 1.4.2: Python 3.12+, строки на f-строках.
 ★ gh_update 1.4.0: только Python — обновления собранного exe больше нет
 (нет сборок в GitHub Releases, «GitHub собирает exe», подмены exe помощником).
 
@@ -158,6 +158,7 @@ class UpdateBox(QGroupBox):
         self.restart_ask = restart_ask         # ★ 1.3.3: False — перезапуск сам через 3 с
         self._rel = None
         self._busy = False
+        self._installing = False       # ★ 1.4.1: скачивание / установка
         self._last_err = ""
         self.last_check = ""
         self._sig = _Sig(self)
@@ -398,8 +399,10 @@ class UpdateBox(QGroupBox):
 
     # ---------- скачивание и установка ----------
     def busy(self):
-        """★ 1.3.2 (из 1.2.2): идёт скачивание / установка — окно не закрывать."""
-        return self._busy
+        """★ 1.3.2 (из 1.2.2): идёт скачивание / установка — окно не закрывать.
+        ★ 1.4.1: только они — простая проверка версии закрыть не мешает
+        (раньше окно не закрывалось «идёт установка», пока GitHub думал)."""
+        return self._installing
 
     def update_now(self):
         if self._busy or self._rel is None:
@@ -411,6 +414,7 @@ class UpdateBox(QGroupBox):
         t, token = self._target()
         rel = self._rel
         self._busy = True
+        self._installing = True
         self.btn_check.setEnabled(False)
         self.btn_update.setEnabled(False)
         self.bar.setValue(0)
@@ -448,6 +452,7 @@ class UpdateBox(QGroupBox):
 
     def _on_done(self, ok, text):
         self._busy = False
+        self._installing = False
         self.btn_check.setEnabled(True)
         self.btn_update.setEnabled(True)
         self._log(f"обновление: {text}")
