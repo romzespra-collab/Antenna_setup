@@ -36,8 +36,17 @@
 wait_previous(sys.argv) — ждёт, пока старая завершится (иначе защита от
 второго запуска приняла бы её за «уже запущено»).
 
-1.4.1: только Python 3.12+ — строки на f-строках, без старых приёмов
-(«# -*- coding»). Поведение не менялось.
+1.4.2: только Python 3.12+ — строки на f-строках, без «# -*- coding».
+Поведение не менялось. (Две ветки «1.4.1» — SmartMon и остальные
+проекты — сведены в одну.)
+
+1.4.1: свои файлы пользователя не стираются и без списка MANIFEST: папки
+tools/ и modules/ — всегда свои (user_dirs по умолчанию), копия из git
+(.git рядом) старый код не чистит, список, который не прочитался (занят), —
+не повод для чистки «по архиву»; запрет GitHub из-за лимита запросов —
+«лимит», а не «токен не видит репозиторий»; новая версия вышла, пока
+окно было открыто, — понятная ошибка вместо 404; gh_update_qt: busy() —
+только скачивание / установка (во время проверки версии окно закрывается).
 
 1.4.0: убрано обновление собранного exe — только Python. Нет больше
 check_exe / latest_exe / download_exe / stage_exe / launch_swap /
@@ -115,7 +124,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass, field
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 API = "https://api.github.com"
 TIMEOUT = 30
 
@@ -144,6 +153,10 @@ KEEP_DIRS = frozenset((
     ".gh_update_old"))
 
 
+# ★ 1.4.1: свои папки пользователя — без списка MANIFEST их не чистим никогда
+USER_DIRS = ("modules", "tools")
+
+
 class UpdateError(Exception):
     """Ошибка обновления; текст — по-русски, для пользователя.
     code — HTTP-код ответа GitHub (0 — не HTTP)."""
@@ -169,7 +182,9 @@ class UpdateTarget:
     version_files: tuple = ()     # где ещё искать VERSION = "…" в архиве
     where: str = "Настройки → 🔄 Обновление"   # где вкладка (для инструкции)
     removed: list = field(default_factory=list)  # ★ 1.2.0: что стёрла install()
-    user_dirs: tuple = ()         # ★ 1.2.1/1.3.2: свои файлы пользователя (modules/ …) — без списка не чистить
+    # ★ 1.2.1/1.3.2: свои файлы пользователя (modules/ …) — без списка не
+    # чистить; ★ 1.4.1: tools/ и modules/ — по умолчанию у всех
+    user_dirs: tuple = USER_DIRS
     own: tuple = ()               # ★ 1.3.3 (из WinHub 1.2.1): маски своих файлов — ставим, но не стираем
 
 
@@ -229,6 +244,11 @@ def _open(url, token, accept="application/vnd.github+json", timeout=TIMEOUT,
         if e.code == 401:
             raise UpdateError("токен GitHub не подошёл (401): проверь, что он "
                               "вставлен целиком и не истёк", 401) from e
+        if e.code == 403 and (e.headers or {}).get(
+                "X-RateLimit-Remaining") == "0":
+            # ★ 1.4.1: лимит запросов — не «нет доступа» (без разбора токена)
+            raise UpdateError("GitHub: исчерпан лимит запросов — попробуй "
+                              "через час", 429) from e
         if e.code == 403:
             raise UpdateError("GitHub не дал доступ (403): у токена нет права "
                               "Contents: Read на этот репозиторий, или лимит "
@@ -406,12 +426,20 @@ def download(t, token, rel, progress=None):
     докачка с места обрыва."""
     api = f"{API}/repos/{t.owner}/{t.repo}/contents/{urllib.parse.quote(rel.path)}?ref={urllib.parse.quote(t.branch)}"
     url = rel.url
+    fresh = None
     try:                                       # ссылка живёт минуты — свежая
         fresh = latest(t, token)
         if fresh is not None and fresh.path == rel.path and fresh.url:
             url = fresh.url
     except Exception:                          # noqa: BLE001
         pass
+    if fresh is not None and fresh.path != rel.path \
+            and newer(fresh.version, rel.version):
+        # ★ 1.4.1: пока окно было открыто, вышла ещё новее — прежнего архива
+        # в release/ уже нет (лежит только последний): было 404 и совет
+        # про токен
+        raise UpdateError(f"на GitHub уже версия {fresh.version} — нажми «Проверить "
+                          "сейчас»")
     srcs = [(url, "application/octet-stream")] if url else []
     srcs.append((api, "application/vnd.github.raw"))
     buf = bytearray()
@@ -476,8 +504,12 @@ def stale_files(app_dir, new_files, keep=KEEP_DEFAULT, user_dirs=()):
     ещё нет. Смотрим только папки, которые есть в архиве (app/, tests/ …):
     корень (свои скрипты рядом с программой), папки данных (KEEP_DIRS) и
     виртуальные окружения (pyvenv.cfg) — мимо."""
-    mine = set(d.strip("/\\").replace("\\", "/").lower() for d in user_dirs)
+    mine = set(d.strip("/\\").replace("\\", "/").lower()
+               for d in tuple(user_dirs) + USER_DIRS)
     app_dir = os.path.abspath(app_dir)
+    # ★ 1.4.1: копия из git — тут свои незакоммиченные модули, не чистим
+    if os.path.exists(os.path.join(app_dir, ".git")):
+        return []
     new = set(f.replace("\\", "/") for f in new_files)
     new_nc = set(os.path.normcase(f) for f in new)
     out = []
@@ -502,13 +534,17 @@ def stale_files(app_dir, new_files, keep=KEEP_DEFAULT, user_dirs=()):
 
 
 def read_manifest(app_dir):
-    """Что поставило прошлое обновление -> set или None (списка нет)."""
+    """Что поставило прошлое обновление -> set или None (списка нет).
+    ★ 1.4.1: список есть, но не читается (занят антивирусом) — пустой set:
+    чистить нечего (раньше None — и чистка шла «по архиву»)."""
     try:
         with open(os.path.join(app_dir, MANIFEST), encoding="utf-8") as fh:
             return set(x.strip().replace("\\", "/") for x in fh
                        if x.strip() and not x.startswith("#"))
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError:
+        return set()
 
 
 def write_manifest(app_dir, files):
