@@ -1,6 +1,5 @@
-# -*- coding: utf-8 -*-
 """
-antenna_setup.pyw  v0.6.3
+antenna_setup.pyw  v0.6.4
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -8,6 +7,9 @@ antenna_setup.pyw  v0.6.3
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.6.4: Python 3.12+: PySide6 ≥ 6.10.1 (автоустановка и requirements.txt), код очищен автоправкой ruff
+          (кодировка в шапке, socket.timeout → TimeoutError), setup.bat: тексты под Windows 10+ и
+          Python 3.12+; gh_update 1.4.1.
   v0.6.3: обновление — только Python: убрано обновление собранного exe (gh_update 1.4.0), GitHub больше
           не собирает exe; собранный exe сам не обновляется.
   v0.6.2: обновление с GitHub — общий модуль gh_update 1.3.3 (обрыв ответа GitHub — понятная ошибка, при сбое
@@ -112,7 +114,7 @@ antenna_setup.pyw  v0.6.3
   v0.1.0: первая версия: пресеты антенн, статический IP через netsh,
           возврат на DHCP, проверка доступности, открытие в браузере.
 """
-VERSION = "0.6.3"
+VERSION = "0.6.4"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -151,7 +153,7 @@ NO_WINDOW = 0x08000000
 IS_WIN = sys.platform == "win32"
 
 # ───────────────────────── авто-установка библиотек ─────────────────────────
-REQUIRED = (("PySide6", "PySide6>=6.5"),)
+REQUIRED = (("PySide6", "PySide6>=6.10.1"),)
 
 
 def _python_exe():
@@ -785,7 +787,7 @@ def raw_probe(ip, src=None, timeout=HTTP_TIMEOUT):
         while len(data) < 8192:
             try:
                 chunk = sk.recv(4096)
-            except socket.timeout:
+            except TimeoutError:
                 break
             if not chunk:
                 break
@@ -1031,7 +1033,7 @@ def listen_wire(src_ip, seconds=12.0, stopped=lambda: False):
             while not done.is_set():
                 try:
                     pkt = r.recv(65535)
-                except socket.timeout:
+                except TimeoutError:
                     continue
                 if len(pkt) >= 20 and pkt[0] >> 4 == 4:
                     add(socket.inet_ntoa(pkt[12:16]), "")
@@ -1062,7 +1064,7 @@ def listen_wire(src_ip, seconds=12.0, stopped=lambda: False):
                             pass
                 try:
                     data, (ip, _port) = u.recvfrom(4096)
-                except (socket.timeout, OSError):
+                except (TimeoutError, OSError):
                     continue
                 res = parse_ubnt(data) or parse_mndp(data)
                 add(ip, res[1] if res else "")
@@ -1445,7 +1447,7 @@ def dhcp_serve(bind_ip, mac, offer_ip, seconds=120, stopped=lambda: False, log=p
         while time.monotonic() < end and not stopped():
             try:
                 req, _ = sk.recvfrom(2048)
-            except socket.timeout:
+            except TimeoutError:
                 continue
             rep, what = dhcp_reply(req, bind_ip, offer_ip, only_mac=mac)
             if not rep:
@@ -4416,7 +4418,7 @@ class MainWindow(QWidget):
         """При выходе: программа меняла сеть — спросить и вернуть как было (по умолчанию «да»)."""
         if not IS_WIN:
             return
-        changed = list((self.cfg.get("saved_net") or {}))
+        changed = list(self.cfg.get("saved_net") or {})
         if changed:
             mb = QMessageBox(QMessageBox.Question, "Выход",
                              f"Программа меняла адрес «{', '.join(changed)}» (временный адрес на кабеле).\n\n"

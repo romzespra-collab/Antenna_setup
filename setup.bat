@@ -3,7 +3,7 @@ chcp 65001 >nul
 setlocal EnableExtensions
 title Настройка антенны - установка
 rem ============================================================
-rem  setup.bat  v0.6.3 (antenna_setup)
+rem  setup.bat  v0.6.4 (antenna_setup)
 rem  По образцу START_ON_NEW_PC.bat из SmartMon (проверенный).
 rem  Python 3.15 - ОДИН на компьютер для всех наших программ: уже
 rem  стоит - берётся он; нет - ставится официальным установщиком
@@ -24,14 +24,14 @@ goto :findfirst
 
 :tooold
 echo.
-echo Эта Windows (%WINVER%) слишком старая: нужна Windows 7 SP1 или новее.
+echo Эта Windows (%WINVER%) слишком старая: нужна Windows 10 или новее.
 pause
 exit /b 2
 
 :oldwin
 echo.
 echo Эта Windows (%WINVER%) старше Windows 10: программа на ней
-echo не запустится - ей нужны Qt6 и Python 3.10+, а они требуют
+echo не запустится - ей нужны Qt6 и Python 3.12+, а они требуют
 echo Windows 10 или новее.
 pause
 exit /b 2

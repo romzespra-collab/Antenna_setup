@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """gh_update — обновление программы из приватного репозитория GitHub.
 
 ОБЩИЙ модуль для всех наших приложений (только стандартная библиотека):
@@ -36,6 +35,9 @@
 --after-update <pid> и закрывает текущую. Новая копия в самом начале зовёт
 wait_previous(sys.argv) — ждёт, пока старая завершится (иначе защита от
 второго запуска приняла бы её за «уже запущено»).
+
+1.4.1: только Python 3.12+ — строки на f-строках, без старых приёмов
+(«# -*- coding»). Поведение не менялось.
 
 1.4.0: убрано обновление собранного exe — только Python. Нет больше
 check_exe / latest_exe / download_exe / stage_exe / launch_swap /
@@ -113,7 +115,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass, field
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 API = "https://api.github.com"
 TIMEOUT = 30
 
@@ -235,17 +237,15 @@ def _open(url, token, accept="application/vnd.github+json", timeout=TIMEOUT,
             raise UpdateError("не найдено (404): репозиторий/ветка/папка release "
                               "не те, или токен не видит приватный репозиторий",
                               404) from e
-        raise UpdateError("GitHub ответил %s" % e.code, e.code) from e
+        raise UpdateError(f"GitHub ответил {e.code}", e.code) from e
     except (urllib.error.URLError, OSError) as e:
-        raise UpdateError("нет связи с GitHub (%s)" % getattr(e, "reason", e)) from e
+        raise UpdateError(f"нет связи с GitHub ({getattr(e, 'reason', e)})") from e
 
 
 def latest(t, token):
     """Последний архив в release/ ветки -> Release или None (архивов нет)."""
     folder = (t.subdir.strip("/") + "/release") if t.subdir else "release"
-    url = "%s/repos/%s/%s/contents/%s?ref=%s" % (
-        API, t.owner, t.repo, urllib.parse.quote(folder),
-        urllib.parse.quote(t.branch))
+    url = f"{API}/repos/{t.owner}/{t.repo}/contents/{urllib.parse.quote(folder)}?ref={urllib.parse.quote(t.branch)}"
     try:
         with _open(url, token) as r:
             items = json.loads(r.read().decode("utf-8"))
@@ -254,10 +254,10 @@ def latest(t, token):
             raise UpdateError(diagnose(t, token, folder), e.code) from e
         raise
     except (OSError, ValueError, http.client.HTTPException) as e:    # ★ 1.3.3: обрыв при чтении ответа
-        raise UpdateError("ответ GitHub не дочитан: %s" % e) from e
+        raise UpdateError(f"ответ GitHub не дочитан: {e}") from e
     if not isinstance(items, list):
         raise UpdateError("GitHub вернул не список файлов папки release")
-    pat = re.compile(r"^%s_v?(\d+(?:\.\d+)*)\.zip$" % re.escape(t.name), re.I)
+    pat = re.compile(rf"^{re.escape(t.name)}_v?(\d+(?:\.\d+)*)\.zip$", re.I)
     best = None
     for it in items:
         m = pat.match(str(it.get("name") or ""))
@@ -284,28 +284,28 @@ def diagnose(t, token, folder="release"):
     исправить (GitHub на приватный репозиторий без доступа отвечает 404 —
     по одному коду не понять)."""
     q = urllib.parse.quote
-    full = "%s/%s" % (t.owner, t.repo)
-    c = _code("%s/user" % API, token)
+    full = f"{t.owner}/{t.repo}"
+    c = _code(f"{API}/user", token)
     if c == 401:
         return ("токен GitHub недействителен (удалён, истёк или вставлен не "
                 "целиком) — сделайте новый, кнопка «?»")
-    c = _code("%s/repos/%s" % (API, full), token)
+    c = _code(f"{API}/repos/{full}", token)
     if c in (403, 404):
-        return ("токен не видит репозиторий %s. На GitHub: токен → Edit → "
-                "Repository access → Only select repositories → добавьте %s "
-                "(и Resource owner — %s)" % (full, full, t.owner))
+        return (f"токен не видит репозиторий {full}. На GitHub: токен → Edit → "
+                f"Repository access → Only select repositories → добавьте {full} "
+                f"(и Resource owner — {t.owner})")
     if c != 200:
-        return "GitHub не отвечает на запрос репозитория (код %s)" % c
-    c = _code("%s/repos/%s/branches/%s" % (API, full, q(t.branch)), token)
+        return f"GitHub не отвечает на запрос репозитория (код {c})"
+    c = _code(f"{API}/repos/{full}/branches/{q(t.branch)}", token)
     if c == 404:
-        return ("в репозитории %s нет ветки «%s» — впишите в поле «Ветка» "
-                "правильную (обычно main)" % (full, t.branch))
-    c = _code("%s/repos/%s/contents/?ref=%s" % (API, full, q(t.branch)), token)
+        return (f"в репозитории {full} нет ветки «{t.branch}» — впишите в поле «Ветка» "
+                "правильную (обычно main)")
+    c = _code(f"{API}/repos/{full}/contents/?ref={q(t.branch)}", token)
     if c in (403, 404):
         return ("у токена нет права читать файлы. На GitHub: токен → Edit → "
                 "Permissions → Repositories → Add permissions → Contents → "
                 "Read-only → Update")
-    return ("в ветке «%s» нет папки %s с архивами программы" % (t.branch, folder))
+    return (f"в ветке «{t.branch}» нет папки {folder} с архивами программы")
 
 
 def check(t, token):
@@ -335,9 +335,7 @@ def whats_new(t, token, upto=None, limit=6000):
     -> текст или "" (нет файла/разделов — не ошибка)."""
     if not t.changelog:
         return ""
-    url = "%s/repos/%s/%s/contents/%s?ref=%s" % (
-        API, t.owner, t.repo, urllib.parse.quote(t.changelog),
-        urllib.parse.quote(t.branch))
+    url = f"{API}/repos/{t.owner}/{t.repo}/contents/{urllib.parse.quote(t.changelog)}?ref={urllib.parse.quote(t.branch)}"
     try:
         with _open(url, token, accept="application/vnd.github.raw") as r:
             text = r.read().decode("utf-8", errors="replace")
@@ -380,7 +378,7 @@ def _fetch(url, token, accept, buf, total, progress):
     -> (total, прибавилось байт). Обрыв посреди — не ошибка: вызывающий
     докачает следующей попыткой."""
     got0 = len(buf)
-    hdr = {"Range": "bytes=%d-" % got0} if got0 else None
+    hdr = {"Range": f"bytes={got0}-"} if got0 else None
     with _open(url, token, accept=accept, timeout=120, headers=hdr) as r:
         st = int(getattr(r, "status", 0) or getattr(r, "code", 0) or 200)
         if got0 and st != 206:
@@ -406,9 +404,7 @@ def download(t, token, rel, progress=None):
     """Скачать архив во временный файл, сверить размер и sha. -> путь.
     ★ 1.1.2: по ссылке на файл (у API ответ рвётся через ~10 с), обрыв —
     докачка с места обрыва."""
-    api = "%s/repos/%s/%s/contents/%s?ref=%s" % (
-        API, t.owner, t.repo, urllib.parse.quote(rel.path),
-        urllib.parse.quote(t.branch))
+    api = f"{API}/repos/{t.owner}/{t.repo}/contents/{urllib.parse.quote(rel.path)}?ref={urllib.parse.quote(t.branch)}"
     url = rel.url
     try:                                       # ссылка живёт минуты — свежая
         fresh = latest(t, token)
@@ -432,7 +428,7 @@ def download(t, token, rel, progress=None):
                     break
                 add = 0
             except (OSError, ValueError, http.client.HTTPException) as e:
-                last = UpdateError("нет связи с GitHub (%s)" % e)
+                last = UpdateError(f"нет связи с GitHub ({e})")
                 add = 0
             if total and len(buf) >= total:
                 break
@@ -446,8 +442,7 @@ def download(t, token, rel, progress=None):
     if rel.size and len(data) != rel.size:
         if not data and last is not None:
             raise last
-        raise UpdateError("архив скачался не целиком (%d из %d байт)"
-                          % (len(data), rel.size))
+        raise UpdateError(f"архив скачался не целиком ({len(data)} из {rel.size} байт)")
     if rel.sha and _blob_sha1(data) != rel.sha:
         raise UpdateError("контрольная сумма архива не совпала — "
                           "скачивание испорчено, обновление отменено")
@@ -467,7 +462,7 @@ def _kept(rel_path, keep):
 def _safe(root, rel):
     dst = os.path.normpath(os.path.join(root, rel))
     if not (dst == root or dst.startswith(root + os.sep)):
-        raise UpdateError("в архиве опасный путь: %s" % rel)
+        raise UpdateError(f"в архиве опасный путь: {rel}")
     return dst
 
 
@@ -546,7 +541,7 @@ def _drop_stale(app_dir, files, installed, keep, log, user_dirs=(), prev=_UNREAD
                 continue
             os.remove(dst)
         except (OSError, UpdateError) as exc:
-            log("обновление: не стёр %s: %s" % (rel, exc))
+            log(f"обновление: не стёр {rel}: {exc}")
             continue
         removed.append(rel)
         dirs.add(os.path.dirname(dst))
@@ -572,7 +567,7 @@ def _drop_stale(app_dir, files, installed, keep, log, user_dirs=(), prev=_UNREAD
     try:
         write_manifest(app_dir, installed)
     except OSError as exc:
-        log("обновление: список файлов не записан: %s" % exc)
+        log(f"обновление: список файлов не записан: {exc}")
     return removed
 
 
@@ -590,7 +585,7 @@ def drop_old_backup(app_dir, log=None):
         shutil.rmtree(b)
     except OSError as e:
         if log:
-            log("обновление: старую папку backup не удалить: %s" % e)
+            log(f"обновление: старую папку backup не удалить: {e}")
         return False
     if log:
         log("обновление: старая папка backup удалена (резервных копий "
@@ -621,7 +616,7 @@ def drop_leftovers(app_dir, gone=(), log=None):
                     pass
     if out and log:
         log("обновление: стёрт старый код, оставшийся от прежних версий: "
-            "%s" % ", ".join(x for x in out if not x.endswith(".pyc")))
+            ", ".join(x for x in out if not x.endswith(".pyc")))
     if drop_old_backup(app_dir, log):
         out.append("backup")
     return out
@@ -639,7 +634,7 @@ def install(t, zip_path, rel_version, log=None):
         with zipfile.ZipFile(zip_path) as z:
             bad = z.testzip()
             if bad:
-                raise UpdateError("архив повреждён: %s" % bad)
+                raise UpdateError(f"архив повреждён: {bad}")
             names = [n for n in z.namelist() if not n.endswith("/")]
             prefix = t.name + "/"
             if names and all(n.startswith(prefix) for n in names):
@@ -657,7 +652,7 @@ def install(t, zip_path, rel_version, log=None):
                     shutil.copyfileobj(src, out)
                 files.append(rel)
         if t.main_file not in files:
-            raise UpdateError("в архиве нет %s — это не та программа" % t.main_file)
+            raise UpdateError(f"в архиве нет {t.main_file} — это не та программа")
         # номер версии внутри архива должен совпасть с именем архива
         found = ""
         for cand in tuple(t.version_files) + ("app/version.py", "version.py",
@@ -675,8 +670,8 @@ def install(t, zip_path, rel_version, log=None):
                     found = m.group(1)
                     break
         if found and vtuple(found) != vtuple(rel_version):
-            raise UpdateError("внутри архива версия %s, а не %s — обновление "
-                              "отменено" % (found, rel_version))
+            raise UpdateError(f"внутри архива версия {found}, а не {rel_version} — обновление "
+                              "отменено")
         # ★ 1.2.0: копия заменяемого — только на случай отката, во временной
         # папке (не в папке программы), после установки удаляется
         bdir = tempfile.mkdtemp(prefix=t.name + "_old_")
@@ -698,7 +693,7 @@ def install(t, zip_path, rel_version, log=None):
                 os.replace(tmp, dst)
                 replaced.append(rel)
         except Exception as exc:                       # noqa: BLE001
-            log("обновление: ошибка (%s) — возвращаю старые файлы" % exc)
+            log(f"обновление: ошибка ({exc}) — возвращаю старые файлы")
             try:
                 os.remove(tmp)                         # ★ 1.3.3: недокопированный *.upd не оставлять
             except (OSError, NameError):
@@ -715,10 +710,10 @@ def install(t, zip_path, rel_version, log=None):
                 except OSError:
                     failed.append(rel)
             if failed:
-                raise UpdateError("не удалось заменить файлы (%s), и не вернулись "
-                                  "старые: %s" % (exc, ", ".join(failed))) from exc
-            raise UpdateError("не удалось заменить файлы (%s) — оставлена "
-                              "прежняя версия" % exc) from exc
+                raise UpdateError(f"не удалось заменить файлы ({exc}), и не вернулись "
+                                  f"старые: {', '.join(failed)}") from exc
+            raise UpdateError(f"не удалось заменить файлы ({exc}) — оставлена "
+                              "прежняя версия") from exc
         # ★ 1.2.0: то, что ставили в прошлый раз и чего в новой версии нет,
         # — стереть (без списка — старый код по stale_files)
         removed = _drop_stale(app_dir, files, todo,
@@ -726,9 +721,8 @@ def install(t, zip_path, rel_version, log=None):
         drop_old_backup(app_dir, log)
         t.removed = removed
         code = [r for r in removed if not r.endswith((".pyc", ".pyo"))]
-        log("обновление: заменено файлов %d, стёрто старых %d%s"
-            % (len(replaced), len(removed),
-               (" (%s)" % ", ".join(code)[:400]) if code else ""))
+        tail = f" ({', '.join(code)[:400]})" if code else ""
+        log(f"обновление: заменено файлов {len(replaced)}, стёрто старых {len(removed)}{tail}")
         return replaced
     finally:
         shutil.rmtree(stage, ignore_errors=True)
