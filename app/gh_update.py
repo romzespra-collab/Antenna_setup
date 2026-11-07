@@ -36,6 +36,13 @@
 wait_previous(sys.argv) — ждёт, пока старая завершится (иначе защита от
 второго запуска приняла бы её за «уже запущено»).
 
+1.4.3: две ветки «1.4.2» сведены в одну: f-строки (Python 3.12+) и
+замена файла при установке и запись MANIFEST с повтором, если файл на миг
+занят (антивирус, индексатор: WinError 5 / 32) — раньше всё обновление
+откатывалось с «не удалось заменить файлы»; drop_leftovers: в журнале снова
+видно, что стёрто (строка склеивалась неверно); gone понимает маски
+(«CHANGELOG_v*.md») — старые файлы прежних версий в корне программы.
+
 1.4.2: только Python 3.12+ — строки на f-строках, без «# -*- coding».
 Поведение не менялось. (Две ветки «1.4.1» — SmartMon и остальные
 проекты — сведены в одну.)
@@ -54,56 +61,7 @@ swap_failed / finish_exe_update и помощника .gh_update_swap.bat; GitHu
 Actions exe не собирает (build_exe.yml удалён), GitHub Releases не нужны.
 check() у собранного exe — понятная ошибка вместо обновления.
 
-1.3.3: собраны доработки из всех проектов — обрыв при чтении ответа GitHub —
-понятная ошибка; из backup/ стираются только папки v<цифры>; при сбое замены
-не остаётся *.upd, а не вернувшиеся старые файлы называются в ошибке (из
-PionerFM 1.2.1); own — маски своих файлов пользователя рядом с кодом
-(WinHub: functions/fn_*.py): ставятся, но при чистке не стираются; старое из
-MANIFEST сверяется без учёта регистра, MANIFEST из архива не ставится (из
-WinHub 1.2.1). gh_update_qt: restart_ask=False — перезапуск сам через 3 с
-(Smart_BMS); поле токена с «глазом» (theme.add_password_eye, если есть);
-после установки current = новая версия (авто-проверка не предложит её снова).
-
-1.3.2: объединены две ветки модуля — 1.3.1 (SmartMon: обновление собранного
-exe) и 1.2.1 / 1.2.2 (mega_fan_gui): user_dirs — свои папки пользователя
-(modules/, tools/) при первом обновлении не чистятся; gh_update_qt —
-can_install (программа запрещает «Обновить», пока идёт работа) и busy()
-(идёт установка — окно не закрывать).
-
-1.3.1: прежняя сборка exe (.gh_update_old) стирается и при обычном запуске
-(раньше — только при запуске с --after-update); токен отвергнут (401 / 403)
-посреди закачки — так и сказано сразу, а не «скачалась не целиком».
-
-1.3.0: программа сама знает, как она запущена (run_kind): из исходников
-(Python) — как раньше, архив release/<имя>_vX.Y.Z.zip поверх папки; собранный
-exe — готовая сборка <имя>_exe_vX.Y.Z.zip из GitHub Releases (её собирает
-GitHub Actions, .github/workflows/build_exe.yml, на каждую версию в main):
-скачать (докачка, sha256 из ответа GitHub) → распаковать в .gh_update_new
-(stage_exe) → программа закрывается, помощник .gh_update_swap.bat ждёт её
-выхода, убирает старое в .gh_update_old, ставит новое и запускает новую
-версию (launch_swap); не вышло — возвращает старое и запускает его, причина
-— в .gh_update_failed.txt (swap_failed). Настройки, журналы, записи и свои
-файлы в папке exe не трогаются; vendor\\ дополняется, а не заменяется.
-Версия уже в main, а exe GitHub ещё собирает — Release(kind="wait").
-1.2.0: обновление больше не копит мусор: стирается то, что модуль ставил
-сам и чего нет в новой версии (список MANIFEST — .gh_update_files.txt;
-без списка — stale_files: код в папках архива, мимо KEEP_DIRS — logs, libs,
-Rec, Archive, Bin, sdk, venv …); настройки и всё по KEEP — никогда.
-backup/ не ведётся (старый удаляется), откат при ошибке — из временной
-копии вне папки программы.
-1.1.3: в облаке анимации обновления — значок GitHub над надписью (gh_update_qt; без QtSvg —
-только надпись, как раньше).
-1.1.2: архив качается по ссылке на файл (download_url из списка release/,
-raw.githubusercontent.com), а не через API: API обрывает ответ через ~10 с,
-и архив ~39 МБ приходил не целиком (38765774 из 38982176 байт, сколько ни
-пробуй). Оборвалось — докачка с места обрыва (Range), до DL_TRIES попыток;
-ссылки нет или она не открылась — по-старому через API, тоже с докачкой.
-1.1.1: «Что нового» понимает и заголовки «v1.2.3: …», «## v1.2.3», «Версия
-1.2.3 — …»; инструкция показывает настоящий файл с номером версии.
-1.1.0: version_files — где искать номер версии в архиве (кроме
-app/version.py, version.py, VERSION и главного файла); where — где в
-программе вкладка (для инструкции); работает и как пакет (app/), и как
-отдельные файлы рядом с главным .pyw.
+Раньше (1.0–1.3.3) — в истории git репозитория SmartMon.
 
 """
 import fnmatch
@@ -124,7 +82,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass, field
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 API = "https://api.github.com"
 TIMEOUT = 30
 
@@ -533,6 +491,18 @@ def stale_files(app_dir, new_files, keep=KEEP_DEFAULT, user_dirs=()):
     return out
 
 
+def _replace(src, dst, tries=6):
+    """★ 1.4.3: os.replace с повтором: файл на миг держит антивирус."""
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(0.1 * (i + 1))
+
+
 def read_manifest(app_dir):
     """Что поставило прошлое обновление -> set или None (списка нет).
     ★ 1.4.1: список есть, но не читается (занят антивирусом) — пустой set:
@@ -552,7 +522,7 @@ def write_manifest(app_dir, files):
     with open(tmp, "w", encoding="utf-8") as fh:
         fh.write("# gh_update: файлы, поставленные обновлением (не править)\n")
         fh.write("\n".join(sorted(files)) + "\n")
-    os.replace(tmp, os.path.join(app_dir, MANIFEST))
+    _replace(tmp, os.path.join(app_dir, MANIFEST))
 
 
 _UNREAD = object()
@@ -629,18 +599,41 @@ def drop_old_backup(app_dir, log=None):
     return True
 
 
+def _is_mask(fn):
+    return any(ch in fn for ch in "*?[")
+
+
+def _gone_files(app_dir, d, fn):
+    """★ 1.4.3: файл из gone -> пути. Маска («CHANGELOG_v*.md») — только файлы
+    этой папки (без подпапок), не меньше 3 обычных букв, мимо KEEP_DEFAULT
+    (настройки, журналы, exe, dll — никогда)."""
+    folder = os.path.join(app_dir, d)
+    if not _is_mask(fn):
+        return [os.path.join(folder, fn)]
+    if len(re.sub(r"[*?\[\]]", "", fn)) < 3 or not os.path.isdir(folder):
+        return []
+    out = []
+    for x in sorted(os.listdir(folder)):
+        rel = os.path.join(d, x).replace(os.sep, "/")
+        if (fnmatch.fnmatch(x.lower(), fn.lower()) and not _kept(rel, KEEP_DEFAULT)
+                and os.path.isfile(os.path.join(folder, x))):
+            out.append(os.path.join(folder, x))
+    return out
+
+
 def drop_leftovers(app_dir, gone=(), log=None):
     """★ 1.2.0: разово при запуске — то, что оставили обновления до 1.2.0:
     папка backup/ и модули, удалённые из программы (gone — пути вида
-    «app/quick_fill.py»; заодно их .pyc в __pycache__). -> что стёрто."""
+    «app/quick_fill.py»; заодно их .pyc в __pycache__; ★ 1.4.3 — и маски
+    «CHANGELOG_v*.md», «README.txt»). -> что стёрто."""
     app_dir = os.path.abspath(app_dir)
     out = []
     for rel in gone:
         d, fn = os.path.split(rel.replace("/", os.sep))
         stem = os.path.splitext(fn)[0]
-        cands = [os.path.join(app_dir, d, fn)]
+        cands = _gone_files(app_dir, d, fn)
         pyc = os.path.join(app_dir, d, "__pycache__")
-        if os.path.isdir(pyc):
+        if os.path.isdir(pyc) and not _is_mask(fn):
             cands += [os.path.join(pyc, x) for x in os.listdir(pyc)
                       if x.split(".", 1)[0] == stem and x.endswith(".pyc")]
         for c in cands:
@@ -652,7 +645,7 @@ def drop_leftovers(app_dir, gone=(), log=None):
                     pass
     if out and log:
         log("обновление: стёрт старый код, оставшийся от прежних версий: "
-            ", ".join(x for x in out if not x.endswith(".pyc")))
+            + ", ".join(x for x in out if not x.endswith(".pyc")))
     if drop_old_backup(app_dir, log):
         out.append("backup")
     return out
@@ -726,7 +719,7 @@ def install(t, zip_path, rel_version, log=None):
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 tmp = dst + ".upd"
                 shutil.copy2(os.path.join(stage, rel), tmp)
-                os.replace(tmp, dst)
+                _replace(tmp, dst)
                 replaced.append(rel)
         except Exception as exc:                       # noqa: BLE001
             log(f"обновление: ошибка ({exc}) — возвращаю старые файлы")
