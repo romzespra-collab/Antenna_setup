@@ -1,5 +1,5 @@
 """
-antenna_setup.pyw  v0.6.7
+antenna_setup.pyw  v0.6.8
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -7,6 +7,10 @@ antenna_setup.pyw  v0.6.7
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.6.8: «⋯ → Обновить программу с GitHub» — те же проверки, что у кнопки на вкладке «Обновление»: копия из
+          git — отказ сразу; «⏹ Стоп» / Esc бросает скачивание, и ничего не ставится; токен не попадает в
+          журнал; окно не закрыть только во время замены файлов. Кнопка на вкладке не ставит обновление,
+          пока идёт другая работа.
   v0.6.7: обновление с GitHub — общий модуль gh_update 1.5.3: неполный архив не ставится (раньше мог стереть
           по списку почти всю программу); копия из git не обновляется; «можно ли ставить» проверяется ещё раз
           после скачивания; скачивание при выходе бросается; кривой токен не попадает в журнал.
@@ -32,16 +36,9 @@ antenna_setup.pyw  v0.6.7
           во временном профиле), берёт адрес антенны из шлюза (например 192.168.10.1), проверяет;
           «Вернуть как было» и выход возвращают домашний Wi-Fi. Причина: у антенны веб был только на её
           Wi-Fi, а кабель — WAN с закрытым веб.
-  v0.5.3: раздача адреса антенне — через Npcap (запросы ловим и ответы шлём прямо в кабель; раньше
-          брандмауэр Windows не пропускал запросы к программе); поиск по MAC больше не останавливается
-          через 10 с (главный порт антенны объявляется позже); адрес антенны в подсети Wi-Fi
-          (192.168.1.1) при «Проверить» / «Открыть веб» / «Прочитать» — предложение выключить Wi-Fi.
-  v0.5.2: под экран ноутбука: плитки вверху и шапка компактнее, главная страница прокручивается,
-          окно при запуске не больше экрана и целиком на нём; кнопки в 4 ряда, логин и пароль в одну строку;
-          всё помещается в 1366×768.
   Более ранние версии — в истории git.
 """
-VERSION = "0.6.7"
+VERSION = "0.6.8"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -2590,8 +2587,12 @@ class MainWindow(QWidget):
             self.cfg["upd_every_h"] = int(d.get("every_h") or 12)
             self.save_if_changed()
 
+        def can_install():                     # v0.6.8: идёт работа (или обновление из «⋯») — не ставить поверх
+            return f"идёт «{self.worker.name}»" if self.worker.busy() else ""
+
         self.update_page = gh_update_qt.UpdatePage(target, cfg_get, cfg_set, on_quit=self._quit_for_update,
-                                                   log=lambda *a: self.q.put(("log", " ".join(str(x) for x in a))))
+                                                   log=lambda *a: self.q.put(("log", " ".join(str(x) for x in a))),
+                                                   can_install=can_install)
         self.update_page.box.setFixedWidth(450)   # под шрифт 10pt — кнопки не обрезаются
         self.update_page.box.available.connect(
             lambda v: self.set_status(f"⬆ есть новая версия {v} — вкладка «Обновление»"))
@@ -4266,8 +4267,19 @@ class MainWindow(QWidget):
         import dataclasses
         from app import gh_update
         t = dataclasses.replace(self.update_page.box.t, branch=self.cfg.get("upd_branch") or GITHUB_BRANCH)
-        token = self.cfg.get("upd_token") or ""
+        # v0.6.8: те же проверки, что у кнопки на вкладке «Обновление»
+        if gh_update.is_git_copy(t.app_dir) and not t.git_ok:      # отказ сразу, до скачивания
+            QMessageBox.information(self, "Обновление", "Папка программы — рабочая копия git (.git рядом): "
+                                                       "обновляй через git pull.")
+            return
+        token = gh_update.clean_token(self.cfg.get("upd_token"))
         self.set_page(2)
+
+        def stop():                            # у каждой работы своё событие «стоп» — читать в момент вызова
+            return self.worker.stop_flag.is_set()
+
+        def safe(text):                        # токен в журнал не попадает, что бы ни было в ошибке
+            return str(text).replace(token, "***") if token else str(text)
 
         cable = self.cb_adapter.currentData()
 
@@ -4275,17 +4287,32 @@ class MainWindow(QWidget):
             if cable:
                 self._cable_low_priority(w, cable)
             w.log(f"🔎 смотрю версию на GitHub ({t.owner}/{t.repo}, {t.branch})…")
-            rel, new = gh_update.check(t, token)
-            if rel is None:
-                w.log("✗ на GitHub нет архива программы в release/")
+            try:
+                rel, new = gh_update.check(t, token)
+                if rel is None:
+                    w.log("✗ на GitHub нет архива программы в release/")
+                    return
+                if not new:
+                    w.log(f"✓ у тебя последняя версия v{VERSION} (на GitHub v{rel.version})")
+                    return
+                w.log(f"⬇ качаю v{rel.version}…")
+                z = gh_update.download(t, token, rel, cancel=stop)    # «⏹ Стоп» / Esc — бросить скачивание
+            except Exception as e:
+                w.log(f"✗ обновление: {safe(e)}")
                 return
-            if not new:
-                w.log(f"✓ у тебя последняя версия v{VERSION} (на GitHub v{rel.version})")
+            if stop():                         # остановили, пока качалось — не ставим
+                try:
+                    os.remove(z)
+                except OSError:
+                    pass
+                w.log("⏹ обновление остановлено — ничего не установлено")
                 return
-            w.blocking_close = True
-            w.log(f"⬇ качаю v{rel.version}…")
-            z = gh_update.download(t, token, rel)
-            gh_update.install(t, z, rel.version, lambda *a: w.log(" ".join(str(x) for x in a)))
+            w.blocking_close = True            # с этого места окно не закрыть: идёт замена файлов
+            try:
+                gh_update.install(t, z, rel.version, lambda *a: w.log(safe(" ".join(str(x) for x in a))))
+            except Exception as e:
+                w.log(f"✗ обновление не установлено: {safe(e)}")
+                return
             w.log(f"✓ установлена v{rel.version} — перезапускаю")
             w.ui(self._restart_after_update)
         self.run_job("обновление", job)
