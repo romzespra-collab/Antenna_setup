@@ -10,3 +10,7 @@ dist/
 _backup/
 *.zip
 !release/*.zip
+# значок программы (app_icon): выбор пользователя и кэш
+app_icon.json
+app_icon.json.bak
+app_icon_cache.json
