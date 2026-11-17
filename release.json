@@ -1,0 +1,21 @@
+{
+  "repo": "romzespra-collab/Antenna_setup",
+  "programs": [
+    {
+      "name": "antenna_setup",
+      "dir": "",
+      "files": [
+        ["VERSION", "{v}"],
+        ["antenna_setup.pyw", "VERSION = \"{v}\""],
+        ["antenna_setup.pyw", "antenna_setup.pyw  v{v}"],
+        ["antenna_setup.spec", "antenna_setup.spec  v{v}"],
+        ["build_exe.bat", "build_exe.bat  v{v}"],
+        ["setup.bat", "setup.bat  v{v}"],
+        ["README.md", "# Antenna_setup  v{v}"]
+      ],
+      "headers": false,
+      "changelog": {"file": "CHANGELOG.md", "before": "re:^### v\\d", "template": "### v{v} — {msg}\n"},
+      "allow_in_zip": []
+    }
+  ]
+}

@@ -2,8 +2,11 @@ __pycache__/
 *.pyc
 config.json
 config.json.bak
+*.bak
+*.bad-*
 *.tmp
 *.log
+*.log.*
 selftest.txt
 build/
 dist/
