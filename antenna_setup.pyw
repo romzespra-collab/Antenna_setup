@@ -1,5 +1,5 @@
 """
-antenna_setup.pyw  v0.6.8
+antenna_setup.pyw  v0.7.0
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -7,6 +7,10 @@ antenna_setup.pyw  v0.6.8
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.7.0: Значок программы: окно выбора (общий модуль app_icon 1.2.0) — «Настройки» → «Оформление» →
+          «🎨 Значок программы…»; встроенная база ~370 значков, поиск в интернете, своя картинка; .ico и
+          ярлыки. «По умолчанию» — родной значок (антенна); не выбирали — значок прежний. Значок в своей
+          полосе заголовка меняется сразу.
   v0.6.8: «⋯ → Обновить программу с GitHub» — те же проверки, что у кнопки на вкладке «Обновление»: копия из
           git — отказ сразу; «⏹ Стоп» / Esc бросает скачивание, и ничего не ставится; токен не попадает в
           журнал; окно не закрыть только во время замены файлов. Кнопка на вкладке не ставит обновление,
@@ -31,14 +35,9 @@ antenna_setup.pyw  v0.6.8
   v0.6.1: временный адрес кабеля больше не остаётся: при выходе — «вернуть сеть как было?» (по умолчанию
           да; кабель — автоматический адрес, приоритет, маршруты, Wi-Fi); при запуске — то же, если осталось
           с прошлого раза; плитка «IP ноутбука» подсвечивает временный адрес программы.
-  v0.6.0: «📶 Wi-Fi антенны» — как с телефона: программа ищет Wi-Fi вокруг, отмечает сеть самой антенны
-          (по её MAC из поиска по MAC, по марке BSSID и имени), подключает к ней Wi-Fi ноутбука (пароль —
-          во временном профиле), берёт адрес антенны из шлюза (например 192.168.10.1), проверяет;
-          «Вернуть как было» и выход возвращают домашний Wi-Fi. Причина: у антенны веб был только на её
-          Wi-Fi, а кабель — WAN с закрытым веб.
   Более ранние версии — в истории git.
 """
-VERSION = "0.6.8"
+VERSION = "0.7.0"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -1801,6 +1800,29 @@ def app_icon():
         icon.addPixmap(pm)
     return icon
 
+
+def make_icons():
+    """v0.7.0: значок программы (общий модуль app_icon): выбор — app_icon.json рядом с программой, файл
+    antenna_setup.ico рядом. «По умолчанию» — родной значок (антенна). Только после QApplication."""
+    import app_icon as ai
+    target = sys.executable if FROZEN else APP_ROOT / "antenna_setup.pyw"
+    default = {"kind": "image", "png": ai.image_to_png(app_icon().pixmap(256, 256).toImage())}
+    return ai.AppIcon("antenna_setup", APP_ROOT, title=APP_NAME, target=target, default=default)
+
+
+def app_icons():
+    """v0.7.0: один объект значка на приложение (app.app_icons)."""
+    app = QApplication.instance()
+    if getattr(app, "app_icons", None) is None:
+        app.app_icons = make_icons()
+    return app.app_icons
+
+
+def cur_icon():
+    """v0.7.0: значок окон — выбранный (app_icon), иначе родной."""
+    ic = QApplication.windowIcon()
+    return app_icon() if ic.isNull() else ic
+
 # ───────────────────────── виджеты ─────────────────────────
 
 
@@ -2013,7 +2035,7 @@ class TitleBar(QWidget):
         lay.setContentsMargins(10, 0, 0, 0)
         lay.setSpacing(8)
         self.icon = QLabel()
-        self.icon.setPixmap(app_icon().pixmap(18, 18))
+        self.icon.setPixmap(cur_icon().pixmap(18, 18))      # v0.7.0: выбранный значок (app_icon)
         self.title = QLabel(f"{APP_NAME} — v{VERSION} · Qt6")
         self.title.setObjectName("titleText")
         for w in (self.icon, self.title):
@@ -2177,7 +2199,7 @@ class MainWindow(QWidget):
         self._normal_geo = None
         self._closing = False
         self.setWindowTitle(f"{APP_NAME} — v{VERSION}")
-        self.setWindowIcon(app_icon())
+        self.setWindowIcon(cur_icon())                      # v0.7.0: выбранный значок (app_icon)
         self.setMinimumSize(760, 600)
         self._loading = True
         self._build()
@@ -2545,10 +2567,14 @@ class MainWindow(QWidget):
         b1.clicked.connect(lambda: self.set_theme("dark"))
         b2 = QPushButton("☀ Светлая")
         b2.clicked.connect(lambda: self.set_theme("light"))
+        self.btn_app_icon = QPushButton("🎨 Значок программы…")   # v0.7.0: общий модуль app_icon
+        self.btn_app_icon.setToolTip("Свой значок окна, панели задач, файла .ico и ярлыков:\n"
+                                     "встроенная база, поиск в интернете или своя картинка")
+        self.btn_app_icon.clicked.connect(self.show_icon_dialog)
         b3 = QPushButton("💾 Сохранить")
         b3.setToolTip("Ctrl+S")
         b3.clicked.connect(self.save_now)
-        for b in (b1, b2, b3):
+        for b in (b1, b2, self.btn_app_icon, b3):
             row.addWidget(b)
         row.addStretch()
         cl.addLayout(row)
@@ -2564,6 +2590,29 @@ class MainWindow(QWidget):
         sc.setFrameShape(QFrame.NoFrame)
         sc.setWidget(page)
         return sc
+
+    def show_icon_dialog(self):
+        """v0.7.0: окно «Значок программы» (app_icon_qt.IconDialog): окно, полоса заголовка, .ico, ярлыки."""
+        try:
+            import app_icon_qt
+            icons = app_icons()
+        except Exception as e:
+            QMessageBox.warning(self, "Значок программы", f"Окно значка не открылось:\n{e}")
+            return
+
+        def applied(qicon):
+            app_icon_qt.apply_everywhere(qicon)
+            self.titlebar.icon.setPixmap(qicon.pixmap(18, 18))   # своя полоса значок не перечитывает
+            self.log("🎨 Значок программы изменён")
+        dlg = app_icon_qt.IconDialog(icons, self, on_apply=applied)
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        # галочки в QSS программы нет (свои переключатели) — квадрат галочки цветом темы, только в этом окне
+        dlg.setStyleSheet(dlg.styleSheet() + f"""
+            QCheckBox::indicator {{ width: 14px; height: 14px; border: 1px solid {P['muted']}; border-radius: 4px;
+                background: {P['panel2']}; }}
+            QCheckBox::indicator:checked {{ background: {P['accent']}; border-color: {P['accent']}; }}
+            QCheckBox::indicator:disabled {{ border-color: {P['line']}; }}""")
+        dlg.exec()
 
     def _page_update(self):
         """Вкладка «Обновление» — общий модуль gh_update (как в SmartMon)."""
@@ -4578,6 +4627,19 @@ def selftest():
     w.set_theme("dark")
     ok("смена темы", w.btn_theme.text() == "☀")
     ok("меню ⋯: обновление с GitHub", any("GitHub" in a.text() for a in w.main_menu().actions()))
+    try:                                   # v0.7.0: значок программы (app_icon) — рисунки, .ico, окно выбора
+        import app_icon
+        import app_icon_qt
+        errs = app_icon.selftest()
+        dlg = app_icon_qt.IconDialog(make_icons(), w)
+        dlg.show()
+        app.processEvents()
+        shown = dlg.isVisible()
+        dlg.close()
+        dlg.deleteLater()
+        ok("значок программы (app_icon)" + (": " + "; ".join(errs[:3]) if errs else ""), not errs and shown)
+    except Exception as e:
+        ok(f"значок программы (app_icon): {type(e).__name__}: {e}", False)
     text = "\n".join(res)
     fail = any(r.startswith("✗") for r in res)
     text += f"\n\nselftest v{VERSION}: {'ОШИБКИ' if fail else 'всё в порядке'}"
@@ -4627,6 +4689,13 @@ def main():
     install_ru(app)
     app.setStyle("Fusion")
     app.setWindowIcon(app_icon())
+    try:                                   # v0.7.0: выбранный значок (app_icon.json) → окна и antenna_setup.ico
+        icons = app_icons()
+        if icons.cfg_file.exists() or icons.cfg_file.with_name(icons.cfg_file.name + ".bak").exists():
+            icons.ensure()
+            app.setWindowIcon(icons.icon())
+    except Exception as e:
+        print(f"значок программы: {e}", file=sys.stderr)
     apply_theme(app, cfg.get("theme", "dark"))
     win = MainWindow(cfg, writable)
     flt = AppFilter(win)
