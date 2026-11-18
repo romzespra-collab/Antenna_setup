@@ -1,8 +1,10 @@
-# antenna_setup.spec  v0.8.0 — PyInstaller: onefile, без консоли, просит права администратора
+# antenna_setup.spec  v0.9.0 — PyInstaller: onefile, без консоли, просит права администратора
+# v0.9.0: общие модули qt_base (основа окна) и int_field (поле-число) — в EXE.
 # v0.8.0: общие модули safe_json (config.json) и app_log (журнал) — в EXE; утилиты разработчика — нет.
 # v0.7.0: значок программы (app_icon): база app_icon_pack.dat, app_icon / app_icon_qt, QtSvg.
 a = Analysis(['antenna_setup.pyw'], pathex=[], datas=[('app_icon_pack.dat', '.')],
-             hiddenimports=['app_icon', 'app_icon_qt', 'PySide6.QtSvg', 'safe_json', 'app_log'],
+             hiddenimports=['app_icon', 'app_icon_qt', 'PySide6.QtSvg', 'safe_json', 'app_log',
+                            'qt_base', 'int_field'],
              excludes=['PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets', 'PySide6.Qt3DCore',
                        'PySide6.QtMultimedia', 'PySide6.QtQuick', 'PySide6.QtQml', 'PySide6.QtCharts'])
 pyz = PYZ(a.pure)

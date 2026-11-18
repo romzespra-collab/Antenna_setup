@@ -1,5 +1,5 @@
 """
-antenna_setup.pyw  v0.8.0
+antenna_setup.pyw  v0.9.0
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -7,6 +7,10 @@ antenna_setup.pyw  v0.8.0
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.9.0: Общие модули: qt_base 1.1.0 — тема, палитра, значок на панели задач, полоса диалогов (было своё в
+          программе); int_field (SmartMon 5.19.0) — поля «Таймаут проверки» и «Повторов после смены IP»:
+          колесо, ↑/↓, PgUp/PgDn (×10), Esc — отмена набранного, число берётся и без Enter; вид прежний (снимки
+          до / после совпадают).
   v0.8.0: Общие модули: safe_json 1.1.1 — config.json пишется атомарно, с .bak; испорченный не затирается
           (копия config.json.bad-<время>, настройки — из .bak); app_log 1.2.1 — журнал antenna_setup.log:
           ротация, пароли и токены скрыты, падения — ещё и в antenna_setup_crash.log; для разработки —
@@ -36,12 +40,9 @@ antenna_setup.pyw  v0.8.0
           не собирает exe; собранный exe сам не обновляется.
   v0.6.2: обновление с GitHub — общий модуль gh_update 1.3.3 (обрыв ответа GitHub — понятная ошибка, при сбое
           замены не остаётся *.upd, свои файлы пользователя не стираются, та же версия не предлагается снова).
-  v0.6.1: временный адрес кабеля больше не остаётся: при выходе — «вернуть сеть как было?» (по умолчанию
-          да; кабель — автоматический адрес, приоритет, маршруты, Wi-Fi); при запуске — то же, если осталось
-          с прошлого раза; плитка «IP ноутбука» подсвечивает временный адрес программы.
   Более ранние версии — в истории git.
 """
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -156,7 +157,7 @@ ensure_packages()
 from PySide6.QtCore import (QEvent, QLibraryInfo, QObject, QTranslator, QPoint, QPointF, QProcess, QRectF,  # noqa: E402
                             Qt, QTimer, QUrl, Signal)
 from PySide6.QtGui import (QColor, QDesktopServices, QFont, QIcon,  # noqa: E402
-                           QKeySequence, QPainter, QPalette, QPen,
+                           QKeySequence, QPainter, QPen,
                            QPixmap, QShortcut, QTextCursor)
 from PySide6.QtWidgets import (QAbstractButton, QApplication, QButtonGroup,  # noqa: E402
                                QComboBox, QFileDialog, QFrame, QGridLayout,
@@ -165,6 +166,9 @@ from PySide6.QtWidgets import (QAbstractButton, QApplication, QButtonGroup,  # n
                                QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
                                QStackedWidget, QTextEdit, QVBoxLayout,
                                QWidget)
+
+import int_field  # noqa: E402 — общий модуль (из SmartMon): поле-число без QSpinBox
+import qt_base  # noqa: E402 — общий модуль: Fusion, палитра темы, значок на панели задач, полоса диалогов
 
 app_log.install_qt_handler()   # сообщения Qt (qWarning и т.п.) — в antenna_setup.log
 
@@ -1686,47 +1690,20 @@ def _qss(p):
 
 
 def _palette(p):
-    pal = QPalette(QColor(p["bg"]))
-    roles = {QPalette.Window: p["bg"], QPalette.WindowText: p["text"], QPalette.Base: p["panel2"],
-             QPalette.AlternateBase: p["panel"], QPalette.Text: p["text"], QPalette.Button: p["panel2"],
-             QPalette.ButtonText: p["text"], QPalette.Highlight: p["accent"],
-             QPalette.HighlightedText: "#ffffff", QPalette.PlaceholderText: p["muted"],
-             QPalette.ToolTipBase: p["panel2"], QPalette.ToolTipText: p["text"],
-             QPalette.BrightText: "#ffffff", QPalette.Link: p["accent"]}
-    for grp in (QPalette.Active, QPalette.Inactive, QPalette.Disabled):
-        for role, c in roles.items():
-            pal.setColor(grp, role, QColor(c))
-    for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
-        pal.setColor(QPalette.Disabled, role, QColor(p["muted"]))
-    return pal
+    """Палитра темы — общий модуль qt_base (с нуля от фона; роли — как раньше)."""
+    return qt_base.make_palette(window=p["bg"], text=p["text"], base=p["panel2"], alt_base=p["panel"],
+                                button=p["panel2"], highlight=p["accent"], highlighted_text="#ffffff",
+                                muted=p["muted"], tooltip_base=p["panel2"], tooltip_text=p["text"],
+                                bright_text="#ffffff", link=p["accent"], disabled_base=p["panel2"],
+                                disabled_highlight=p["accent"])
 
 
 def apply_theme(app, name):
+    """Тема — всё сразу (qt_base): палитра, QSS на приложение, системная полоса диалогов (Windows)."""
     P.clear()
     P.update(THEMES.get(name, THEMES["dark"]))
-    app.setPalette(_palette(P))
-    app.setStyleSheet(_qss(P))
-
-
-def _dwm_paint(w):
-    """Системная полоса диалогов в цвет темы (Windows 10/11). Ошибки — молча."""
-    if not IS_WIN:
-        return
-    try:
-        hwnd = int(w.winId())
-        dark = ctypes.c_int(1 if QColor(P["bg"]).lightness() < 128 else 0)
-        dwm = ctypes.windll.dwmapi
-        if dwm.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(dark), 4) != 0:
-            dwm.DwmSetWindowAttribute(hwnd, 19, ctypes.byref(dark), 4)
-
-        def colorref(hexc):
-            c = QColor(hexc)
-            return ctypes.c_int(c.red() | (c.green() << 8) | (c.blue() << 16))
-        dwm.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(colorref(P["panel"])), 4)
-        dwm.DwmSetWindowAttribute(hwnd, 36, ctypes.byref(colorref(P["text"])), 4)
-        ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027)  # NOSIZE|NOMOVE|NOZORDER|FRAMECHANGED
-    except Exception:
-        pass
+    qt_base.apply_theme(app, palette=_palette(P), qss=_qss(P), title_bars=getattr(app, "title_bars", None),
+                        caption=P["panel"], text=P["text"], dark=QColor(P["bg"]).lightness() < 128)
 
 # ───────────────────────── значки (QPainter) ─────────────────────────
 
@@ -1861,13 +1838,28 @@ class Dot(QWidget):
         p.drawEllipse(QRectF(1, 1, 10, 10))
 
 
+class _FieldEdit(int_field.IntEdit):
+    """Поле-число (общий модуль int_field): ширина — как раньше, под «720 мин» (шрифт при создании),
+    а не по самому длинному значению."""
+
+    def __init__(self, parent=None):
+        self._w = 0
+        super().__init__(parent)
+        self._w = self.fontMetrics().horizontalAdvance("720 мин") + 28
+        self.setFixedWidth(self._w)
+
+    def need_width(self):
+        return self._w or super().need_width()
+
+
 class _IntField(QWidget):
-    """Число без QSpinBox: [−] поле [+]; колесо и ↑/↓; ввод по Enter/уходу фокуса, кривой — откат."""
+    """Число без QSpinBox: [−] поле [+]. Поле — общий модуль int_field (IntEdit, objectName «intField»):
+    колесо, ↑/↓ (PgUp/PgDn — ×10), ввод по Enter / уходу фокуса, кривой — откат, Esc — отмена набранного,
+    value() берёт набранное и без Enter. Кнопки #step и место поля — свои, как раньше."""
     valueChanged = Signal(int)
 
     def __init__(self, lo=0, hi=100, value=0, suffix="", parent=None):
         super().__init__(parent)
-        self._lo, self._hi, self._val, self._suffix, self._special = lo, hi, value, suffix, ""
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
@@ -1877,72 +1869,35 @@ class _IntField(QWidget):
             b.setObjectName("step")
             b.setAutoRepeat(True)
             b.setFocusPolicy(Qt.NoFocus)
-        self.edit = QLineEdit()
-        self.edit.setObjectName("intField")
-        self.edit.setAlignment(Qt.AlignCenter)
-        self.edit.setFixedWidth(self.edit.fontMetrics().horizontalAdvance("720 мин") + 28)
-        self.edit.installEventFilter(self)
-        self.edit.editingFinished.connect(self._commit)
+        self.edit = _FieldEdit()
+        self.edit.setRange(lo, hi)
+        self.setSuffix(suffix)
+        self.edit.setValue(value)
+        self.edit.valueChanged.connect(self.valueChanged.emit)
         self.minus.clicked.connect(lambda: self.stepBy(-1))
         self.plus.clicked.connect(lambda: self.stepBy(1))
         lay.addWidget(self.minus)
         lay.addWidget(self.edit)
         lay.addWidget(self.plus)
         lay.addStretch()
-        self._show()
 
     def value(self):
-        return self._val
-
-    def setRange(self, lo, hi):
-        self._lo, self._hi = lo, hi
-        self.setValue(self._val)
-
-    def setSuffix(self, s):
-        self._suffix = s
-        self._show()
-
-    def setSpecialValueText(self, s):
-        self._special = s
-        self._show()
+        return self.edit.value()
 
     def setValue(self, v):
-        v = max(self._lo, min(self._hi, int(v)))
-        changed = v != self._val
-        self._val = v
-        self._show()
-        if changed:
-            self.valueChanged.emit(v)
+        self.edit.setValue(v)
+
+    def setRange(self, lo, hi):
+        self.edit.setRange(lo, hi)
+
+    def setSuffix(self, s):
+        self.edit.setSuffix(f" {s}" if s else "")      # «3 с», как раньше
+
+    def setSpecialValueText(self, s):
+        self.edit.setSpecialValueText(s)
 
     def stepBy(self, n):
-        self.setValue(self._val + n)
-
-    def _show(self):
-        if self._special and self._val == self._lo:
-            self.edit.setText(self._special)
-        else:
-            self.edit.setText(f"{self._val} {self._suffix}".strip())
-
-    def _commit(self):
-        t = self.edit.text().strip()
-        if self._special and t == self._special:
-            self.setValue(self._lo)
-            return
-        digits = t[:-len(self._suffix)].strip() if self._suffix and t.endswith(self._suffix) else t
-        try:
-            self.setValue(int(digits))
-        except ValueError:
-            self._show()
-
-    def eventFilter(self, obj, ev):
-        if obj is self.edit:
-            if ev.type() == QEvent.Wheel:
-                self.stepBy(1 if ev.angleDelta().y() > 0 else -1)
-                return True
-            if ev.type() == QEvent.KeyPress and ev.key() in (Qt.Key_Up, Qt.Key_Down):
-                self.stepBy(1 if ev.key() == Qt.Key_Up else -1)
-                return True
-        return super().eventFilter(obj, ev)
+        self.edit.stepBy(n)
 
 
 class SideButton(QAbstractButton):
@@ -2162,19 +2117,14 @@ class Tile(QFrame):
 
 
 class AppFilter(QObject):
-    """DWM-полоса у диалогов до показа + русское меню по правому клику везде."""
+    """Русское меню по правому клику везде (полоса диалогов в цвет темы — qt_base.TitleBars)."""
 
     def __init__(self, win):
         super().__init__()
         self.win = win
 
     def eventFilter(self, obj, ev):
-        t = ev.type()
-        if t == QEvent.Show and isinstance(obj, QWidget) and obj.isWindow() \
-                and not (obj.windowFlags() & Qt.FramelessWindowHint) \
-                and obj.windowType() in (Qt.Window, Qt.Dialog, Qt.Tool):
-            _dwm_paint(obj)
-        elif t == QEvent.ContextMenu and isinstance(obj, QWidget):
+        if ev.type() == QEvent.ContextMenu and isinstance(obj, QWidget):
             if self.win.context_menu(obj, ev.globalPos(), own=obj.window() is self.win):
                 return True
         return False
@@ -4627,13 +4577,20 @@ def selftest():
     app = QApplication.instance() or QApplication(sys.argv)
     if not install_ru(app):
         res.append("ℹ русского перевода Qt нет — кнопки диалогов будут по-английски")
-    app.setStyle("Fusion")
+    qt_base.setup_app(app, qt_dialogs=False)
+    errs = qt_base.selftest()
+    ok(f"основа окна: тема, палитра, полоса диалогов (qt_base {qt_base.VERSION})"
+       + (": " + "; ".join(errs[:3]) if errs else ""), not errs)
     apply_theme(app, "dark")
     f = _IntField(1, 15, 3, "с")
     f.stepBy(20)
     f.edit.setText("abc")
-    f._commit()
-    ok("_IntField: предел и откат", f.value() == 15 and f.edit.text() == "15 с")
+    ok("числовое поле (int_field): предел и откат", f.value() == 15 and f.edit.text() == "15 с")
+    f.edit.setText("7 с")
+    ok("числовое поле (int_field): набранное — и без Enter", f.value() == 7 and f.edit.text() == "7 с")
+    f.setSpecialValueText("нет")
+    f.setValue(-5)
+    ok("числовое поле (int_field): особое значение", f.value() == 1 and f.edit.text() == "нет")
     cfg = dict(DEFAULT_CONFIG)
     w = MainWindow(cfg, cfg_writable=False)
     ok("окно создаётся", w.found.count() == 0 and w.e_ant.text() == "")
@@ -4687,11 +4644,7 @@ def main():
         sys.exit(selftest())
     from app import gh_update
     gh_update.wait_previous(sys.argv)   # после обновления — дождаться закрытия старой копии
-    if IS_WIN:
-        try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
-        except Exception:
-            pass
+    qt_base.set_app_id(APP_ID)          # до QApplication — свой значок на панели задач
     cfg, writable = load_config()
     if cfg.get("github_token") and not cfg.get("upd_token"):   # токен из v0.2.x
         cfg["upd_token"] = cfg["github_token"]
@@ -4701,10 +4654,10 @@ def main():
             and "--after-update" not in sys.argv and not is_admin():
         if relaunch_as_admin():
             sys.exit(0)
-    QApplication.setAttribute(Qt.AA_DontUseNativeDialogs, True)
     app = QApplication(sys.argv)
     install_ru(app)
-    app.setStyle("Fusion")
+    qt_base.setup_app(app, qt_dialogs=True)   # Fusion; выбор файла / папки — окно Qt в цветах темы
+    app.title_bars = qt_base.TitleBars(app)   # системная полоса диалогов — в цвет темы до показа (Windows)
     app.setWindowIcon(app_icon())
     try:                                   # v0.7.0: выбранный значок (app_icon.json) → окна и antenna_setup.ico
         icons = app_icons()
