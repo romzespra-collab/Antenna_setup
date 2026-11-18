@@ -7,8 +7,8 @@ antenna_setup.pyw  v0.8.0
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
-  v0.8.0: Общие модули: safe_json 1.1.0 — config.json пишется атомарно, с .bak; испорченный не затирается
-          (копия config.json.bad-<время>, настройки — из .bak); app_log 1.2.0 — журнал antenna_setup.log:
+  v0.8.0: Общие модули: safe_json 1.1.1 — config.json пишется атомарно, с .bak; испорченный не затирается
+          (копия config.json.bad-<время>, настройки — из .bak); app_log 1.2.1 — журнал antenna_setup.log:
           ротация, пароли и токены скрыты, падения — ещё и в antenna_setup_crash.log; для разработки —
           bump_version.py / release.py / check_leaks.py (release.json), в build_exe.bat — проверка утечек.
   v0.7.0: Значок программы: окно выбора (общий модуль app_icon 1.2.0) — «Настройки» → «Оформление» →
