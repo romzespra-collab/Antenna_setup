@@ -1,6 +1,12 @@
-"""bump_version.py  v1.0.0 — общая утилита для всех проектов: подъём версии во всех местах сразу.
+"""bump_version.py  v1.1.0 — общая утилита для всех проектов: подъём версии во всех местах сразу.
 
 Журнал:
+v1.1.0: несколько программ поднимаются ВМЕСТЕ (общее место версии — у обеих, проверка до записи);
+        шапки: и «vNNN» из одного числа, и «Version: X.Y.Z» / «Версия: X.Y.Z»; программа в корне ("dir": "")
+        не трогает шапки других программ репозитория (их папок); -t "название" — {title} в шаблоне
+        (заголовок версии «## vX — название»); журнал изменений: несколько -m — продолжение под текстом (не повтор строки версии), "more", перенос
+        длинных строк ("wrap"), только N последних версий ("keep" + "tail"), несколько журналов (список —
+        например, ещё журнал в шапке .pyw).
 v1.0.0: первая версия (на основе bump_version.py SmartView 2.10.2): места версии — в release.json;
         проверка, что везде одна версия; шапки изменённых файлов; запись в журнал изменений.
 
@@ -14,6 +20,7 @@ v1.0.0: первая версия (на основе bump_version.py SmartView 2
     python bump_version.py 2.1.0               # задать явно
     python bump_version.py mini minor          # программа «mini» из release.json (если их несколько)
     python bump_version.py minor -m "Что сделано" -m "Ещё строка"    # + запись в журнал изменений
+    python bump_version.py minor -t "Общие модули" -m "…"              # {title} — заголовок версии
     python bump_version.py --check             # версии всех программ и расхождения
 Если хоть в одном файле версия не найдена или не та — ничего не меняется (обойти: --force).
 Версии вида X.Y и одно число тоже понимает: patch / minor поднимают последнюю / вторую часть.
@@ -24,14 +31,15 @@ import os
 import re
 import subprocess
 import sys
+import textwrap
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 import release as R          # noqa: E402 — release.json, шаблоны, чтение и запись файлов
 
 HOW = ("patch", "minor", "major")
-HEADER_RX = re.compile(r"\bv(\d+(?:\.\d+)+)\b")
+HEADER_RX = re.compile(r"\bv(\d+(?:\.\d+)*)\b|(?i:\b(?:version|версия)\b)\s*[:=]?\s*v?(\d+(?:\.\d+)*)\b")
 HEADER_EXT = (".py", ".pyw", ".bat", ".cmd", ".spec", ".ps1")
 # общие модули — со своей версией; их шапки программа не трогает (+ "headers_skip" в release.json)
 SHARED = ("gh_update*.py", "test_gh_update.pyw", "app_icon*.py", "app_icon_pack_build.pyw", "safe_json.py",
@@ -58,12 +66,16 @@ def bump(cur, how):
     return ".".join(str(x) for x in parts)
 
 
-def changed_files(prog, root=R.ROOT):
-    """Изменённые (и новые, не в .gitignore) файлы программы — для шапок."""
+def changed_files(prog, root=R.ROOT, others=()):
+    """Изменённые (и новые, не в .gitignore) файлы программы — для шапок. others — папки других программ
+    репозитория (программа в корне их файлы не берёт)."""
     sub = (prog.get("dir") or "").strip("/\\") or "."
     out = R.git("diff", "--name-only", "HEAD", "--", sub, root=root, check=False).split("\n")
     out += R.git("ls-files", "--others", "--exclude-standard", "--", sub, root=root, check=False).split("\n")
-    return sorted({p for p in out if p.strip() and p.lower().endswith(HEADER_EXT)})
+    mine = (prog.get("dir") or "").strip("/\\")
+    skip = [o.strip("/\\") + "/" for o in others if o and o.strip("/\\") and o.strip("/\\") != mine]
+    return sorted({p for p in out if p.strip() and p.lower().endswith(HEADER_EXT)
+                   and not any(p.startswith(o) for o in skip)})
 
 
 def update_header(text, new):
@@ -72,61 +84,114 @@ def update_header(text, new):
     for i in range(min(3, len(lines))):
         m = HEADER_RX.search(lines[i])
         if m:
-            if m.group(1) == new:
+            g = 1 if m.group(1) else 2
+            if m.group(g) == new:
                 return text, False
-            lines[i] = lines[i][:m.start()] + "v" + new + lines[i][m.end():]
+            lines[i] = lines[i][:m.start(g)] + new + lines[i][m.end(g):]
             return "\n".join(lines), True
     return text, False
 
 
-def changelog_insert(text, cl, new, msgs):
+def _fill(t, new, today, title):
+    if not title:                      # нет названия — убрать и разделитель перед ним
+        t = re.sub(r"\s*[—–:-]?\s*\{title\}", "", t)
+    return t.replace("{v}", new).replace("{date}", today).replace("{title}", title or "")
+
+
+def _entry_lines(line, msgs, more, wrap, new, today, title=""):
+    """Строки записи: шаблонная строка с {msg} — для первого сообщения, для остальных — more
+    (по умолчанию: та же строка, если в ней нет {v} / {date}, иначе — отступ под {msg});
+    wrap — перенос длинных сообщений, продолжение — под {msg}."""
+    def fill(t):
+        return _fill(t, new, today, title)
+    if more is None:
+        more = line if not re.search(r"\{(v|date|title)\}", line) else \
+            " " * fill(line).index("{msg}") + "{msg}"
+    out = []
+    for i, m in enumerate(msgs):
+        tpl = fill(line if i == 0 else more)
+        c = tpl.index("{msg}")
+        parts = textwrap.wrap(m, width=max(20, wrap - c)) if wrap else [m]
+        parts = parts or [""]
+        out.append(tpl.replace("{msg}", parts[0]))
+        out.extend(" " * c + p for p in parts[1:])
+    return out
+
+
+def _find(lines, spec, start=0):
+    rx = re.compile(spec[3:]) if spec.startswith("re:") else None
+    for i in range(start, len(lines)):
+        if (rx.search(lines[i]) if rx else spec in lines[i]):
+            return i
+    return None
+
+
+def changelog_insert(text, cl, new, msgs, title=""):
     nl = "\r\n" if "\r\n" in text else "\n"
-    tpl = cl.get("template", "{v}:\n- {msg}\n")
-    tl = tpl.split("\n")
+    today = datetime.date.today().isoformat()
     body = []
-    for line in tl:
+    for line in cl.get("template", "{v}:\n- {msg}\n").split("\n"):
         if "{msg}" in line:
-            body.extend(line.replace("{msg}", m) for m in msgs)
+            body.extend(_entry_lines(line, msgs, cl.get("more"), int(cl.get("wrap") or 0), new, today, title))
         else:
-            body.append(line)
-    block = "\n".join(body).replace("{v}", new).replace(
-        "{date}", datetime.date.today().isoformat()).replace("\n", nl)
+            body.append(_fill(line, new, today, title))
+    block = body
     lines = text.split(nl)
-
-    def find(spec):
-        rx = re.compile(spec[3:]) if spec.startswith("re:") else None
-        for i, line in enumerate(lines):
-            if (rx.search(line) if rx else spec in line):
-                return i
-        return None
-
     if cl.get("before"):
-        i = find(cl["before"])
-        if i is None:
+        pos = _find(lines, cl["before"])
+        if pos is None:
             raise R.ReleaseError(f"{cl['file']}: строка {cl['before']!r} не найдена")
-        pos = i
     elif cl.get("after"):
-        i = find(cl["after"])
+        i = _find(lines, cl["after"])
         if i is None:
             raise R.ReleaseError(f"{cl['file']}: строка {cl['after']!r} не найдена")
         pos = i + 1
     else:
         pos = 0
-    head = nl.join(lines[:pos])
-    tail = nl.join(lines[pos:])
-    return (head + nl if pos else "") + block + tail
+    # шаблон кончается переводом строки — последняя пустая часть не нужна
+    if block and block[-1] == "":
+        block = block[:-1]
+    lines[pos:pos] = block
+    keep = int(cl.get("keep") or 0)
+    if keep:
+        entry = cl.get("entry") or (cl["before"] if str(cl.get("before", "")).startswith("re:") else None)
+        if not entry:
+            raise R.ReleaseError(f"{cl['file']}: keep — нужен \"entry\" (строка начала версии, re:…)")
+        if "tail" not in cl:
+            raise R.ReleaseError(f"{cl['file']}: keep — нужен \"tail\" (строка после версий; \"\" — конец файла)")
+        rx = re.compile(entry[3:] if entry.startswith("re:") else re.escape(entry))
+        starts = [i for i, ln in enumerate(lines) if i >= pos and rx.search(ln)]
+        if len(starts) > keep:
+            cut = starts[keep]
+            end = _find(lines, cl["tail"], cut) if cl["tail"] else None
+            if cl["tail"] and end is None:
+                raise R.ReleaseError(f"{cl['file']}: строка {cl['tail']!r} не найдена — версии не обрезаю")
+            end = len(lines) if end is None else end
+            to_eof = end == len(lines)
+            tail_blank = not to_eof and cut > 0 and lines[cut - 1].strip() != ""
+            del lines[cut:end]
+            if tail_blank:
+                lines.insert(cut, "")
+            if to_eof:
+                while lines and lines[-1] == "":
+                    lines.pop()
+                if text.endswith(nl):
+                    lines.append("")
+    return nl.join(lines)
 
 
-def plan(prog, how, msgs, root=R.ROOT, force=False):
-    """Все правки заранее: {путь: (текст, кодировка, BOM)}, старая и новая версия, заметки."""
-    cur, bad = R.check_versions(prog, root)
+def plan(prog, how, msgs, root=R.ROOT, force=False, title="", edits=None, others=()):
+    """Все правки заранее: {путь: [текст, кодировка, BOM]}, старая и новая версия, заметки.
+    edits — общий словарь правок (несколько программ вместе: общее место версии правится один раз)."""
+    cur, bad = R.check_versions(prog, root, strict=True)
     new = bump(cur, how)
     if new == cur:
         raise R.ReleaseError(f"версия уже {cur}")
     if bad and not force:
-        raise R.ReleaseError("версии не совпадают — ничего не меняю (обойти: --force):\n  "
+        raise R.ReleaseError(f"{prog['name']}: версии не совпадают — ничего не меняю (обойти: --force):\n  "
                              + "\n  ".join(f"{p}: {t}" for p, t in bad))
-    edits, notes = {}, []
+    edits = {} if edits is None else edits
+    notes = []
 
     def get(path):
         full = os.path.join(root, path)
@@ -146,7 +211,7 @@ def plan(prog, how, msgs, root=R.ROOT, force=False):
         notes.append(f"{path}: {'обновлён' if n else 'версия не найдена'}")
     if prog.get("headers"):
         skip = SHARED + tuple(prog.get("headers_skip", ()))
-        for path in changed_files(prog, root):
+        for path in changed_files(prog, root, others):
             if any(fnmatch.fnmatch(os.path.basename(path), g) or fnmatch.fnmatch(path, g) for g in skip):
                 continue
             full = os.path.join(root, path)
@@ -156,13 +221,14 @@ def plan(prog, how, msgs, root=R.ROOT, force=False):
             rec[0], ch = update_header(rec[0], new)
             if ch:
                 notes.append(f"{path}: шапка -> v{new}")
-    cl = prog.get("changelog")
-    if cl and msgs:
-        rec = get(cl["file"])
-        rec[0] = changelog_insert(rec[0], cl, new, msgs)
-        notes.append(f"{cl['file']}: запись о {new}")
-    elif cl:
-        notes.append(f"{cl['file']}: запись о {new} — допишите (или -m \"текст\")")
+    cls = prog.get("changelog") or []
+    for cl in ([cls] if isinstance(cls, dict) else cls):
+        if msgs:
+            rec = get(cl["file"])
+            rec[0] = changelog_insert(rec[0], cl, new, msgs, title)
+            notes.append(f"{cl['file']}: запись о {new}")
+        else:
+            notes.append(f"{cl['file']}: запись о {new} — допишите (или -m \"текст\")")
     return cur, new, edits, notes
 
 
@@ -225,6 +291,54 @@ def selftest():
         check(rd("build.bat") == "@echo off\r\nchcp 65001\r\necho App v1.3.0\r\n", "bat: CRLF сохранён")
         check(rd("CHANGELOG.txt") == "История\n=======\n\n1.3.0:\n- новое\n- ещё\n1.2.0:\n- старое\n",
               "журнал изменений: " + repr(rd("CHANGELOG.txt")))
+        # журнал «v{v} — {msg}»: продолжение под текстом, перенос, только 2 версии; второй журнал — в шапке
+        with open(os.path.join(d, "NEWS.txt"), "w", encoding="utf-8", newline="") as f:
+            f.write("Что нового\n\nv1.3.0 — было 3\nv1.2.0 — было 2\nv1.1.0 — было 1\n\nБолее ранние — в git.\n")
+        news = {"file": "NEWS.txt", "before": "re:^v\\d", "template": "v{v} — {msg}\n", "wrap": 30,
+                "keep": 2, "tail": "Более ранние"}
+        head = {"file": "app.py", "after": "Журнал:", "template": "v{v}: {msg}\n"}
+        prog3 = dict(prog, headers=False, changelog=[news, head])
+        cur, new, edits, notes = plan(prog3, "patch", ["первая строка довольно длинная", "вторая"], root=d)
+        apply(edits, root=d)
+        check(rd("NEWS.txt") == "Что нового\n\nv1.3.1 — первая строка\n         довольно длинная\n"
+              "         вторая\nv1.3.0 — было 3\n\nБолее ранние — в git.\n", "журнал v{v} — {msg}: " + repr(rd("NEWS.txt")))
+        check("Журнал:\nv1.3.1: первая строка довольно длинная\n        вторая\nv1.1.0: было" in rd("app.py"),
+              "журнал в шапке: " + repr(rd("app.py")[:120]))
+        # шапка «Version: X» и заголовок с названием
+        check(update_header("# app.py\n# Version: 1.2.0\n", "1.3.0") == ("# app.py\n# Version: 1.3.0\n", True),
+              "шапка Version:")
+        check(update_header("Модуль. Версия 2.0\n", "2.1")[0] == "Модуль. Версия 2.1\n", "шапка Версия")
+        t = changelog_insert("# Журнал\n\n## v1.0 — старое\n", {"file": "x", "before": "re:^## v",
+                             "template": "## v{v} — {title}\n- {msg}\n\n"}, "1.1", ["а"], "Новое")
+        check(t == "# Журнал\n\n## v1.1 — Новое\n- а\n\n## v1.0 — старое\n", "заголовок {title}: " + repr(t))
+        t = changelog_insert("## v1.0\n", {"file": "x", "template": "## v{v} — {title}\n- {msg}\n\n"}, "1.1", ["а"])
+        check(t.startswith("## v1.1\n- а\n"), "без названия — без «— »: " + repr(t))
+        # одно число в шапке, программа в корне не трогает папку другой программы
+        check(update_header("# dash v236\n", "237")[0] == "# dash v237\n", "шапка vNNN")
+        os.makedirs(os.path.join(d, "mini"))
+        with open(os.path.join(d, "mini", "m.py"), "w", encoding="utf-8") as f:
+            f.write('"""m.py  v7.9.0"""\n')
+        check("mini/m.py" not in changed_files({"dir": ""}, d, others=["", "mini"]), "чужая папка — не наша шапка")
+        check("mini/m.py" in changed_files({"dir": "mini"}, d, others=["", "mini"]), "своя папка — наша шапка")
+        # две программы с общим местом версии — вместе
+        with open(os.path.join(d, "shared.bat"), "w", encoding="utf-8", newline="") as f:
+            f.write("rem A v3.1.0\r\n")
+        with open(os.path.join(d, "B_VERSION"), "w", encoding="utf-8") as f:
+            f.write("3.1.0\n")
+        with open(os.path.join(d, "A_VERSION"), "w", encoding="utf-8") as f:
+            f.write("3.1.0\n")
+        pa = {"name": "a", "files": [["A_VERSION", "{v}"], ["shared.bat", "A v{v}"]]}
+        pb = {"name": "b", "files": [["B_VERSION", "{v}"], ["shared.bat", "A v{v}"]]}
+        ed = {}
+        plan(pa, "minor", [], root=d, edits=ed)
+        plan(pb, "minor", [], root=d, edits=ed)
+        apply(ed, root=d)
+        check(rd("shared.bat") == "rem A v3.2.0\r\n" and rd("A_VERSION") == rd("B_VERSION") == "3.2.0\n",
+              "общее место версии у двух программ")
+        # keep до конца файла (tail "")
+        t = changelog_insert("H\n\n2.0:\n- b\n\n1.0:\n- a\n", {"file": "x", "before": "re:^\\d", "keep": 2,
+                             "tail": "", "template": "{v}:\n- {msg}\n\n"}, "3.0", ["c"])
+        check(t == "H\n\n3.0:\n- c\n\n2.0:\n- b\n", "keep до конца файла: " + repr(t))
         # расхождение — ничего не меняется
         with open(os.path.join(d, "build.bat"), "w", encoding="utf-8", newline="") as f:
             f.write("echo App v1.0.0\r\n")
@@ -233,7 +347,7 @@ def selftest():
             errs.append("расхождение версий — должна быть ошибка")
         except R.ReleaseError as e:
             check("build.bat" in str(e), f"в ошибке нет файла: {e}")
-        check(rd("VERSION") == "1.3.0\n", "при ошибке файлы не тронуты")
+        check(rd("VERSION") == "1.3.1\n", "при ошибке файлы не тронуты")
     return errs
 
 
@@ -244,11 +358,13 @@ def main(argv):
         return 1 if problems else 0
     if "--check" in argv:
         return R.main(["--check"])
-    msgs, rest, force = [], [], False
+    msgs, rest, force, title = [], [], False, ""
     it = iter(argv)
     for a in it:
         if a == "-m":
             msgs.append(next(it, ""))
+        elif a == "-t":
+            title = next(it, "")
         elif a == "--force":
             force = True
         else:
@@ -262,10 +378,14 @@ def main(argv):
             raise R.ReleaseError("лишние аргументы: " + " ".join(hows))
         how = hows[0] if hows else "patch"
         progs = R.pick(cfg, prog_names)
-        for p in progs:
-            cur, new, edits, notes = plan(p, how, msgs, force=force)
-            apply(edits)
-            print(f"{p['name']}: {cur} -> {new}")
+        dirs = [p.get("dir") or "" for p in cfg["programs"]]
+        edits, report = {}, []
+        for p in progs:                      # сначала все планы (ошибка — ничего не записано), потом запись
+            cur, new, _, notes = plan(p, how, msgs, force=force, title=title, edits=edits, others=dirs)
+            report.append((p["name"], cur, new, notes))
+        apply(edits)
+        for name, cur, new, notes in report:
+            print(f"{name}: {cur} -> {new}")
             for n in notes:
                 print("  " + n)
         print("Шапки остальных изменённых файлов и описание — проверьте вручную; потом commit и"

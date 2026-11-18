@@ -1,13 +1,17 @@
-"""check_leaks.py  v1.0.0 — общая утилита для всех проектов: поиск утечек перед выдачей.
+"""check_leaks.py  v1.1.0 — общая утилита для всех проектов: поиск утечек перед выдачей.
 
 Журнал:
+v1.1.0: токен бота Telegram находится и в адресе (…/bot<токен>/…); без аргументов вне git (папка программы, распакованная из архива) — проверяются только файлы
+        программы; config.json, журналы, кэш и прочие файлы пользователя пропускаются, а не считаются
+        утечкой (сборка build_exe.bat из такой папки больше не останавливается).
 v1.0.0: первая версия: токены и ключи в файлах, секреты в JSON, лишние файлы в архиве / сборке.
 
 Общая утилита: одинаковая во всех проектах (в архив программы попадает, в EXE — нет).
 Правка — поднять версию и перенести файл ЦЕЛИКОМ во все проекты.
 
 Запуск (из папки репозитория):
-    python check_leaks.py                    # файлы репозитория (git ls-files)
+    python check_leaks.py                    # файлы репозитория (git ls-files); вне git — файлы программы
+                                             # без файлов пользователя (config.json, журналы, build/, dist/)
     python check_leaks.py release/x_v1.zip   # архив: секреты + лишнее (__pycache__, config.json, логи, release/)
     python check_leaks.py dist/Prog          # папка сборки — то же, что архив
     python check_leaks.py --selftest
@@ -30,7 +34,7 @@ import subprocess
 import sys
 import zipfile
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 MAX_SIZE = 20_000_000
 TOKEN_RES = [
@@ -40,7 +44,7 @@ TOKEN_RES = [
     ("ключ OpenAI", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9]{32,}")),
     ("ключ AWS", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("токен Slack", re.compile(r"\bxox[baprs]-[A-Za-z0-9]{10,}-[A-Za-z0-9\-]{10,}")),
-    ("токен бота Telegram", re.compile(r"\b\d{8,10}:AA[A-Za-z0-9_\-]{33}\b")),
+    ("токен бота Telegram", re.compile(r"(?<!\d)\d{8,10}:AA[A-Za-z0-9_\-]{33}(?![A-Za-z0-9_\-])")),
     ("закрытый ключ", re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----")),
 ]
 SECRET_KEYS = re.compile(
@@ -150,7 +154,7 @@ def scan_zip(path, allow=()):
 
 def scan_dir(path, allow=()):
     out = []
-    for root, dirs, files in os.walk(path):
+    for root, _dirs, files in os.walk(path):
         for fn in files:
             full = os.path.join(root, fn)
             rel = os.path.relpath(full, path).replace("\\", "/")
@@ -190,6 +194,38 @@ def scan_repo(root="."):
     return out
 
 
+def scan_program_dir(path):
+    """Папка программы без git (распакована из архива): файлы пользователя и сборки пропускаются."""
+    out = []
+    skip_dirs = {"__pycache__", "logs", "release", ".git", "build", "dist", ".venv", "venv"}
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [x for x in dirs if x not in skip_dirs]
+        for fn in files:
+            full = os.path.join(root, fn)
+            rel = os.path.relpath(full, path).replace("\\", "/")
+            if _forbidden(rel) or fn.endswith(".json") and _user_json(fn):
+                continue
+            try:
+                if os.path.getsize(full) <= MAX_SIZE:
+                    with open(full, "rb") as f:
+                        out.extend(scan_bytes(rel, f.read()))
+            except OSError:
+                pass
+    return out
+
+
+def _user_json(fn):
+    """JSON-файлы пользователя рядом с программой (настройки, кэш, история) — не исходники."""
+    return bool(re.search(r"config|settings|cache|state|history|session|token|secret|user", fn, re.I))
+
+
+def scan_default(root="."):
+    """Без аргументов: репозиторий git — его файлы; иначе — папка программы без файлов пользователя."""
+    if os.path.isdir(os.path.join(root, ".git")) or os.path.isfile(os.path.join(root, ".git")):
+        return scan_repo(root), "файлы репозитория"
+    return scan_program_dir(root), "файлы программы (без файлов пользователя)"
+
+
 def scan(target, allow=()):
     if os.path.isfile(target) and target.lower().endswith(".zip"):
         return scan_zip(target, allow)
@@ -215,6 +251,9 @@ def selftest():
     check(scan_bytes("a.py", f"t = '{fake}'\n".encode()), "ghp_ не найден")
     check(scan_bytes("a.py", f"t = '{pat}'\n".encode()), "github_pat_ не найден")
     check(not scan_bytes("a.py", f"t = '{fake}'  # leak-ok\n".encode()), "leak-ok не учтён")
+    tg = "123456789:AA" + "Bb1" * 11
+    check(scan_bytes("a.py", f"u = 'https://api.telegram.org/bot{tg}/getMe'\n".encode()),
+          "токен Telegram в адресе не найден")
     check(not scan_bytes("a.py", b"rx = r'github_pat_[A-Za-z0-9_]{20,}'\n"), "шаблон в коде — не утечка")
     check(scan_bytes("c.json", b'{"gh": {"token": "abc123"}}'), "токен в JSON не найден")
     check(not scan_bytes("c.json", b'{"token": "", "password": "***", "api_key": "<your key>"}'),
@@ -227,6 +266,21 @@ def selftest():
           "config.json / logs / release")
     check(_forbidden("config.json", allow=["config.json"]) is None, "allow")
     check(_forbidden("app/config_defaults.json") is None and _forbidden("README.md") is None, "лишнее срабатывание")
+    with tempfile.TemporaryDirectory() as d:
+        # папка программы без git: config.json с токеном и журналы — не утечка; токен в коде — утечка
+        with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as f:
+            f.write('{"upd_token": "%s"}' % fake)
+        os.makedirs(os.path.join(d, "logs"))
+        with open(os.path.join(d, "logs", "a.log"), "w", encoding="utf-8") as f:
+            f.write(fake)
+        with open(os.path.join(d, "main.py"), "w", encoding="utf-8") as f:
+            f.write("x = 1\n")
+        found, what = scan_default(d)
+        check(not found and "без файлов пользователя" in what, f"папка программы: {[str(x) for x in found]}")
+        with open(os.path.join(d, "main.py"), "w", encoding="utf-8") as f:
+            f.write("t = '%s'\n" % fake)
+        found, _ = scan_default(d)
+        check(len(found) == 1 and found[0].path == "main.py", "токен в коде папки программы")
     with tempfile.TemporaryDirectory() as d:
         z = os.path.join(d, "p_v1.zip")
         with zipfile.ZipFile(z, "w") as zf:
@@ -255,11 +309,15 @@ def main(argv):
             allow.append(next(it, ""))
         else:
             targets.append(a)
-    targets = targets or ["."]
     total = []
     try:
-        for t in targets:
-            total.extend(scan(t, allow))
+        if targets:
+            for t in targets:
+                total.extend(scan(t, allow))
+        else:
+            found, what = scan_default(".")
+            total.extend(found)
+            targets = [what]
     except (OSError, RuntimeError, zipfile.BadZipFile) as e:
         print(f"ОШИБКА: {e}")
         return 2

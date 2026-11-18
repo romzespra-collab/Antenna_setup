@@ -1,6 +1,9 @@
-"""release.py  v1.0.0 — общая утилита для всех проектов: архив версии в release/.
+"""release.py  v1.1.0 — общая утилита для всех проектов: архив версии в release/.
 
 Журнал:
+v1.1.0: check_versions вне git (программа из архива / после обновления) — только расхождения номеров:
+        нет файла или старый release.json — не ошибка; описание журнала изменений: список, wrap, keep, more,
+        {title}; ReleaseError — подкласс ValueError.
 v1.0.0: первая версия: архив <имя>_vX.Y.Z.zip из HEAD, проверка утечек, удаление старого архива.
 
 Общая утилита: одинаковая во всех проектах. Правка — поднять версию и перенести файл ЦЕЛИКОМ
@@ -31,7 +34,14 @@ release.json:
                                                     шаблон "re:..." — регулярное выражение с {v}
      "headers": true,                               bump_version: «vX.Y.Z» в шапках изменённых файлов
      "headers_skip": ["comic_archive.py"],          (кроме общих модулей и этих — у них своя версия)
-     "changelog": {"file": "CHANGELOG.txt", "after": "Здесь — последние", "template": "\\n{v}:\\n- {msg}\\n"},
+     "changelog": {"file": "CHANGELOG.txt",          журнал изменений (или список таких — и журнал в шапке):
+                   "before": "re:^\\d+\\.\\d+",       вставить перед первой такой строкой (или "after": …)
+                   "template": "{v}:\\n  {msg}\\n\\n", {v} {date} {msg} {title} (-t); строка с {msg} — для -m
+                   "more": "  {msg}",                 (необяз.) строка для 2-го и следующих -m
+                   "wrap": 88,                        (необяз.) перенос длинных строк, продолжение — под {msg}
+                   "keep": 10, "entry": "re:^\\d", "tail": "Более ранние"},  (необяз.) оставить N версий:
+                                                    entry — начало версии (по умолчанию before), tail — строка
+                                                    после версий ("" — конец файла)
      "allow_in_zip": []}                            что разрешено в архиве из «лишнего» (шаблоны)
   ]
 }
@@ -42,14 +52,14 @@ import re
 import subprocess
 import sys
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG = os.path.join(ROOT, "release.json")
 VER_RX = r"(?P<v>\d+(?:\.\d+)*)"
 
 
-class ReleaseError(Exception):
-    pass
+class ReleaseError(ValueError):
+    """Ошибка утилит выпуска (ValueError — как у прежнего bump_version.py SmartView)."""
 
 
 # ----------------------------------------------------------------- release.json
@@ -147,19 +157,29 @@ def current_version(prog, root=ROOT):
     return m.group("v")
 
 
-def check_versions(prog, root=ROOT):
-    """Список расхождений: [(файл, что не так)]; пустой — все файлы с одной версией."""
+def is_git(root=ROOT):
+    return os.path.exists(os.path.join(root, ".git"))
+
+
+def check_versions(prog, root=ROOT, strict=None):
+    """Список расхождений: [(файл, что не так)]; пустой — все файлы с одной версией.
+    strict (по умолчанию — в репозитории git): нет файла / версия не найдена — тоже расхождение.
+    Вне git (программа из архива, после обновления: release.json мог остаться старым) — только номера."""
+    if strict is None:
+        strict = is_git(root)
     cur = current_version(prog, root)
     bad = []
     for e in prog["files"]:
         path, pat, count = entry(e)
         full = os.path.join(root, path)
         if not os.path.exists(full):
-            bad.append((path, "нет файла"))
+            if strict:
+                bad.append((path, "нет файла"))
             continue
         found = [m.group("v") for m in compile_pattern(pat).finditer(read_text(full)[0])]
         if not found:
-            bad.append((path, f"версия по шаблону {pat!r} не найдена"))
+            if strict:
+                bad.append((path, f"версия по шаблону {pat!r} не найдена"))
             continue
         check = found if count == 0 else found[:count]
         other = sorted(set(v for v in check if v != cur))
@@ -188,7 +208,7 @@ def repo_slug(cfg, root=ROOT):
 def make_archive(prog, cfg, root=ROOT, dirty=False, keep_old=False, log=print):
     name = prog["name"]
     sub = (prog.get("dir") or "").strip("/\\")
-    cur, bad = check_versions(prog, root)
+    cur, bad = check_versions(prog, root, strict=True)
     if bad:
         raise ReleaseError(f"{name}: версии не совпадают — " + "; ".join(f"{p}: {t}" for p, t in bad)
                            + " (python bump_version.py ...)")
@@ -283,8 +303,13 @@ def selftest():
         import zipfile
         names = zipfile.ZipFile(z).namelist()
         check("app/VERSION" in names and not any("release" in n for n in names), f"содержимое: {names}")
+        # вне git нет файла — не ошибка, а другой номер — ошибка
+        prog2 = dict(prog, files=prog["files"] + [["нет.txt", "v{v}"]])
+        check(check_versions(prog2, root=d, strict=False) == ("1.2.0", []), "вне git: нет файла — не ошибка")
+        check(check_versions(prog2, root=d)[1], "в git: нет файла — ошибка")
         with open(os.path.join(d, "app.py"), "w", encoding="utf-8") as f:
             f.write('VERSION = "1.3.0"\n')
+        check(check_versions(prog, root=d, strict=False)[1], "вне git: другой номер — ошибка")
         try:
             make_archive(prog, cfg, root=d, log=out.append)
             errs.append("разные версии — должна быть ошибка")

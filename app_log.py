@@ -1,6 +1,16 @@
-"""app_log.py  v1.1.0 — общий модуль для всех проектов: журнал программы.
+"""app_log.py  v1.2.0 — общий модуль для всех проектов: журнал программы.
 
 Журнал:
+v1.2.0: сообщения Qt — в отдельный журнал «qt» (только в файл), а не в <имя>.qt: окно «Журнал» программы
+        ими не засоряется; qt_logger= — свой журнал для них (file=False — по умолчанию <имя>.qt);
+        токен бота Telegram скрывается и в адресе (…/bot<токен>/…); скрываются ещё pass= / key= / sid= /
+        session= / cookie= и user:пароль@host без схемы; mask_handlers() не заменяет формат программы, а
+        дополняет его скрытием (её собственное скрытие остаётся); проверочные строки selftest() не
+        попадают в журнал программы, даже если она пишет через корневой журнал; add_file() — ещё один
+        журнал в свой файл (журналы отдельных функций), не трогая главный; file=False — журналы общих
+        модулей (safe_json, gh_update, app_icon) идут в обработчики журнала программы; Qt не установлен
+        при setup() — install_qt_handler() позже; уровень журнала, уже заданный программой (DEBUG),
+        setup() не сбивает (level=None по умолчанию).
 v1.1.0: setup(..., file=False) — для программ со своим журналом (файл, окно «Журнал»): только
         следы падений, сообщения Qt и скрытие секретов в их обработчиках (mask_handlers).
 v1.0.0: первая версия: файл с ротацией, следы падений, сообщения Qt, скрытие паролей и токенов.
@@ -15,21 +25,27 @@ v1.0.0: первая версия: файл с ротацией, следы па
   (файл появляется только при падении); fault=True — ещё и faulthandler туда же (нарушение
   доступа в Qt / C-модуле оставляет след; на Windows он пишет и безвредные исключения COM / C++,
   поэтому по умолчанию выключен; пустой файл при обычном выходе удаляется);
-- сообщения Qt (qWarning и т.п.) — в журнал, от уровня qt_level;
+- сообщения Qt (qWarning и т.п.) — в файл журнала (журнал «qt», в окно «Журнал» программы не идут),
+  от уровня qt_level;
 - пароли и токены (github_pat_…, ghp_…, password=…, token=…, логин:пароль@ в адресе) в журнал не
   попадают — заменяются на ***;
 - журналы общих модулей (safe_json, gh_update, app_icon) пишутся в тот же файл.
 
 API:
     log = app_log.setup("comic", log_dir)                  # logging.Logger("comic")
+    log = app_log.setup("", log_dir, file_name="app.log", shared=())   # корневой журнал (пишут все
+                                                           # модули программы; общие — и так в нём)
     log = app_log.setup("comic", log_dir, file_name="comic_project.log", max_bytes=1_000_000,
-                        backups=3, level=logging.INFO, fmt=..., datefmt=..., console=False,
+                        backups=3, level=None (INFO / как задано программой), fmt=..., datefmt=..., console=False,
                         crash=True, fault=False, qt=True, qt_level=logging.WARNING)
     app_log.get("net")          # logging.getLogger("comic.net")
     app_log.log_path() / app_log.crash_path() / app_log.logs_dir()
     app_log.mask_secrets(text)
     app_log.log_exception(exc_type, exc, tb)   # для своего excepthook программы (окно с ошибкой и т.п.)
     app_log.install_qt_handler()               # если Qt подключили позже setup()
+Ещё журнал в свой файл (у отдельной функции), главный не трогается:
+    lg = app_log.add_file("winhub.netwatch", path_to_log, max_bytes=1_000_000, backups=2, fmt=...)
+Qt (PySide6) ставится после setup() — тогда после установки: app_log.install_qt_handler().
 Программа со своим журналом (свой файл / окно «Журнал» / буфер):
     app_log.setup("smartmon", logs_dir, file=False)   # без второго файла: падения + Qt
     app_log.mask_handlers(logger)                     # её обработчикам — форматтер со скрытием секретов
@@ -45,7 +61,7 @@ import time
 import traceback
 from logging.handlers import RotatingFileHandler
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 SHARED_LOGGERS = ("safe_json", "gh_update", "app_icon")
 FMT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
@@ -53,7 +69,7 @@ DATEFMT = "%Y-%m-%d %H:%M:%S"
 CRASH_MAX = 1_000_000          # след падений больше — оставить последние CRASH_KEEP байт
 CRASH_KEEP = 256_000
 
-_state = {"name": None, "logger": None, "dir": None, "path": None, "crash": None,
+_state = {"name": None, "logger": None, "dir": None, "path": None, "crash": None, "qt_logger": "qt",
           "handler": None, "qt_handler": None, "qt_level": logging.WARNING, "fault_file": None}
 _lock = threading.RLock()
 
@@ -64,13 +80,15 @@ _TOKEN_RES = [
     re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_\-]{20,}"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}"),
-    re.compile(r"\b\d{8,10}:AA[A-Za-z0-9_\-]{30,}"),          # токен бота Telegram
+    re.compile(r"(?<!\d)\d{8,10}:AA[A-Za-z0-9_\-]{30,}"),      # токен бота Telegram (и в …/bot<токен>/)
 ]
 _AUTH_RE = re.compile(r"(?i)(authorization\s*[:=]\s*[\"']?)(bearer|token|basic)\s+[^\s\"',;]+")
 _KV_RE = re.compile(
-    r"(?i)([\"']?\b(?:password|passwd|pwd|passw|token|access_token|refresh_token|secret|"
-    r"client_secret|api[_-]?key|apikey|access[_-]?key|auth)[\"']?\s*[:=]\s*[\"']?)([^\s\"'&;,}]+)")
+    r"(?i)([\"']?\b(?:password|passwd|pwd|passw|pass|token|access_token|refresh_token|secret|"
+    r"client_secret|api[_-]?key|apikey|access[_-]?key|key|auth|sid|session(?:_?id)?|cookie)[\"']?"
+    r"\s*[:=]\s*[\"']?)([^\s\"'&;,}]+)")
 _URL_RE = re.compile(r"(://[^/\s:@]+:)([^@\s/]+)(@)")
+_USERPASS_RE = re.compile(r"(?<![:/\w@])([A-Za-z0-9._%+\-]+:)([^\s@/:]+)(@[A-Za-z0-9][A-Za-z0-9.\-]*)")
 
 
 def mask_secrets(text):
@@ -83,6 +101,7 @@ def mask_secrets(text):
     s = _AUTH_RE.sub(r"\1\2 ***", s)
     s = _KV_RE.sub(r"\1***", s)
     s = _URL_RE.sub(r"\1***\3", s)
+    s = _USERPASS_RE.sub(r"\1***\3", s)
     return s
 
 
@@ -91,6 +110,17 @@ class MaskingFormatter(logging.Formatter):
 
     def format(self, record):
         return mask_secrets(super().format(record))
+
+
+class _MaskAround(logging.Formatter):
+    """Формат программы как есть (и её скрытие) + наше скрытие поверх (mask_handlers)."""
+
+    def __init__(self, inner):
+        super().__init__()
+        self.inner = inner
+
+    def format(self, record):
+        return mask_secrets(self.inner.format(record))
 
 
 # ----------------------------------------------------------------- файл с ротацией
@@ -222,6 +252,15 @@ def _install_crash_hooks(fault=False):
 _QT_LEVELS = {}
 
 
+def _qt_log(lvl, msg):
+    if lvl < _state["qt_level"]:
+        return
+    try:
+        logging.getLogger(_state.get("qt_logger") or "qt").log(lvl, "%s", msg)
+    except Exception:                                 # noqa: BLE001
+        pass
+
+
 def install_qt_handler(level=None):
     """Сообщения Qt -> журнал (<имя>.qt). True — поставлен."""
     if level is not None:
@@ -237,13 +276,7 @@ def install_qt_handler(level=None):
             QtMsgType.QtFatalMsg: logging.CRITICAL})
 
     def handler(mode, ctx, msg):
-        lvl = _QT_LEVELS.get(mode, logging.WARNING)
-        if lvl < _state["qt_level"]:
-            return
-        try:
-            (_state["logger"] or logging.getLogger()).getChild("qt").log(lvl, "%s", msg)
-        except Exception:                             # noqa: BLE001
-            pass
+        _qt_log(_QT_LEVELS.get(mode, logging.WARNING), msg)
 
     _state["qt_handler"] = handler
     qInstallMessageHandler(handler)
@@ -251,14 +284,20 @@ def install_qt_handler(level=None):
 
 
 # ----------------------------------------------------------------- настройка
-def setup(name, log_dir, *, file_name=None, level=logging.INFO, max_bytes=1_000_000, backups=3,
+def setup(name, log_dir, *, file_name=None, level=None, max_bytes=1_000_000, backups=3,
           fmt=FMT, datefmt=DATEFMT, console=False, crash=True, fault=False, qt=True,
-          qt_level=logging.WARNING, shared=SHARED_LOGGERS, file=True):
+          qt_level=logging.WARNING, shared=SHARED_LOGGERS, file=True, qt_logger=None):
     """Журнал программы. Повторный вызов не плодит обработчики. Папку не создать — журнал без файла.
-    file=False — свой файл не заводить (у программы свой журнал): следы падений, сообщения Qt."""
+    level — уровень журнала (по умолчанию INFO, но уже заданный программой не меняется).
+    file=False — свой файл не заводить (у программы свой журнал): следы падений, сообщения Qt.
+    qt_logger — журнал для сообщений Qt: по умолчанию «qt» (только файл) или <имя>.qt при file=False."""
     with _lock:
         logger = logging.getLogger(name)
-        logger.setLevel(level)
+        if level is not None:
+            logger.setLevel(level)
+        elif logger.level == logging.NOTSET:
+            logger.setLevel(logging.INFO)            # уровень, уже заданный программой, не трогаем
+        level = logger.level
         _state["name"] = name
         _state["logger"] = logger
         _state["qt_level"] = qt_level
@@ -281,6 +320,14 @@ def setup(name, log_dir, *, file_name=None, level=logging.INFO, max_bytes=1_000_
                 os.makedirs(log_dir, exist_ok=True)
             except OSError:
                 pass
+            if name:                      # общие модули — в обработчики журнала программы
+                for n in shared:
+                    lg = logging.getLogger(n)
+                    if n != name and not lg.handlers:
+                        lg.addHandler(_Forward(logger))
+                        lg.propagate = False
+                        if lg.level == logging.NOTSET or lg.level > level:
+                            lg.setLevel(level)
         elif h is None or getattr(h, "baseFilename", None) != os.path.abspath(path):
             if h is not None:
                 for lg in (logger, *(logging.getLogger(n) for n in shared)):
@@ -293,11 +340,12 @@ def setup(name, log_dir, *, file_name=None, level=logging.INFO, max_bytes=1_000_
             except OSError:
                 h = None
             _state["handler"] = h
+        _state["qt_logger"] = qt_logger or ("qt" if h is not None or not name else f"{name}.qt")
         if h is not None:
             h.setFormatter(formatter)
             if h not in logger.handlers:
                 logger.addHandler(h)
-            for n in shared:
+            for n in (*shared, _state["qt_logger"]):
                 lg = logging.getLogger(n)
                 if n != name and not lg.handlers:
                     lg.addHandler(h)
@@ -319,16 +367,55 @@ def setup(name, log_dir, *, file_name=None, level=logging.INFO, max_bytes=1_000_
 
 
 def mask_handlers(logger, fmt=None, datefmt=None):
-    """Обработчикам logger (и их форматам) — скрытие паролей и токенов. Возвращает, скольким."""
+    """Обработчикам logger — скрытие паролей и токенов поверх их формата (свой формат и своё скрытие
+    программы остаются). fmt / datefmt — только для обработчиков без формата. Возвращает, скольким."""
     n = 0
     for h in list(getattr(logger, "handlers", ())):
         f = h.formatter
-        if isinstance(f, MaskingFormatter):
+        if isinstance(f, (MaskingFormatter, _MaskAround)):
             continue
-        mf = MaskingFormatter(fmt or (f._fmt if f else FMT), datefmt or (f.datefmt if f else DATEFMT))
-        h.setFormatter(mf)
+        h.setFormatter(_MaskAround(f) if f is not None else MaskingFormatter(fmt or FMT, datefmt or DATEFMT))
         n += 1
     return n
+
+
+def add_file(logger_name, path, *, max_bytes=1_000_000, backups=3, fmt=FMT, datefmt=DATEFMT,
+             level=None, propagate=None):
+    """Ещё один журнал в свой файл (ротация, скрытие секретов), главный журнал (setup) не трогается.
+    Повторный вызов с тем же файлом не плодит обработчики. Папку не создать — журнал без файла."""
+    lg = logging.getLogger(logger_name)
+    full = os.path.abspath(os.fspath(path))
+    if level is not None:
+        lg.setLevel(level)
+    if propagate is not None:
+        lg.propagate = propagate
+    for h in lg.handlers:
+        if getattr(h, "baseFilename", None) == full:
+            return lg
+    try:
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        h = SafeRotatingFileHandler(full, maxBytes=max_bytes, backupCount=backups, encoding="utf-8", delay=True)
+    except OSError:
+        return lg
+    h.setFormatter(MaskingFormatter(fmt, datefmt))
+    lg.addHandler(h)
+    return lg
+
+
+class _Forward(logging.Handler):
+    """Записи общих модулей -> обработчики журнала программы (file=False)."""
+
+    def __init__(self, target):
+        super().__init__()
+        self.target = target
+
+    def emit(self, record):
+        try:
+            for h in self.target.handlers:
+                if record.levelno >= h.level:
+                    h.handle(record)
+        except Exception:                             # noqa: BLE001
+            pass
 
 
 def get(sub=""):
@@ -361,12 +448,18 @@ def selftest():
 
     tok = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
     pat = "github_pat_" + "11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz"
+    tg = "123456789:AA" + "Bb1" * 11
     m = mask_secrets(f"t={tok} p={pat} password=qwerty url=rtsp://admin:12345@10.0.0.1/ "
-                     f"Authorization: Bearer abc.def \"token\": \"xyz123\"")
-    for bad in (tok, pat, "qwerty", "12345", "abc.def", "xyz123"):
+                     f"Authorization: Bearer abc.def \"token\": \"xyz123\" "
+                     f"https://api.telegram.org/bot{tg}/sendMessage")
+    for bad in (tok, pat, "qwerty", "12345", "abc.def", "xyz123", tg[10:]):
         check(bad not in m, f"секрет не скрыт: {bad[:8]}… -> {m}")
     check("rtsp://admin:***@10.0.0.1" in m, f"адрес с паролем: {m}")
-    check(mask_secrets("pass 3 of 5, timeout=10") == "pass 3 of 5, timeout=10", "лишнее скрыто")
+    check(mask_secrets("pass 3 of 5, timeout=10, hotkey=F5") == "pass 3 of 5, timeout=10, hotkey=F5", "лишнее скрыто")
+    m2 = mask_secrets("pass=p1 key=k2 sid=s3 cookie=c4 proxy admin:pw5@10.0.0.2:8080 mail a@b.ru")
+    for bad in ("p1", "k2", "s3", "c4", "pw5"):
+        check(bad not in m2, f"не скрыто {bad}: {m2}")
+    check("admin:***@10.0.0.2" in m2 and "a@b.ru" in m2, f"user:пароль@host: {m2}")
 
     # проверка не мешает журналу самой программы: своё состояние, свой «общий» журнал
     saved_hooks = (sys.excepthook, threading.excepthook)
@@ -374,11 +467,15 @@ def selftest():
     fault_was = faulthandler.is_enabled()
     _state.update(name=None, logger=None, dir=None, path=None, crash=None, handler=None, fault_file=None)
     shared = ("app_log_test_shared",)
+    test_names = ("app_log_test", "app_log_test_own", "app_log_test_qt", "app_log_test_sh2", "app_log_test_extra",
+                  *shared)
+    for n in test_names:               # проверочные строки — не в корневой журнал программы
+        logging.getLogger(n).propagate = False
     with tempfile.TemporaryDirectory() as d:
         try:
-            lg = setup("app_log_test", os.path.join(d, "logs"), max_bytes=2000, backups=2, qt=False, shared=shared)
-            lg2 = setup("app_log_test", os.path.join(d, "logs"), max_bytes=2000, backups=2, qt=False, shared=shared)
-            first_h = _state["handler"]
+            kw = dict(max_bytes=2000, backups=2, qt=False, shared=shared, qt_logger="app_log_test_qt")
+            lg = setup("app_log_test", os.path.join(d, "logs"), **kw)
+            lg2 = setup("app_log_test", os.path.join(d, "logs"), **kw)
             check(lg is lg2 and sum(isinstance(x, SafeRotatingFileHandler) for x in lg.handlers) == 1,
                   "повторный setup — один обработчик")
             lg.info("пароль: password=secret1 и токен %s", tok)
@@ -412,6 +509,26 @@ def selftest():
                 sys.stderr = err
             crash = open(crash_path(), encoding="utf-8").read()
             check("ZeroDivisionError" in crash, "падение в потоке")
+            check(lg.level == logging.INFO, "уровень по умолчанию INFO")
+            dbg = logging.getLogger("app_log_test_sh2")
+            dbg.setLevel(logging.DEBUG)
+            setup("app_log_test_sh2", os.path.join(d, "dbg"), file=False, crash=False, qt=False, shared=())
+            check(dbg.level == logging.DEBUG, "уровень, заданный программой, не сбит")
+            dbg.setLevel(logging.NOTSET)
+            setup("app_log_test", os.path.join(d, "logs"), **kw)      # вернуть проверочное состояние
+            # сообщения Qt — в файл, но не в обработчики программы
+            seen = []
+            spy = logging.Handler()
+            spy.emit = lambda r: seen.append(r.getMessage())
+            lg.addHandler(spy)
+            try:
+                _qt_log(logging.WARNING, "qt-проба")
+            finally:
+                lg.removeHandler(spy)
+            for x in logging.getLogger("app_log_test_qt").handlers:
+                x.flush()
+            text = open(os.path.join(d, "logs", "app_log_test.log"), encoding="utf-8").read()
+            check("qt-проба" in text and "qt-проба" not in seen, "Qt: в файл, мимо окна программы")
             # своя программа со своим журналом: file=False + mask_handlers
             own = logging.getLogger("app_log_test_own")
             sh = logging.StreamHandler(io.StringIO())
@@ -419,9 +536,11 @@ def selftest():
             own.addHandler(sh)
             try:
                 setup("app_log_test_own", os.path.join(d, "own"), file=False, qt=False, shared=())
+                sh.setFormatter(logging.Formatter("[своё] %(message)s"))
                 check(mask_handlers(own) == 1, "mask_handlers")
                 own.warning("token=zzz777")
-                check("zzz777" not in sh.stream.getvalue(), "mask_handlers скрывает секрет")
+                out = sh.stream.getvalue()
+                check("zzz777" not in out and "[своё]" in out, f"mask_handlers: скрыто и формат свой: {out!r}")
                 check(not os.path.exists(os.path.join(d, "own", "app_log_test_own.log")), "file=False — файла нет")
                 try:
                     raise ValueError("own")
@@ -429,17 +548,33 @@ def selftest():
                     log_exception(*sys.exc_info())
                 check("ValueError" in open(crash_path(), encoding="utf-8").read(), "file=False — след падения есть")
                 check(_state["handler"] is None, "file=False — без своего обработчика")
+                setup("app_log_test_own", os.path.join(d, "own"), file=False, qt=False, shared=("app_log_test_sh2",))
+                logging.getLogger("app_log_test_sh2").warning("общий модуль при file=False")
+                check("общий модуль при file=False" in sh.stream.getvalue(), "file=False — общие модули в журнал программы")
+                for x in logging.getLogger("app_log_test_sh2").handlers[:]:
+                    logging.getLogger("app_log_test_sh2").removeHandler(x)
+                extra = add_file("app_log_test_extra", os.path.join(d, "extra", "f.log"), propagate=False)
+                add_file("app_log_test_extra", os.path.join(d, "extra", "f.log"))
+                extra.warning("доп password=pp9")
+                for x in extra.handlers:
+                    x.flush()
+                t2 = open(os.path.join(d, "extra", "f.log"), encoding="utf-8").read()
+                check(len(extra.handlers) == 1 and "доп" in t2 and "pp9" not in t2, "add_file")
+                for x in extra.handlers[:]:
+                    extra.removeHandler(x)
+                    x.close()
             finally:
                 own.removeHandler(sh)
         finally:
-            for h in {_state["handler"], locals().get("first_h")} - {None}:
-                for n in ("app_log_test", "app_log_test_own", *shared):
-                    x = logging.getLogger(n)
-                    if h in x.handlers:
-                        x.removeHandler(h)
-                h.close()
-            for n in ("app_log_test", "app_log_test_own", *shared):
-                logging.getLogger(n).propagate = True
+            for n in test_names:          # проверочные журналы — пустые, как были
+                x = logging.getLogger(n)
+                for h in x.handlers[:]:
+                    x.removeHandler(h)
+                    try:
+                        h.close()
+                    except Exception:                 # noqa: BLE001
+                        pass
+                x.propagate = True
             if _state["fault_file"] is not None:
                 try:
                     faulthandler.disable()

@@ -1,7 +1,15 @@
-"""safe_json.py  v1.0.0 — общий модуль для всех проектов: надёжное чтение и запись JSON
+"""safe_json.py  v1.1.0 — общий модуль для всех проектов: надёжное чтение и запись JSON
 (config.json, файлы состояния).
 
 Журнал:
+v1.1.0: битый файл, который читают снова и снова, не плодит копии .bad- и не повторяет сообщение в журнале;
+        запрет записи снимается, только если файл удалили (файл снова читается / исправлен — запрет
+        остаётся до следующего load: иначе значения по умолчанию затёрли бы настоящие настройки);
+        load_state(path) — как прочитан файл (ok / missing / bak / default / unreadable); allow_write(path) —
+        снять запрет по решению пользователя (сохранить принудительно); ошибка записи — в журнал один раз,
+        пока она та же; в last_error — и тип ошибки (PermissionError: …); файл занят / не читается —
+        берётся .bak (если есть; запись всё равно запрещена); protect=False — для кэша: испорченный
+        файл (копия .bad- остаётся) можно перезаписать.
 v1.0.0: первая версия: load / save / AutoSaver / start_autosave.
 
 Общий модуль: одинаковый во всех проектах. Правка — поднять версию в шапке и в VERSION ниже,
@@ -19,8 +27,11 @@ v1.0.0: первая версия: load / save / AutoSaver / start_autosave.
 
 API:
     data = safe_json.load(path, default)     # default копируется (deepcopy); тип проверяется по default
+    data = safe_json.load(cache, {}, protect=False)   # кэш: испорченный можно перезаписать
     ok = safe_json.save(path, data)          # True / False; причина — safe_json.last_error(path)
     safe_json.is_protected(path)             # файл испорчен / не читался — запись запрещена
+    safe_json.load_state(path)               # "ok" | "missing" | "bak" (взята копия) | "default" | "unreadable"
+    safe_json.allow_write(path)              # снять запрет записи (пользователь сам решил сохранить)
     saver = safe_json.AutoSaver(path, get_data, every=10)   # пишет, только если данные изменились
     saver.mark_saved(data)                   # после load: «это уже на диске»
     saver.tick() / saver.flush()             # по таймеру / при закрытии
@@ -36,7 +47,7 @@ import shutil
 import threading
 import time
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 log = logging.getLogger("safe_json")
 
@@ -44,6 +55,9 @@ _lock = threading.RLock()
 _protected = {}      # ключ пути -> почему запись запрещена
 _errors = {}         # ключ пути -> текст последней ошибки
 _good = set()        # ключи путей, где на диске — целый файл (прочитан или записан нами)
+_load_state = {}     # ключ пути -> как прочитан последним load()
+_reported = {}       # ключ пути -> (состояние файла, текст) последнего сообщения о битом / нечитаемом файле
+_save_err = {}       # ключ пути -> текст ошибки записи, о которой уже написали в журнал
 _tmp_n = 0
 
 
@@ -95,8 +109,37 @@ def _parse(text, kind):
     return True, data
 
 
+def _same_bad_copy(path):
+    """Уже есть копия .bad- с тем же содержимым — её имя (чтобы не плодить копии при каждом чтении)."""
+    d = os.path.dirname(os.path.abspath(path))
+    base = os.path.basename(path) + ".bad-"
+    try:
+        size = os.path.getsize(path)
+        names = [n for n in os.listdir(d) if n.startswith(base)]
+    except OSError:
+        return None
+    data = None
+    for n in sorted(names, reverse=True):
+        full = os.path.join(d, n)
+        try:
+            if os.path.getsize(full) != size:
+                continue
+            if data is None:
+                with open(path, "rb") as f:
+                    data = f.read()
+            with open(full, "rb") as f:
+                if f.read() == data:
+                    return full
+        except OSError:
+            continue
+    return None
+
+
 def _keep_bad_copy(path):
     """Копия испорченного файла рядом: <файл>.bad-<время> (байт в байт). Имя копии или None."""
+    same = _same_bad_copy(path)
+    if same:
+        return same
     stamp = time.strftime("%Y%m%d-%H%M%S")
     bad = f"{path}.bad-{stamp}"
     n = 1
@@ -111,9 +154,39 @@ def _keep_bad_copy(path):
         return None
 
 
-def load(path, default=None, *, bak=True, kind=None):
+def _sig(p):
+    try:
+        st = os.stat(p)
+        return st.st_mtime_ns, st.st_size
+    except OSError:
+        return None
+
+
+def _report(k, p, level, text):
+    """Сообщение о битом / нечитаемом файле — один раз на одно и то же состояние файла."""
+    key = (_sig(p), text)
+    if _reported.get(k) == key:
+        log.debug("%s", text)
+        return
+    _reported[k] = key
+    log.log(level, "%s", text)
+
+
+def _read_bak(p, want):
+    """(True, данные) из <файл>.bak или (False, причина)."""
+    if not os.path.exists(p + ".bak"):
+        return False, "нет .bak"
+    try:
+        return _parse(_read_text(p + ".bak"), want)
+    except (OSError, ValueError) as e:
+        return False, str(e)
+
+
+def load(path, default=None, *, bak=True, kind=None, protect=True):
     """Прочитать JSON. Нет файла — копия default. Испорчен — .bak, иначе default и запрет записи.
-    kind — нужный тип (dict / list); по умолчанию — тип default, если это dict / list."""
+    Не читается (занят, нет прав) — .bak (или default), запись запрещена до следующего load.
+    kind — нужный тип (dict / list); по умолчанию — тип default, если это dict / list.
+    protect=False (кэш, который можно собрать заново) — испорченный файл можно перезаписать."""
     p = os.fspath(path)
     k = _key(p)
     want = _kind_of(default, kind)
@@ -124,38 +197,49 @@ def load(path, default=None, *, bak=True, kind=None):
         try:
             text = _read_text(p)
         except FileNotFoundError:
+            _load_state[k] = "missing"
             return copy.deepcopy(default)
         except ValueError as e:          # не UTF-8 — как битый JSON
             reason = str(e)
         except OSError as e:
-            _protected[k] = f"файл не читается: {e}"
+            _protected[k] = f"файл не читается: {type(e).__name__}: {e}"
             _errors[k] = _protected[k]
-            log.error("%s не читается (%s) — значения по умолчанию, файл не перезаписываю", p, e)
-            return copy.deepcopy(default)
+            _load_state[k] = "unreadable"
+            ok, res = _read_bak(p, want) if bak else (False, "")
+            _report(k, p, logging.ERROR, f"{p} не читается ({e}) — "
+                    + ("взята резервная копия .bak" if ok else "значения по умолчанию")
+                    + ", файл не перезаписываю")
+            return res if ok else copy.deepcopy(default)
         else:
             ok, res = _parse(text, want)
             if ok:
                 _good.add(k)
+                _load_state[k] = "ok"
+                _reported.pop(k, None)
                 return res
             reason = res
         # файл испорчен
         bad_copy = _keep_bad_copy(p)
         if bak and os.path.exists(p + ".bak"):
-            try:
-                ok, res = _parse(_read_text(p + ".bak"), want)
-            except (OSError, ValueError) as e:
-                ok, res = False, str(e)
+            ok, res = _read_bak(p, want)
             if ok:
-                log.warning("%s испорчен (%s) — взята резервная копия .bak%s", p, reason,
-                            f"; испорченный сохранён: {os.path.basename(bad_copy)}" if bad_copy else "")
+                _load_state[k] = "bak"
+                _report(k, p, logging.WARNING, f"{p} испорчен ({reason}) — взята резервная копия .bak"
+                        + (f"; испорченный сохранён: {os.path.basename(bad_copy)}" if bad_copy else ""))
                 if not bad_copy:
                     # копию испорченного не сделать — его не затираем
-                    _protected[k] = "испорченный файл не удалось сохранить в копию"
+                    _protected[k] = "испорченный файл не удалось сохранить в копию — не перезаписываю"
+                    _errors[k] = _protected[k]
                 return res
+        _load_state[k] = "default"
+        if not protect and bad_copy:     # кэш: копия есть — можно собрать и записать заново
+            _report(k, p, logging.WARNING, f"{p} испорчен ({reason}) — значения по умолчанию"
+                    f" (копия: {os.path.basename(bad_copy)})")
+            return copy.deepcopy(default)
         _protected[k] = (f"файл испорчен ({reason}); исправьте или удалите его"
                          + (f" (копия: {os.path.basename(bad_copy)})" if bad_copy else ""))
         _errors[k] = _protected[k]
-        log.error("%s: %s — значения по умолчанию, файл не перезаписываю", p, _protected[k])
+        _report(k, p, logging.ERROR, f"{p}: {_protected[k]} — значения по умолчанию, файл не перезаписываю")
         return copy.deepcopy(default)
 
 
@@ -167,15 +251,35 @@ def last_error(path):
     return _errors.get(_key(path), "")
 
 
+def allow_write(path):
+    """Снять запрет записи (пользователь сам решил сохранить поверх испорченного / нечитаемого файла)."""
+    k = _key(path)
+    with _lock:
+        _protected.pop(k, None)
+        _errors.pop(k, None)
+
+
+def load_state(path):
+    """Как прочитан файл последним load(): "ok", "missing" (нет файла — значения по умолчанию),
+    "bak" (файл испорчен — взята резервная копия), "default" (испорчен, копии нет — значения по
+    умолчанию, запись запрещена), "unreadable" (не читается — то же). "" — load() не вызывали."""
+    return _load_state.get(_key(path), "")
+
+
 def _still_protected(p, k):
-    """Запрет снимается, если файл удалили или исправили."""
+    """Запрет снимается, только если файл удалили (пользователь сбросил настройки). Снова читается /
+    исправлен — запрет остаётся: в памяти программы значения по умолчанию, запись затёрла бы настоящие
+    настройки; их подхватит следующий load() (перезапуск программы)."""
     if not os.path.exists(p):
         return False
     try:
         ok, _ = _parse(_read_text(p, tries=1), None)
     except (OSError, ValueError):
-        return True
-    return not ok
+        ok = False
+    if ok:
+        _errors[k] = ("файл снова читается — перечитайте настройки (перезапуск программы); запись "
+                      "запрещена, чтобы не затереть их значениями по умолчанию")
+    return True
 
 
 def dumps(data, indent=2):
@@ -228,8 +332,8 @@ def save_text(path, text, *, bak=True):
     k = _key(p)
     with _lock:
         if k in _protected:
+            _errors[k] = _protected[k]
             if _still_protected(p, k):
-                _errors[k] = _protected[k]
                 return False
             log.info("%s исправлен или удалён — запись снова разрешена", p)
             _protected.pop(k, None)
@@ -245,15 +349,21 @@ def save_text(path, text, *, bak=True):
                 _backup(p, k)
             _replace(tmp, p)
         except OSError as e:
-            _errors[k] = str(e)
+            err = f"{type(e).__name__}: {e}"
+            _errors[k] = err
             _good.discard(k)
-            log.error("%s НЕ сохранён: %s", p, e)
+            if _save_err.get(k) != err:             # та же ошибка снова — в журнал не повторять
+                _save_err[k] = err
+                log.error("%s НЕ сохранён: %s", p, err)
+            else:
+                log.debug("%s НЕ сохранён: %s", p, err)
             try:
                 os.remove(tmp)
             except OSError:
                 pass
             return False
         _errors.pop(k, None)
+        _save_err.pop(k, None)
         _good.add(k)
         return True
 
@@ -355,8 +465,9 @@ def _selftest_body(check):
         dflt = {"a": 1, "list": [1]}
         x = load(p, dflt)
         check(x == dflt and x is not dflt and x["list"] is not dflt["list"], "нет файла -> копия default")
+        check(load_state(p) == "missing", "load_state missing")
         check(save(p, {"a": 2, "т": "я"}), "первая запись")
-        check(load(p, dflt) == {"a": 2, "т": "я"}, "чтение записанного")
+        check(load(p, dflt) == {"a": 2, "т": "я"} and load_state(p) == "ok", "чтение записанного")
         check(not os.path.exists(p + ".bak"), "нет .bak до второй записи")
         check(save(p, {"a": 3}), "вторая запись")
         check(load(p + ".bak", {}) == {"a": 2, "т": "я"}, ".bak — прежняя версия")
@@ -370,8 +481,15 @@ def _selftest_body(check):
         with open(p, "w", encoding="utf-8") as f:
             f.write('{"a": 6,')
         x = load(p, dflt)
-        check(x == {"a": 4}, f"битый -> .bak (получено {x})")
+        check(x == {"a": 4} and load_state(p) == "bak", f"битый -> .bak (получено {x})")
         check(any(".bad-" in f for f in os.listdir(os.path.dirname(p))), "копия битого .bad-")
+        n_bad = len([f for f in os.listdir(os.path.dirname(p)) if ".bad-" in f])
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('{"a": 6,')
+        load(p, dflt)
+        load(p, dflt)
+        check(len([f for f in os.listdir(os.path.dirname(p)) if ".bad-" in f]) == n_bad,
+              "тот же битый файл — новая копия .bad- не появляется")
         check(not is_protected(p), "с целым .bak запись разрешена")
         check(save(p, {"a": 7}) and load(p, dflt) == {"a": 7}, "запись после восстановления из .bak")
         # битый и .bak битый -> default + запрет записи
@@ -382,9 +500,49 @@ def _selftest_body(check):
         x = load(p, dflt)
         check(x == dflt, "битый без .bak -> default")
         check(is_protected(p) and not save(p, {"a": 8}), "битый без .bak -> запись запрещена")
+        check(load_state(p) == "default", "load_state default")
         with open(p, encoding="utf-8") as f:
             check(f.read() == "мусор", "испорченный файл не затёрт")
         check("испорчен" in last_error(p), "причина в last_error")
+        # пользователь исправил файл, пока программа работает с умолчаниями — не затирать
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('{"a": "исправлено"}')
+        check(not save(p, {"a": 8}) and "перечитайте" in last_error(p), "исправленный файл — запись всё ещё запрещена")
+        with open(p, encoding="utf-8") as f:
+            check(f.read() == '{"a": "исправлено"}', "исправленный файл не затёрт умолчаниями")
+        check(load(p, dflt) == {"a": "исправлено"} and not is_protected(p), "load снимает запрет")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("{")
+        os.replace(p + ".bak", p + ".bak.keep")
+        load(p, dflt)
+        allow_write(p)
+        check(save(p, {"a": "сам"}) and load(p, dflt) == {"a": "сам"}, "allow_write — запись по решению пользователя")
+        os.replace(p + ".bak.keep", p + ".bak")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("мусор2")
+        os.remove(p + ".bak")
+        load(p, dflt)
+        # сообщение о том же битом файле — один раз
+        seen = []
+        h = logging.Handler(logging.WARNING)
+        h.emit = lambda r: seen.append(r.getMessage())
+        own_handlers = log.handlers[:]
+        log.handlers = [h]               # только проверочный обработчик — не файл журнала программы
+        was, log.disabled = log.disabled, False
+        lvl, prop = log.level, log.propagate
+        log.setLevel(logging.DEBUG)
+        log.propagate = False            # проверочные сообщения — не в журнал программы
+        try:
+            _reported.clear()
+            load(p, dflt)
+            load(p, dflt)
+            load(p, dflt)
+        finally:
+            log.disabled = was
+            log.setLevel(lvl)
+            log.propagate = prop
+            log.handlers = own_handlers
+        check(len(seen) == 1, f"сообщение о битом файле — один раз (было {len(seen)})")
         os.remove(p)
         check(save(p, {"a": 9}) and not is_protected(p), "файл удалён -> запись снова можно")
         # не тот тип
@@ -392,7 +550,29 @@ def _selftest_body(check):
             f.write("[1, 2]")
         x = load(p, dflt)
         check(x == {"a": 9} or x == dflt, "список вместо словаря -> .bak / default")
+        # кэш (protect=False): испорченный без .bak — можно перезаписать
+        c = os.path.join(d, "cache.json")
+        with open(c, "w", encoding="utf-8") as f:
+            f.write("{")
+        check(load(c, {}, protect=False) == {} and not is_protected(c) and save(c, {"x": 1}),
+              "кэш: испорченный перезаписывается")
+        # файл не читается (занят) — .bak, запись запрещена
+        q2 = os.path.join(d, "busy.json")
+        check(save(q2, {"n": 1}) and save(q2, {"n": 2}), "две записи перед «занят»")
+        real = _read_text
+        try:
+            def busy(path, tries=5):
+                if os.fspath(path) == q2:
+                    raise PermissionError(13, "занят")
+                return real(path, tries)
+            globals()["_read_text"] = busy
+            x = load(q2, {})
+        finally:
+            globals()["_read_text"] = real
+        check(x == {"n": 1} and load_state(q2) == "unreadable" and is_protected(q2), f"занят -> .bak ({x})")
+        check(not save(q2, {"n": 0}) and load(q2, {}) == {"n": 2}, "занят -> настоящий файл не затёрт")
         # не UTF-8 -> как битый: копия байт в байт, .bak
+        os.remove(p)                     # «пользователь удалил» — запись снова разрешена
         check(save(p, {"a": 10}) and save(p, {"a": 11}), "две записи перед не-UTF-8")
         with open(p, "wb") as f:
             f.write(b'{"a": "\xff"}')

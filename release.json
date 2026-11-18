@@ -14,7 +14,12 @@
         ["README.md", "# Antenna_setup  v{v}"]
       ],
       "headers": false,
-      "changelog": {"file": "CHANGELOG.md", "before": "re:^### v\\d", "template": "### v{v} — {msg}\n"},
+      "changelog": [
+        {"file": "CHANGELOG.md", "before": "re:^### v\\d", "template": "### v{v} — {msg}\n",
+         "keep": 10, "tail": "Более ранние версии"},
+        {"file": "antenna_setup.pyw", "after": "Журнал изменений:", "template": "  v{v}: {msg}\n",
+         "wrap": 111, "keep": 10, "entry": "re:^  v\\d+\\.\\d+\\.\\d+:", "tail": "  Более ранние версии"}
+      ],
       "allow_in_zip": []
     }
   ]
