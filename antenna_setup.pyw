@@ -1,5 +1,5 @@
 """
-antenna_setup.pyw  v0.7.0
+antenna_setup.pyw  v0.8.0
 
 Настройка ноутбука под антенну, подключённую напрямую (кабелем / PoE).
 Ставит статический IP на выбранный адаптер (с запоминанием прежних настроек),
@@ -7,6 +7,10 @@ antenna_setup.pyw  v0.7.0
 веб-интерфейс и возвращает сеть как было. Обновляется с GitHub. Только Windows.
 
 Журнал изменений:
+  v0.8.0: Общие модули: safe_json 1.1.1 — config.json пишется атомарно, с .bak; испорченный не затирается
+          (копия config.json.bad-<время>, настройки — из .bak); app_log 1.2.1 — журнал antenna_setup.log:
+          ротация, пароли и токены скрыты, падения — ещё и в antenna_setup_crash.log; для разработки —
+          bump_version.py / release.py / check_leaks.py (release.json), в build_exe.bat — проверка утечек.
   v0.7.0: Значок программы: окно выбора (общий модуль app_icon 1.2.0) — «Настройки» → «Оформление» →
           «🎨 Значок программы…»; встроенная база ~370 значков, поиск в интернете, своя картинка; .ico и
           ярлыки. «По умолчанию» — родной значок (антенна); не выбирали — значок прежний. Значок в своей
@@ -37,7 +41,7 @@ antenna_setup.pyw  v0.7.0
           с прошлого раза; плитка «IP ноутбука» подсвечивает временный адрес программы.
   Более ранние версии — в истории git.
 """
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 APP_NAME = "Настройка антенны"
 APP_ID = "AntennaSetup.App"
 GITHUB_REPO = "romzespra-collab/Antenna_setup"
@@ -72,6 +76,9 @@ APP_ROOT = Path(sys.executable).parent if FROZEN else Path(os.path.abspath(__fil
 CONFIG_PATH = APP_ROOT / "config.json"
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))   # app/ — общие модули (gh_update)
+import app_log  # noqa: E402 — общий модуль: журнал (пароли и токены скрыты, следы падений)
+import safe_json  # noqa: E402 — общий модуль: надёжная запись config.json (.bak, битый не затирается)
+
 NO_WINDOW = 0x08000000
 IS_WIN = sys.platform == "win32"
 
@@ -123,11 +130,11 @@ def ensure_packages():
 
 
 def _crash_hook(exc_type, exc, tb):
-    """Падение не молча: текст в antenna_setup.log и окно с ошибкой."""
-    text = "".join(traceback.format_exception(exc_type, exc, tb))
+    """Падение не молча: текст в antenna_setup.log (+ antenna_setup_crash.log, общий модуль app_log;
+    пароли и токены скрыты) и окно с ошибкой."""
+    text = app_log.mask_secrets("".join(traceback.format_exception(exc_type, exc, tb)))
     try:
-        with open(APP_ROOT / "antenna_setup.log", "a", encoding="utf-8") as f:
-            f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] v{VERSION}\n{text}")
+        app_log.log_exception(exc_type, exc, tb, f"v{VERSION}")
     except Exception:
         pass
     if IS_WIN and "--selftest" not in sys.argv:
@@ -140,6 +147,9 @@ def _crash_hook(exc_type, exc, tb):
         sys.__excepthook__(exc_type, exc, tb)
 
 
+# v0.8.0: журнал antenna_setup.log — общий модуль app_log (ротация 1 МБ × 3, пароли и токены скрыты,
+# падения — ещё и в antenna_setup_crash.log, падения в потоках — тоже); своё окно с ошибкой — после setup
+app_log.setup("antenna_setup", APP_ROOT, file_name="antenna_setup.log", qt=False)
 sys.excepthook = _crash_hook
 ensure_packages()
 
@@ -155,6 +165,8 @@ from PySide6.QtWidgets import (QAbstractButton, QApplication, QButtonGroup,  # n
                                QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
                                QStackedWidget, QTextEdit, QVBoxLayout,
                                QWidget)
+
+app_log.install_qt_handler()   # сообщения Qt (qWarning и т.п.) — в antenna_setup.log
 
 # ───────────────────────── поиск и тема ─────────────────────────
 # заводские подсети антенн и роутеров — по ним ищем, если в своей подсети пусто
@@ -215,32 +227,18 @@ def atomic_write_text(path, text):
 
 
 def load_config(path=CONFIG_PATH):
-    """(cfg, можно_писать). Битый JSON → .bak; и он битый → не писать вовсе."""
+    """(cfg, можно_писать). Общий модуль safe_json: битый JSON → .bak (испорченный — копия
+    config.json.bad-<время>); и он битый → значения по умолчанию, файл не писать вовсе."""
     cfg = dict(DEFAULT_CONFIG)
-    path = Path(path)
-    if not path.exists():
-        return cfg, True
-    for p in (path, path.with_name(path.name + ".bak")):
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                cfg.update(data)
-                return cfg, True
-        except Exception:
-            continue
-    return cfg, False
+    cfg.update(safe_json.load(path, {}))
+    return cfg, not safe_json.is_protected(path)
 
 
 def save_config(cfg, path=CONFIG_PATH):
-    path = Path(path)
-    text = json.dumps(cfg, ensure_ascii=False, indent=2)
-    if path.exists():
-        try:
-            json.loads(path.read_text(encoding="utf-8"))
-            shutil.copyfile(path, path.with_name(path.name + ".bak"))
-        except Exception:
-            pass
-    atomic_write_text(path, text)
+    """Атомарно, прежний целый файл — в config.json.bak, повтор, если файл занят (safe_json).
+    Не записан — OSError с причиной."""
+    if not safe_json.save(path, cfg):
+        raise OSError(safe_json.last_error(path) or "config.json не записан")
 
 # ───────────────────────── сеть ─────────────────────────
 
@@ -2869,6 +2867,7 @@ class MainWindow(QWidget):
 
     def save_now(self):
         self._sync_cfg()
+        self._cfg_err = ""                                  # сохранение по Ctrl+S — ошибку показать всегда
         if self._write_cfg(json.dumps(self.cfg, ensure_ascii=False, sort_keys=True)):
             self.set_status("💾 настройки сохранены")
 
@@ -2878,9 +2877,12 @@ class MainWindow(QWidget):
         try:
             save_config(self.cfg)
             self._saved_dump = dump
+            self._cfg_err = ""
             return True
         except Exception as e:
-            self.log(f"✗ не удалось сохранить config.json: {e}")
+            if str(e) != getattr(self, "_cfg_err", ""):    # одна и та же ошибка — в журнал один раз, а не каждые 10 с
+                self._cfg_err = str(e)
+                self.log(f"✗ не удалось сохранить config.json: {e}")
             return False
 
     # ── тема ──
@@ -4604,6 +4606,21 @@ def selftest():
         (Path(d) / "config.json.bak").write_text("{", encoding="utf-8")
         c, w = load_config(cp)
         ok("config: оба битые → не писать", not w)
+    errs = safe_json.selftest()
+    ok("надёжная запись настроек (safe_json)" + (": " + "; ".join(errs[:3]) if errs else ""), not errs)
+    errs = app_log.selftest()
+    ok("журнал программы (app_log)" + (": " + "; ".join(errs[:3]) if errs else ""), not errs)
+    if not FROZEN and (APP_ROOT / "release.json").exists():
+        try:                               # утилиты разработчика (bump_version / release / check_leaks) — не в EXE
+            rel = importlib.import_module("release")
+            importlib.import_module("bump_version")
+            importlib.import_module("check_leaks")
+            rcfg = rel.load_config(str(APP_ROOT / "release.json"))
+            bad = [f"{p}: {t}" for pr in rcfg["programs"] for p, t in rel.check_versions(pr, str(APP_ROOT))[1]]
+            same = all(rel.current_version(pr, str(APP_ROOT)) == VERSION for pr in rcfg["programs"])
+            ok("версия во всех местах (release.json)" + (": " + "; ".join(bad[:3]) if bad else ""), same and not bad)
+        except Exception as e:
+            ok(f"версия во всех местах (release.json): {type(e).__name__}: {e}", False)
     ok("утечек токенов нет", not leak_scan(APP_ROOT))
     if not IS_WIN:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")

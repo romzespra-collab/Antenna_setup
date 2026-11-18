@@ -1,4 +1,4 @@
-# Antenna_setup  v0.7.0
+# Antenna_setup  v0.8.0
 
 Настройка ноутбука (Windows 10/11) под антенну, подключённую кабелем / PoE:
 найти антенну на кабеле, поставить ноутбуку подходящий адрес, проверить связь,
@@ -46,7 +46,9 @@ Esc — стоп.
 запрос прав администратора, «интернет только через Wi-Fi», логин/пароль веба
 антенны (по умолчанию admin / admin), репозиторий и токен для отчётов
 («Отчёт для Claude»), тема. Всё хранится в `config.json` рядом с программой
-(с копией `config.json.bak`).
+(с копией `config.json.bak`). Запись атомарная (общий модуль safe_json): испорченный
+`config.json` не затирается — он сохраняется как `config.json.bad-<время>`, а настройки берутся
+из `config.json.bak`.
 
 «Оформление» → **🎨 Значок программы…** (общий модуль app_icon 1.2.0): свой
 значок окна, панели задач, файла `antenna_setup.ico` и ярлыков — встроенная
@@ -65,14 +67,24 @@ Icons — CC0.
 
 ## Сборка в EXE
 `build_exe.bat` → `dist\antenna_setup.exe` (PyInstaller, `antenna_setup.spec`,
-просит права администратора). Новую версию exe — собрать заново.
+просит права администратора; перед сборкой — поиск утечек `check_leaks.py`: токены, пароли).
+Новую версию exe — собрать заново.
+
+Для разработки: `python bump_version.py minor -m "что нового"` — версия во всех местах из
+`release.json` и запись в `CHANGELOG.md`; после commit — `python release.py`: архив
+`release/antenna_setup_vX.Y.Z.zip` (с проверкой утечек, старый удаляется).
 
 ## Файлы
 - `antenna_setup.pyw` — программа; `app/` — модуль обновления с GitHub.
 - `app_icon.py`, `app_icon_qt.py`, `app_icon_pack.dat` — значок программы (общий модуль: рисунки, .ico,
   ярлыки, окно выбора, встроенная база ~370 значков).
 - `CHANGELOG.md` — журнал изменений (последние версии; раньше — в истории git).
+- `safe_json.py` — надёжная запись `config.json`: атомарно, `.bak`, битый файл не затирается (общий модуль).
+- `app_log.py` — журнал: ротация, пароли и токены скрыты, падения — в `antenna_setup_crash.log` (общий модуль).
 - `setup.bat`, `requirements.txt` — установка; `build_exe.bat`, `antenna_setup.spec` — сборка exe.
-- Создаются при работе: `config.json`, `antenna_setup.log`, `selftest.txt`; выбранный значок —
-  `app_icon.json`, `antenna_setup.ico`.
+- `bump_version.py`, `release.py`, `check_leaks.py`, `release.json` — для разработки: версия во всех местах,
+  архив в `release/`, поиск утечек (общие утилиты, в EXE не входят).
+- Создаются при работе: `config.json`, `config.json.bak` (прежняя целая копия), `config.json.bad-<время>`
+  (испорченный файл, только при порче), `antenna_setup.log`, `antenna_setup_crash.log` (след необработанной
+  ошибки — только при ней), `selftest.txt`; выбранный значок — `app_icon.json`, `antenna_setup.ico`.
 - `release/` — архив текущей версии для обновления.
